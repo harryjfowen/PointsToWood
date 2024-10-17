@@ -3,7 +3,7 @@
 
 # Ignore the data folder
 /data/
-instance_all.py
+pointstowood/instance_all.py
 
 # Ignore any archived or data folder in subdirectories
 **/archived/
