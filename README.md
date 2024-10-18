@@ -1,33 +1,50 @@
 
 # Semantic classification of wood and leaf in TLS forest point clouds
-This repository describes methods to classify wood and leaf points.
+
+### Development Environment
+
+- **Operating System:** Ubuntu LTS 22.04
+- **GPU:** NVIDIA Quadro RTX 6000 24GB
+- **NVIDIA Driver:** 535.183.06
+- **CUDA Version:** 12.2
+
+### Setup Instructions
+
+1. Install the Ubuntu NVIDIA driver (535.183.06 recommended).
+
+2. Set up a Conda environment:
+   ```bash
+   conda create --name myenv python=3.10
+   conda activate myenv
+   conda install mamba -c conda-forge
+
+3. install packages within your Conda environment using mamba
+
+   mamba install pytorch==2.3.1 pytorch-cuda=12.1 -c pytorch -c nvidia
+   mamba install pyg==2.5.3 -c pyg
+
+📎 [Pytorch](https://pytorch.org/get-started/locally/) instructions for each OS can be found here.
+
+📎 [Pytorch Geometric](https://pytorch-geometric.readthedocs.io/en/latest/notes/installation.html) instructions for each OS can be found here.
 
 #
 
-### 1. Installation instructions
-
-All development was done on Ubuntu LTS 22.04 on an NVIDIA Quadro RTX 6000 24GB
-
-First, install the ubuntu nvidia driver. I used 535.183.06 along with CUDA version 12.2
-
-Its recommended to set up a conda environment and use mamba to install packages wihtin it.
-
-conda create --name myenv python=3.10 conda install mamba -c conda-forge
-
-Second install pytorch. 2.3.1+cu121 and pytorch geometric 2.5.3
-
-Instructions for each OS can be found at https://pytorch.org/get-started/locally/ and https://pytorch-geometric.readthedocs.io/en/latest/notes/installation.html
-
-#
-
-### 2. Running PointsToWood
+### Running PointsToWood
    
-conda activate myenv (myenv being the environemnt name you created above)
+1. Activate your conda environment.
+   
+```
+conda activate myenv. 
+```
 
+2. Navigate to the PointsToWood directory.
+   
 ```
 cd ~/points2wood/points2wood/
 ```
 
+3. Run PointsToWood.
+   
 ```
 python3 predict.py --point-cloud /x/x/cloud.ply --model f1-eu.pth --batch_size 8 --is-wood 0.50 --grid_size 2.0 4.0 --min_pts 2048 --max_pts 16384;
 ```
