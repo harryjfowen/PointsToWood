@@ -68,7 +68,7 @@ class Voxelise:
     
     def write_voxels(self):
         
-        self.pos = torch.tensor(self.pos[['x', 'y', 'z', 'reflectance']].values, dtype=torch.float).to(device='cuda')
+        self.pos = torch.tensor(self.pos.values, dtype=torch.float).to(device='cuda')
 
         reflectance_not_zero = not torch.all(self.pos[:, 3] == 0)
 
