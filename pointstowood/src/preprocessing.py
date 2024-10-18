@@ -68,6 +68,8 @@ class Voxelise:
     
     def write_voxels(self):
         
+        self.pos = torch.tensor(self.pos[['x', 'y', 'z', 'reflectance']].values, dtype=torch.float).to(device='cuda')
+
         reflectance_not_zero = not torch.all(self.pos[:, 3] == 0)
 
         if reflectance_not_zero:
@@ -106,10 +108,11 @@ class Voxelise:
             
             torch.save(voxel, os.path.join(self.vxpath, f'voxel_{file_counter}.pt'))
             file_counter += 1
+        return (self.pos[:,-1])
 
 def preprocess(args):
-    Voxelise(torch.tensor(args.pc.values, dtype=torch.float32).to('cuda'),
-             vxpath=args.vxfile, minpoints=args.min_pts, maxpoints=args.max_pts,
-             pointspacing=args.resolution, gridsize = args.grid_size).write_voxels()
+    n_z = Voxelise(args.pc, vxpath=args.vxfile, minpoints=args.min_pts, maxpoints=args.max_pts, pointspacing=args.resolution, gridsize = args.grid_size).write_voxels()
+    args.pc['n_z'] = n_z.detach().numpy()
+
 
 
