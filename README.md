@@ -1,42 +1,29 @@
-<<<<<<< HEAD
-# xxx
+Semantic classification of wood and leaf in high resolution TLS forest point clouds 
 
-xxx
+**This repository describes methods to classify wood and leaf points . This is done using a two-stage process
 
-### 1. xxx
+1. Installation instructions 
 
+All development was done on Ubuntu LTS 22.04 on an NVIDIA Quadro RTX 6000 24GB
 
-### Installation instructions to run on HPC
+First, install the ubuntu nvidia driver. I used 535.183.06 along with CUDA version 12.2
 
-#torch cuda sanity checks
-#torch.distributed.is_nccl_available()
-#torch.version.cuda
+Its recommended to set up a conda environment and use mamba to install packages wihtin it.
 
-1. module load cuda/11.4
-2. python -m venv torch
-3. source torch/bin/activate
-4. pip install --upgrade pip
-4. pip install torch==1.12.1+cu113 torchvision==0.13.1+cu113 torchaudio==0.12.1 -f https://download.pytorch.org/whl/cu113/torch_stable.html
-5. CUDA="cu113" && URL="https://data.pyg.org/whl/torch" && VERSION="1.12.1"
-6. pip install --no-index torch-scatter -f ${URL}-${VERSION}+${CUDA}.html
-7. pip install --no-index torch-cluster -f ${URL}-${VERSION}+${CUDA}.html
-7. pip install torch-sparse -f ${URL}-${VERSION}+${CUDA}.html
-8. pip install torch-geometric
+conda create --name myenv python=3.10 conda install mamba -c conda-forge
+
+Second install pytorch. 2.3.1+cu121 and pytorch geometric 2.5.3
+
+Instructions for each OS can be found at https://pytorch.org/get-started/locally/ and https://pytorch-geometric.readthedocs.io/en/latest/notes/installation.html
 
 
+2. Running PointsToWood
+   
+conda activate myenv (myenv being the environemnt name you created above)
 
-module load cuda/11.4
-module load python/3.8
-virtualenv venv 
-source venv/bin/activate
+cd ~/points2wood/points2wood/
 
-pip install torch==1.12.1+cu113 torchvision==0.13.1+cu113 torchaudio==0.12.1 -f https://download.pytorch.org/whl/cu113/torch_stable.html
-CUDA="cu113" && URL="https://data.pyg.org/whl/torch" && VERSION="1.12.1"
-pip install --no-index torch-scatter -f ${URL}-${VERSION}+${CUDA}.html
-pip install torch-cluster -f ${URL}-${VERSION}+${CUDA}.html
-pip install torch-sparse -f ${URL}-${VERSION}+${CUDA}.html
-pip install torch-geometric
-=======
-# points2wood
-Semantic segmentation of wood and leaf in high resolution TLS point clouds
->>>>>>> origin/main
+python3 predict.py --point-cloud /x/x/cloud.ply --model f1-eu.pth --batch_size 8 --is-wood 0.50 --grid_size 2.0 4.0 --min_pts 2048 --max_pts 16384;
+
+*NOTE Make sure the point cloud contains columns x y z as a minimum and x y z reflectance if available to you.
+
