@@ -35,11 +35,8 @@ def get_path(location_in_pointstowood: str = "") -> str:
 
 def preprocess_point_cloud_data(df):
     df.columns = df.columns.str.lower()
-    columns_to_drop = ['n_z', 'label', 'pwood', 'pleaf']
-    df = df.drop(columns=columns_to_drop, errors='ignore')
-    df = df.rename(columns=lambda x: x.replace('scalar_', '') if 'scalar_' in x else x)
-    df = df.rename(columns={'refl': 'reflectance', 'intensity': 'reflectance'})
-    headers = [header for header in df.columns[3:] if header not in columns_to_drop]
+    df.rename(columns=lambda x: x.replace('scalar_', '') if 'scalar_' in x else x, inplace=True)
+    df = df.rename(columns={'refl': 'reflectance', 'intensity': 'reflectance', 'truth': 'label'})
     if 'reflectance' not in df.columns:
         df['reflectance'] = np.zeros(len(df))
         print('No reflectance detected, column added with zeros.')
@@ -49,7 +46,7 @@ def preprocess_point_cloud_data(df):
     if 'reflectance' in cols:
         cols.insert(3, cols.pop(cols.index('reflectance')))
         df = df[cols]
-    return df, headers, 'reflectance' in df.columns
+    return df, 'reflectance' in df.columns
 
 '''
 ---------------------------------------------------------------------------------------------------------------------------
@@ -115,8 +112,9 @@ if __name__ == '__main__':
                         
                         os.makedirs(args.trfile, exist_ok=True)
                         args.pc, args.headers = load_file(filename=p, additional_headers=True, verbose=True)
-                        args.pc, args.headers, args.reflectance = preprocess_point_cloud_data(args.pc)
+                        args.pc, args.reflectance = preprocess_point_cloud_data(args.pc)
                         args.vxfile = args.trfile
+                        print(args.pc)
                         
                         print(f'Voxelising to {args.grid_size} grid sizes')
                         preprocess(args)
@@ -133,7 +131,7 @@ if __name__ == '__main__':
 
                                 os.makedirs(args.tefile, exist_ok=True)
                                 args.pc, args.headers = load_file(filename=p, additional_headers=True, verbose=True)
-                                args.pc, args.headers, args.reflectance = preprocess_point_cloud_data(args.pc)
+                                args.pc, args.reflectance = preprocess_point_cloud_data(args.pc)
                                 args.vxfile = args.tefile
 
                                 print(f'Voxelising to {args.grid_size} grid sizes')
