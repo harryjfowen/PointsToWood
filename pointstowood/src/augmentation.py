@@ -48,9 +48,5 @@ def augmentations(pos, reflectance, label, mode='train'):
             reflectance = perturb_reflectance(reflectance)
     if rand_val_pos < 0.25:
         pos = rotate_3d(pos)
-    # if rand_val_pos > 0.25 and rand_val_pos <= 0.375:
-    #     pos = random_rescale(pos)
-    # if (rand_val_pos) > 0.375 and rand_val_pos <= 0.50:
-    #     pos = random_noise_addition(pos)
     return pos, reflectance, label
 

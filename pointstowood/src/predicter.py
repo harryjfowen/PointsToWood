@@ -45,7 +45,7 @@ class TestingDataset(Dataset, ABC):
         pos = pos - local_shift
         scaling_factor = torch.sqrt((pos ** 2).sum(dim=1)).max()
 
-        nan_mask = torch.isnan(pos).any(dim=1) | torch.isnan(reflectance) | torch.isnan(h) 
+        nan_mask = torch.isnan(pos).any(dim=1) | torch.isnan(reflectance)
         pos = pos[~nan_mask]
         reflectance = reflectance[~nan_mask]
 
