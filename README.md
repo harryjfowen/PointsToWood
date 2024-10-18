@@ -51,7 +51,7 @@ python3 predict.py --point-cloud /x/x/cloud.ply --model f1-eu.pth --batch_size 8
 
 *NOTE Make sure the point cloud contains columns x y z as a minimum and x y z reflectance if available to you.
 
-### 3. Model Selection
+### Model Selection
 
 Within the model folder, we have biome specific as well as more general ecosystem agnostic models. 
 
