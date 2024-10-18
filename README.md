@@ -2,7 +2,7 @@
 # Semantic classification of wood and leaf in TLS forest point clouds
 
 ![Probability of wood predicted by our model from blue to red (Data from Wang et al., 2021](images/our_tropical.png)
-*Probability of wood from blue to red. (Data sourced from Wang et al., 2021)*
+*Probability of wood predicted by our model from blue to red. (Data sourced from Wang et al., 2021)*
 
 ### Development Environment
 
