@@ -116,11 +116,11 @@ def SemanticTraining(args):
     criterion = Poly1FocalLoss(reduction="mean", gamma = 2.0, alpha = None, label_smoothing = 0.1)
 
     if args.tune: 
-        optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-6, weight_decay=1e-4)
+        optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-6, weight_decay=1e-2)
         lr_scheduler = CosineAnnealingWarmupRestarts(optimizer, first_cycle_steps=args.num_epochs//5, cycle_mult=1.0, max_lr=1e-6, min_lr=1e-8, warmup_steps=5, gamma=0.5)
     else:
-        optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3, weight_decay=1e-4)
-        lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-3, total_steps=args.num_epochs, pct_start=0.05, anneal_strategy='cos', div_factor = 100)
+        optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4, weight_decay=1e-2)
+        lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-4, total_steps=args.num_epochs, pct_start=0.05, anneal_strategy='cos', div_factor = 100)
             
     manager = ModelManager(model, device)
 
@@ -276,15 +276,21 @@ def SemanticTraining(args):
         if epoch in args.checkpoints:
             manager.save_checkpoints(args, epoch)
         
-        patience = 10
-        consec_increases = 0
         if args.stop_early:
-            if epoch > 0 and history[-1, 3] >= history[-2, 3]:
-                consec_increases += 1
-
-        if consec_increases == patience:
-            print(f"Stopped early at epoch {epoch + 1} - val loss increased for {consec_increases} consecutive epochs!")
-            break
+            consec_decreases = 0  
+            if epoch > 10: 
+                current_acc = history[-1, 3] 
+                prev_acc = history[-2, 3]     
+                
+                if current_acc < prev_acc:
+                    consec_decreases += 1
+                else:
+                    consec_decreases = 0  
+                    
+                if consec_decreases >= 10: 
+                    print(f"\nStopping early at epoch {epoch} - training accuracy decreased for {consec_decreases} consecutive epochs")
+                    print(f"Best accuracy was {max(history[:, 3]):.4f} at epoch {np.argmax(history[:, 3]) + 1}")
+                    break
 
         if epoch > int(args.num_epochs*0.10) and not args.test:
             best_ba_train = manager.save_best_model(train_accuracy/len(train_loader), best_ba_train, os.path.join(args.wdir,'model','ba-' + os.path.basename(args.model)))
