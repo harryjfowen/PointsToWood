@@ -29,7 +29,7 @@ PointsToWood: A deep learning framework for complete canopy leaf-wood segmentati
 
 4. install packages within your Conda environment using mamba
    ```bash
-   mamba install pytorch pytorch-cuda=12.2 -c pytorch -c nvidia
+   mamba install pytorch pytorch-cuda=12.4 -c pytorch -c nvidia
    mamba install pyg -c pyg
    mamba install pytorch-scatter -c pyg
 
