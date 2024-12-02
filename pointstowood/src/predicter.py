@@ -13,6 +13,7 @@ from src.io import save_file
 from collections import OrderedDict
 from numba import jit, prange, set_num_threads
 import glob
+from torch.utils.data import Sampler
 
 import warnings
 warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
@@ -22,6 +23,48 @@ os.environ['OMP_NUM_THREADS'] = str(os.cpu_count()-1)
 set_num_threads(30)
 sys.setrecursionlimit(10 ** 8) 
 
+class BalancedBatchSampler(Sampler):
+    """
+    Batch sampler that keeps fixed batch size but pairs long and short samples
+    to maintain more consistent total points per batch.
+    """
+    def __init__(self, dataset, batch_size):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        
+        # Get length of each point cloud
+        self.lengths = []
+        for key in dataset.keys:
+            pc = torch.load(key)
+            self.lengths.append(len(pc))
+            
+        # Sort indices by length
+        self.indices = np.argsort(self.lengths)
+        
+    def __iter__(self):
+        # Create iterator that pairs short and long samples
+        n = len(self.indices)
+        half_batch = self.batch_size // 2
+        
+        # Shuffle both halves independently to maintain size distribution
+        # but add randomness between epochs
+        short_samples = self.indices[:n//2].copy()
+        long_samples = self.indices[n//2:].copy()
+        
+        np.random.shuffle(short_samples)
+        np.random.shuffle(long_samples)
+        
+        # Combine short and long samples into batches
+        for i in range(0, len(short_samples) - half_batch + 1, half_batch):
+            if i + half_batch <= len(long_samples):
+                batch = list(short_samples[i:i + half_batch])
+                batch.extend(list(long_samples[i:i + half_batch]))
+                np.random.shuffle(batch)  # Shuffle within batch
+                yield batch
+                
+    def __len__(self):
+        return len(self.dataset) // self.batch_size
+    
 class TestingDataset(Dataset, ABC):
     def __init__(self, voxels, max_pts, device, in_memory=False):
         if not voxels:
@@ -71,11 +114,11 @@ class PointCloudClassifier:
 
     @staticmethod
     @jit(nopython=True, parallel=True)
-    def compute_labels(nbr_classification, labels, is_wood, any_wood):
+    def compute_labels(nbr_classification, labels, any_wood):
         num_neighborhoods = labels.shape[0]
         num_classes = nbr_classification.shape[1]
         for i in prange(num_neighborhoods):
-            labels[i, 1] = np.mean(nbr_classification[i, :, -1])
+            labels[i, 1] = np.median(nbr_classification[i, :, -1])
             if any_wood != 1:
                 over_threshold = nbr_classification[i, :, -2] > any_wood
                 labels[i, 0] = np.where(np.any(over_threshold), 1, 0)  
@@ -94,10 +137,10 @@ class PointCloudClassifier:
             indices = np.load(indices_file)
         else:
             kd_tree = KDTree(classification[:, :3])
-            _, indices = kd_tree.query(original.values[:, :3], k = 8 if self.any_wood != 1 else 32)
+            _, indices = kd_tree.query(original.values[:, :3], k = 32 if self.any_wood != 1 else 64)
 
         labels = np.zeros((original.shape[0], 2))
-        labels = self.compute_labels(classification[indices], labels, self.is_wood, self.any_wood)
+        labels = self.compute_labels(classification[indices], labels, self.any_wood)
         original.loc[:, ['label', 'pwood']] = labels
         return original
 
@@ -131,10 +174,13 @@ def SemanticSegmentation(args):
     '''
 
     test_dataset = TestingDataset(voxels=args.vxfile, device = device, max_pts=args.max_pts)
-                                
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
-                              shuffle=False, drop_last=False, num_workers=0,
-                              pin_memory=True)
+    
+    batch_sampler = BalancedBatchSampler(test_dataset, args.batch_size)
+                         
+    test_loader = DataLoader(test_dataset, 
+                           batch_sampler=batch_sampler,
+                           num_workers=0,
+                           pin_memory=True)
 
     #####################################################################################################
 

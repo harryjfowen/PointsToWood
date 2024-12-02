@@ -1,6 +1,8 @@
 import numpy as np
 from scipy.spatial import cKDTree
 from collections import deque
+from src.io import load_file, save_file
+import argparse
 
 class EuclideanCluster:
     def __init__(self, cluster_tolerance, min_cluster_size, max_cluster_size=np.inf):
@@ -21,7 +23,6 @@ class EuclideanCluster:
             if self.min_cluster_size <= len(cluster) <= self.max_cluster_size:
                 clusters.append(cluster)
 
-        # Create labels array
         labels = np.full(len(points), -1, dtype=int)
         for cluster_id, cluster in enumerate(clusters):
             labels[cluster] = cluster_id
@@ -40,25 +41,38 @@ class EuclideanCluster:
             processed.add(point_idx)
             cluster.append(point_idx)
 
-            # Here we use the cluster_tolerance (epsilon) to find neighboring points
             neighbors = tree.query_ball_point(points[point_idx], self.cluster_tolerance)
             queue.extend([idx for idx in neighbors if idx not in processed])
 
         return cluster
     
-# Example usage
 if __name__ == "__main__":
-    # Generate a sample point cloud
-    np.random.seed(0)
-    points = np.random.rand(10000, 3) * 100
+    parser = argparse.ArgumentParser(description="Perform Euclidean Clustering on a point cloud file.")
+    parser.add_argument("input_file", help="Path to the input point cloud file")
+    parser.add_argument("--cluster_tolerance", type=float, default=0.1, help="Cluster tolerance (epsilon)")
+    parser.add_argument("--min_cluster_size", type=int, default=10, help="Minimum cluster size")
+    parser.add_argument("--max_cluster_size", type=int, default=10000, help="Maximum cluster size")
+    args = parser.parse_args()
 
-    # Add some clustered points
-    points = np.vstack([points, np.random.normal(50, 2, (1000, 3))])
-    points = np.vstack([points, np.random.normal(80, 2, (1000, 3))])
+    # Load the point cloud file
+    pc_data, headers = load_file(filename=args.input_file, additional_headers=True, verbose=True)
 
-    # Cluster the points
-    clusterer = EuclideanCluster(cluster_tolerance=0.1, min_cluster_size=10, max_cluster_size=10000)
+    # Extract XYZ coordinates from the loaded data
+    # Adjust this based on your data structure
+    points = pc_data[['x', 'y', 'z']].values
+
+    # Perform clustering
+    clusterer = EuclideanCluster(
+        cluster_tolerance=args.cluster_tolerance,
+        min_cluster_size=args.min_cluster_size,
+        max_cluster_size=args.max_cluster_size
+    )
     labels = clusterer.cluster(points)
 
     print(f"Number of clusters: {len(np.unique(labels[labels != -1]))}")
     print(f"Number of noise points: {np.sum(labels == -1)}")
+
+    # You can add more processing here, such as saving the labeled points to a file
+    # For example:
+    # pc_data['cluster_label'] = labels
+    # save_file('output_clustered.ply', pc_data, additional_fields=['cluster_label'])
