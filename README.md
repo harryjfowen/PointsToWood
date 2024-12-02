@@ -30,7 +30,7 @@ PointsToWood: A deep learning framework for complete canopy leaf-wood segmentati
    ```bash
    mamba install pytorch==2.3.1 pytorch-cuda=12.1 -c pytorch -c nvidia
    mamba install pyg==2.5.3 -c pyg
-   mamba install pytorch-scatter -c pyg
+   mamba install pytorch-scatter==2.1.1 -c pyg
 
 📎 [Pytorch](https://pytorch.org/get-started/locally/) instructions for each OS can be found here.
 
