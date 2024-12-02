@@ -22,9 +22,8 @@ PointsToWood: A deep learning framework for complete canopy leaf-wood segmentati
 
 2. Set up a Conda environment:
    ```bash
-   conda create --name myenv python=3.10
+   conda create --name myenv python=3.10 mamba -c conda-forge
    conda activate myenv
-   conda install mamba -c conda-forge
 
 3. install packages within your Conda environment using mamba
    ```bash
