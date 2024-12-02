@@ -20,16 +20,18 @@ PointsToWood: A deep learning framework for complete canopy leaf-wood segmentati
 
 1. Install the Ubuntu NVIDIA driver (535.183.06 recommended).
 
-2. Set up a Conda environment:
+2. Install NVIDIA toolkit (https://developer.nvidia.com/cuda-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=22.04&target_type=deb_local)
+
+3. Set up a Conda environment:
    ```bash
    conda create --name myenv python=3.10 mamba -c conda-forge
    conda activate myenv
 
-3. install packages within your Conda environment using mamba
+4. install packages within your Conda environment using mamba
    ```bash
-   mamba install pytorch==2.3.1 pytorch-cuda=12.1 -c pytorch -c nvidia
-   mamba install pyg==2.5.3 -c pyg
-   mamba install pytorch-scatter==2.1.1 -c pyg
+   mamba install pytorch pytorch-cuda=12.6 -c pytorch -c nvidia
+   mamba install pyg -c pyg
+   mamba install pytorch-scatter -c pyg
 
 📎 [Pytorch](https://pytorch.org/get-started/locally/) instructions for each OS can be found here.
 
