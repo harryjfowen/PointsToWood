@@ -114,12 +114,10 @@ class SAModule(torch.nn.Module):
             idx = self.random_sample(pos.shape[0])
         else:
             idx = self.voxelsample(pos[:, :3], batch, self.resolution)
-
         if self.resolution == 0.04:
             row, col = radius(pos[:, :3], pos[idx, :3], self.resolution*2, batch, batch[idx], max_num_neighbors=self.k)
         else: 
             row, col = knn(x=pos[:, :3], y=pos[idx, :3], k=self.k, batch_x=batch, batch_y=batch[idx])
-            
         edge_index = torch.stack([col, row], dim=0)
         pos[:, :3] = pos[:, :3] / sf[batch].unsqueeze(-1)
         x = self.conv(x, (pos, pos[idx]), edge_index)

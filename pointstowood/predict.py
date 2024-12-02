@@ -12,6 +12,7 @@ import shutil
 import sys
 import numpy as np
 import re
+from src.io import load_file, save_file
 
 '''
 Minor functions-------------------------------------------------------------------------------------------------------------
@@ -30,7 +31,7 @@ def get_path(location_in_pointstowood: str = "") -> str:
 
 def preprocess_point_cloud_data(df):
     df.columns = df.columns.str.lower()
-    columns_to_drop = ['n_z', 'label', 'pwood', 'pleaf']
+    columns_to_drop = ['label', 'pwood', 'pleaf']
     df = df.drop(columns=columns_to_drop, errors='ignore')
     df = df.rename(columns=lambda x: x.replace('scalar_', '') if 'scalar_' in x else x)
     df = df.rename(columns={'refl': 'reflectance', 'intensity': 'reflectance'})
