@@ -19,6 +19,8 @@ PointsToWood: A deep learning framework for complete canopy leaf-wood segmentati
 ### Setup Instructions
 
 1. Install the Ubuntu NVIDIA driver (535.183.06 recommended).
+   '''bash
+   sudo ubuntu-drivers install nvidia:535
 
 2. Install NVIDIA toolkit (https://developer.nvidia.com/cuda-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=22.04&target_type=deb_local)
 
