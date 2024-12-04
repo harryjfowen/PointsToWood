@@ -29,7 +29,7 @@ PointsToWood: A deep learning framework for complete canopy leaf-wood segmentati
    conda create --name myenv python=3.10 mamba -c conda-forge
    conda activate myenv
 
-4. install packages within your Conda environment using mamba
+4. install packages within your Conda environment
    ```bash
    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
    pip install torch-scatter -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
@@ -37,6 +37,7 @@ PointsToWood: A deep learning framework for complete canopy leaf-wood segmentati
    pip install torch-cluster -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
    pip install torch-spline-conv -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
    pip install torch-geometric
+   pip install pandas pykdtree numba 
 
 📎 [Pytorch](https://pytorch.org/get-started/locally/) instructions for each OS can be found here.
 
@@ -61,7 +62,7 @@ cd ~/points2wood/points2wood/
 3. Run PointsToWood.
    
 ```
-python3 predict.py --point-cloud /x/x/cloud.ply --model f1-eu.pth --batch_size 8 --is-wood 0.50 --grid_size 2.0 4.0 --min_pts 2048 --max_pts 16384;
+python3 predict.py --point-cloud /x/x/cloud.ply --model global.pth --batch_size 8 --is-wood 0.50 --grid_size 2.0 4.0 --min_pts 128 --max_pts 16384;
 ```
 
 *NOTE Make sure the point cloud contains columns x y z as a minimum and x y z reflectance if available to you.
