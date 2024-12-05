@@ -14,6 +14,10 @@ import numpy as np
 import re
 from src.io import load_file, save_file
 
+def set_num_threads(num_threads):
+    torch.set_num_threads(num_threads)
+    os.environ['OMP_NUM_THREADS'] = str(num_threads)
+
 '''
 Minor functions-------------------------------------------------------------------------------------------------------------
 '''
@@ -58,10 +62,10 @@ if __name__ == '__main__':
     parser.add_argument('--point-cloud', '-p', default=[], nargs='+', type=str, help='list of point cloud files')    
     parser.add_argument('--odir', type=str, default='.', help='output directory')
     parser.add_argument('--batch_size', default=8, type=int, help="If you get CUDA errors, try lowering this.")
-    parser.add_argument('--num_procs', default=30, type=int, help="Number of CPU cores you want to use. If you run out of RAM, lower this.")
+    parser.add_argument('--num_procs', default=-1, type=int, help="Number of CPU cores you want to use. If you run out of RAM, lower this.")
     parser.add_argument('--resolution', type=float, default=0.01, help='Resolution to which point cloud is downsampled [m]')
     parser.add_argument('--grid_size', type=float, nargs='+', default=[2.0, 4.0], help='Grid sizes for voxelization')
-    parser.add_argument('--min_pts', type=int, default=8192, help='Minimum number of points in voxel')
+    parser.add_argument('--min_pts', type=int, default=128, help='Minimum number of points in voxel')
     parser.add_argument('--max_pts', type=int, default=16384, help='Maximum number of points in voxel')
     parser.add_argument('--model', type=str, default='model.pth', help='path to candidate model')
     parser.add_argument('--is-wood', default=0.5, type=float, help='a probability above which points within KNN are classified as wood')
@@ -70,6 +74,14 @@ if __name__ == '__main__':
     parser.add_argument('--verbose', action='store_true', help="print stuff")
 
     args = parser.parse_args()
+
+    # Configure the number of threads based on args.num_procs
+    if args.num_procs == -1:
+        num_threads = os.cpu_count()
+    else:
+        num_threads = args.num_procs
+
+    set_num_threads(num_threads)
 
     if args.verbose:
         print('\n---- parameters used ----')
