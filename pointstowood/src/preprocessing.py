@@ -42,17 +42,14 @@ class Voxelise:
         y_min, y_max = torch.min(y), torch.max(y)
         x_bins = torch.arange(x_min, x_max + grid_resolution, grid_resolution, device='cuda')
         y_bins = torch.arange(y_min, y_max + grid_resolution, grid_resolution, device='cuda')
-        x_indices = torch.bucketize(x.contiguous(), x_bins)
-        y_indices = torch.bucketize(y.contiguous(), y_bins)
+        x_indices = torch.bucketize(x, x_bins)
+        y_indices = torch.bucketize(y, y_bins)
         grid_indices = x_indices * len(y_bins) + y_indices
         _, grid_inverse_indices = torch.unique(grid_indices, return_inverse=True)
         min_z_values = torch_scatter.scatter_min(z, grid_inverse_indices)[0]
         min_z_per_point = min_z_values[grid_inverse_indices]
-        # global_max_z = torch.max(z)
-        # normalized_z = (z - min_z_per_point) / (global_max_z - min_z_per_point + 1e-8)
         normalized_z = z - min_z_per_point  # Preserve units in meters
-        normalized_z = normalized_z.view(-1, 1) 
-        self.pos = torch.cat((self.pos, normalized_z), dim=1)
+        self.pos = torch.cat((self.pos, normalized_z.view(-1, 1)), dim=1)
         return self.pos
         
     def grid(self):
@@ -87,6 +84,8 @@ class Voxelise:
             self.pos = self.gpu_ground()
         else:
             self.pos = torch.tensor(self.pos.values, dtype=torch.float).to(device='cuda')
+        
+        self.pos = self.gpu_ground()
         
         reflectance_not_zero = not torch.all(self.pos[:, 3] == 0)
         

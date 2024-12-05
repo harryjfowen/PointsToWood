@@ -18,9 +18,6 @@ from torch.utils.data import Sampler
 import warnings
 warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
-
-os.environ['OMP_NUM_THREADS'] = str(os.cpu_count()-1)
-set_num_threads(30)
 sys.setrecursionlimit(10 ** 8) 
 
 class BalancedBatchSampler(Sampler):
