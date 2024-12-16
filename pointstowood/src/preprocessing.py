@@ -13,7 +13,7 @@ class Voxelise:
         self.minpoints = minpoints
         self.maxpoints = maxpoints
         self.gridsize = gridsize
-        self.pointspacing = min(self.gridsize) / 100.0#pointspacing
+        self.pointspacing = min(self.gridsize) / 100.0
 
     def quantile_normalize_reflectance(self):
         reflectance_tensor = self.pos[:, 3].view(-1)
@@ -36,7 +36,7 @@ class Voxelise:
 
     def gpu_ground(self):
         self.pos = self.pos.contiguous()
-        x, y, z = self.pos[:, 0], self.pos[:, 1], self.pos[:, 2]
+        x, y, z = self.pos[:, 0].contiguous(), self.pos[:, 1].contiguous(), self.pos[:, 2].contiguous()
         grid_resolution = 5.0
         x_min, x_max = torch.min(x), torch.max(x)
         y_min, y_max = torch.min(y), torch.max(y)
@@ -55,12 +55,12 @@ class Voxelise:
     def grid(self):
         indices_list = []
         for size in self.gridsize:
-            voxelised = voxel_grid(self.pos, size).to('cpu')
+            voxelised = voxel_grid(self.pos, size)
             for vx in torch.unique(voxelised):
                 voxel = (voxelised == vx).nonzero(as_tuple=True)[0]
                 if voxel.size(0) < self.minpoints:
                     continue
-                indices_list.append(voxel)
+                indices_list.append(voxel.to('cpu'))
         return indices_list
     
     def reflectance2intensity(self):
@@ -77,16 +77,14 @@ class Voxelise:
         return self.pos
     
     def write_voxels(self):
-    
+        # Check if 'n_z' is in the DataFrame before converting to tensor
         if 'n_z' not in self.pos.columns:
             print('Height Normalising Point Cloud')
             self.pos = torch.tensor(self.pos.values, dtype=torch.float).to(device='cuda')
             self.pos = self.gpu_ground()
         else:
             self.pos = torch.tensor(self.pos.values, dtype=torch.float).to(device='cuda')
-        
-        self.pos = self.gpu_ground()
-        
+                
         reflectance_not_zero = not torch.all(self.pos[:, 3] == 0)
         
         #self.reflectance2intensity()
@@ -95,6 +93,7 @@ class Voxelise:
             self.pos[:, 3] = self.quantile_normalize_reflectance()
 
         voxels = self.grid()
+
         
         if reflectance_not_zero:
             weight = self.pos[:, 3] - self.pos[:, 3].min()
@@ -125,7 +124,7 @@ class Voxelise:
             
             torch.save(voxel, os.path.join(self.vxpath, f'voxel_{file_counter}.pt'))
             file_counter += 1
-        return (self.pos[:,-1])
+        return self.pos[:, -1]
 
 def preprocess(args):
     n_z = Voxelise(args.pc, vxpath=args.vxfile, minpoints=args.min_pts, maxpoints=args.max_pts, pointspacing=args.resolution, gridsize = args.grid_size).write_voxels()
