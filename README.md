@@ -17,6 +17,7 @@ PointsToWood: A deep learning framework for complete canopy leaf-wood segmentati
 - **CUDA Version:** 12.2
 
 ### Setup Instructions
+#### For Ubuntu
 
 1. Install the Ubuntu NVIDIA driver (535.183.06 recommended).
    '''bash
@@ -24,12 +25,19 @@ PointsToWood: A deep learning framework for complete canopy leaf-wood segmentati
 
 2. Install NVIDIA toolkit (https://developer.nvidia.com/cuda-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=22.04&target_type=deb_local)
 
+#### For WSL 
+1. Install the appropriate NVIDIA driver on Windows (which should be automatically  made available for use within WSL).
+ 
+2. Install NVIDIA toolkit.
+   Guidance for WSL NVDIA driver and toolkit installation are available here: https://docs.nvidia.com/cuda/wsl-user-guide/index.html#installing-nvidia-drivers
+
+#### For both systems 
 3. Set up a Conda environment:
    ```bash
    conda create --name myenv python=3.10 mamba -c conda-forge
    conda activate myenv
 
-4. install packages within your Conda environment
+3. install packages within your Conda environment
    ```bash
    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
    pip install torch-scatter -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
