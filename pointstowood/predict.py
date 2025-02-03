@@ -63,7 +63,7 @@ if __name__ == '__main__':
     parser.add_argument('--odir', type=str, default='.', help='output directory')
     parser.add_argument('--batch_size', default=8, type=int, help="If you get CUDA errors, try lowering this.")
     parser.add_argument('--num_procs', default=-1, type=int, help="Number of CPU cores you want to use. If you run out of RAM, lower this.")
-    parser.add_argument('--resolution', type=float, default=0.01, help='Resolution to which point cloud is downsampled [m]')
+    parser.add_argument('--resolution', type=float, default=None, help='Resolution to which point cloud is downsampled [m]')
     parser.add_argument('--grid_size', type=float, nargs='+', default=[2.0, 4.0], help='Grid sizes for voxelization')
     parser.add_argument('--min_pts', type=int, default=128, help='Minimum number of points in voxel')
     parser.add_argument('--max_pts', type=int, default=16384, help='Maximum number of points in voxel')
@@ -120,9 +120,10 @@ if __name__ == '__main__':
         '''
         
         path = OP.dirname(point_cloud_file)
-        file = OP.splitext(OP.basename(point_cloud_file))[0] + "_ours.ply"
+        file = OP.splitext(OP.basename(point_cloud_file))[0] + "_wood.ply"
         args.odir = OP.join(path, file)
-
+        args.h5 = OP.join(path, file.replace('_wood.ply', '_features.h5'))
+        
         '''
         Preprocess data into voxels------------------------------------------------------------------------------------------
         '''

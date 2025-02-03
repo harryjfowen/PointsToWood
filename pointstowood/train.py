@@ -62,7 +62,7 @@ if __name__ == '__main__':
         parser.add_argument('--num_epochs', default=2, type=int, metavar='N', help='number of total epochs to run')
         parser.add_argument('--checkpoint_saves', default=1, type=int, metavar='N', help='number of times to save model')
         parser.add_argument('--model', type=str, default='model.pth', help='Name of global model [e.g. model.pth]')
-        parser.add_argument('--resolution', type=float, default=0.01, help='Resolution to which point cloud is downsampled [m]')
+        parser.add_argument('--resolution', type=float, default=None, help='Resolution to which point cloud is downsampled [m]')
         parser.add_argument('--grid_size', type=float, nargs='+', default=[2.0, 4.0], help='Grid sizes for voxelization')
         parser.add_argument('--min_pts', type=int, default=8192, help='Minimum number of points in voxel')
         parser.add_argument('--max_pts', type=int, default=16384, help='Maximum number of points in voxel')

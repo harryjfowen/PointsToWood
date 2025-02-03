@@ -16,14 +16,19 @@ from src.cosine_scheduler import CosineAnnealingWarmupRestarts
 import warnings
 import copy
 import glob
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import autocast_mode
 torch.backends.cudnn.benchmark = False
-
+torch.set_float32_matmul_precision('medium')
 warnings.filterwarnings("ignore", category=UserWarning)
 torch.autograd.set_detect_anomaly(True)
 
 seed = 141190
 torch.manual_seed(seed)
+def write_xyz_to_file(tensor: torch.Tensor, filename: str):
+    tensor_np = tensor.cpu().numpy()    
+    with open(filename, 'w') as f:
+        for row in tensor_np:
+            f.write(f"{row[0]} {row[1]} {row[2]}\n")
 
 class TrainingDataset(Dataset, ABC):
     def __init__(self, voxels, augmentation, mode, max_pts, device):
@@ -40,12 +45,11 @@ class TrainingDataset(Dataset, ABC):
         self.mode = mode
 
     def __len__(self):
-
         return len(self.keys) 
 
     def __getitem__(self, index):
 
-        point_cloud = torch.load(self.keys[index])
+        point_cloud = torch.load(self.keys[index], weights_only=True)
         pos = torch.as_tensor(point_cloud[:, :3], dtype=torch.float).requires_grad_(False)
         reflectance = torch.as_tensor(point_cloud[:, self.reflectance_index], dtype=torch.float)
         y = torch.as_tensor(point_cloud[:, self.label_index], dtype=torch.float)
@@ -56,8 +60,26 @@ class TrainingDataset(Dataset, ABC):
         scaling_factor = torch.sqrt((pos ** 2).sum(dim=1)).max()
         if torch.any(torch.isnan(reflectance)):
             print('nans in relfectance')
-        data = Data(pos=pos, reflectance=reflectance, y=y, sf=scaling_factor)
+        # Compute pointwise class ratio
+        label_weighting = self.calculate_pointwise_weight(y)
+        #sample_ratio = self.sample_pos_weight(y)
+        data = Data(pos=pos, reflectance=reflectance, y=y, sf=scaling_factor, label_weighting=label_weighting)
+        # output_dir = '/home/harryowen/Desktop/voxels/'
+        # os.makedirs(output_dir, exist_ok=True)
+        # filename = os.path.join(output_dir, f'{index + 1}_.txt')
+        # write_xyz_to_file(pos, filename)
+    
         return data
+    
+    def calculate_pointwise_weight(self, y, min_weight=0.5):
+        num_pos = (y == 1).sum().float()
+        num_neg = (y == 0).sum().float()
+        total = num_pos + num_neg
+        pos_ratio = num_pos / total
+        weight = 1.0 - torch.abs(pos_ratio - 0.5) * 2.0
+        weight = torch.clamp(weight, min=min_weight)
+        weights = torch.full_like(y, weight, dtype=torch.float, device=y.device)
+        return weights
 
 class ModelManager:
     def __init__(self, model, device):
@@ -65,7 +87,7 @@ class ModelManager:
         self.device = device
 
     def load_model(self, path):
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=True)
         adjusted_state_dict = OrderedDict()
         for key, value in checkpoint['model_state_dict'].items():
             if key.startswith('module.'):
@@ -103,11 +125,19 @@ def SemanticTraining(args):
         wandb.init(project="PointsToWood", config={"architecture": "pointnet++","dataset": "high resolution 2 & 4 m voxels","epochs": args.num_epochs,})
         
     
-    model = Net(num_classes=1).to(device)
+    model = Net(num_classes=1, num_epochs=args.num_epochs).to(device)
     print('Model contains', sum(p.numel() for p in model.parameters()), ' parameters')
 
     train_dataset = TrainingDataset(voxels=args.trfile, augmentation=args.augmentation, mode='train', device=device, max_pts=args.max_pts)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=32, sampler = None, pin_memory=True)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=32,              # Increase from default
+        pin_memory=True,           # Faster data transfer to GPU
+        persistent_workers=True,    # Keep workers alive between epochs
+        prefetch_factor=2          # Prefetch batches
+    )
 
     if args.test:
         test_dataset = TrainingDataset(voxels=args.tefile, augmentation=args.augmentation, mode='test', device=device, max_pts=args.max_pts)
@@ -115,12 +145,8 @@ def SemanticTraining(args):
 
     criterion = Poly1FocalLoss(reduction="mean", gamma = 2.0, alpha = None, label_smoothing = 0.1)
 
-    if args.tune: 
-        optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-6, weight_decay=1e-2)
-        lr_scheduler = CosineAnnealingWarmupRestarts(optimizer, first_cycle_steps=args.num_epochs//5, cycle_mult=1.0, max_lr=1e-6, min_lr=1e-8, warmup_steps=5, gamma=0.5)
-    else:
-        optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4, weight_decay=1e-2)
-        lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-4, total_steps=args.num_epochs, pct_start=0.05, anneal_strategy='cos', div_factor = 100)
+    optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=5e-5, weight_decay=1e-4)
+    lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=5e-5, total_steps=args.num_epochs, pct_start=0.08, anneal_strategy='cos', div_factor = 100)
             
     manager = ModelManager(model, device)
 
@@ -148,12 +174,9 @@ def SemanticTraining(args):
     gamma = 0.0,0.0
     best_ba_train, best_f1_train, best_ba_test, best_f1_test, best_precision_test = 0.0, 0.0, 0.0, 0.0, 0.0
 
-    scaler = GradScaler(init_scale=512)
-
     for epoch in range(1, args.num_epochs + 1):
 
         model.train()
-        accumulation_steps = 1
 
         train_loss, train_accuracy, train_precision, train_recall, train_f1 = 0.0, 0.0, 0.0, 0.0, 0.0
 
@@ -165,28 +188,35 @@ def SemanticTraining(args):
             for i, (data) in enumerate(train_loader):
                 
                 data = data.to(device)
-                if i % accumulation_steps == 0:
-                    optimizer.zero_grad()
+                optimizer.zero_grad()
 
                 try:
                     model_params_before = copy.deepcopy(model.state_dict())
-
-                    with autocast():
+                    
+                    with autocast_mode.autocast(
+                        device_type='cuda' if torch.cuda.is_available() else 'cpu',
+                        enabled=True, 
+                        dtype=torch.bfloat16
+                    ):
                         outputs = model(data)
-                        loss, gamma = criterion(outputs, data.y)
-                        loss = loss / accumulation_steps 
+                        outputs = torch.clamp(outputs, min=-20.0, max=20.0)  # This is your safety net
+                        loss, gamma = criterion(outputs, data.y, data.label_weighting)
 
-                    scaler.scale(loss).backward()
+                    pre_backward_stats = {
+                        'outputs_mean': outputs.mean().item(),
+                        'outputs_std': outputs.std().item(),
+                        'loss_value': loss.item(),
+                        'max_abs_output': torch.abs(outputs).max().item()
+                    }
 
-                    if (i + 1) % accumulation_steps == 0:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad()
-
-                except Exception as e:
-                    print(f"Skipping a batch due to an error: {e}")
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                
+                except RuntimeError as e:
+                    print(f"\nSkipping batch due to error: {str(e)}")
+                    print(f"Last known good values: {pre_backward_stats}")
                     model.load_state_dict(model_params_before)
                     optimizer.zero_grad()
                     continue
@@ -196,10 +226,10 @@ def SemanticTraining(args):
                     preds = (probs >= 0.50).type(torch.int64).detach()
 
                 train_loss += loss.item()
-                train_precision += precision_score(data.y.cpu(), preds.cpu(), average='binary', zero_division=0)
-                train_recall += recall_score(data.y.cpu(), preds.cpu(), average='binary', zero_division=0)
-                train_accuracy += balanced_accuracy_score(data.y.cpu(), preds.cpu(), sample_weight=None)
-                train_f1 += f1_score(data.y.cpu(), preds.cpu(), average='binary', zero_division=0)
+                train_precision += precision_score(data.y.cpu().numpy(), preds.cpu().numpy(), average='binary', zero_division=0)
+                train_recall += recall_score(data.y.cpu().numpy(), preds.cpu().numpy(), average='binary', zero_division=0)
+                train_accuracy += balanced_accuracy_score(data.y.cpu().numpy(), preds.cpu().numpy(), sample_weight=None)
+                train_f1 += f1_score(data.y.cpu().numpy(), preds.cpu().numpy(), average='binary', zero_division=0)
 
                 lr_list.append(optimizer.param_groups[0]["lr"])
                 tepoch.set_description(f"Train")
@@ -236,10 +266,10 @@ def SemanticTraining(args):
                             probs = torch.sigmoid(outputs).detach()
                             preds = (probs >= 0.50).type(torch.int64).detach()                        
 
-                        test_precision += precision_score(data.y.cpu(), preds.cpu(), average='binary', zero_division=0)
-                        test_recall += recall_score(data.y.cpu(), preds.cpu(),average='binary', zero_division=0)
-                        test_accuracy += balanced_accuracy_score(data.y.cpu(), preds.cpu(), sample_weight=None)
-                        test_f1 += f1_score(data.y.cpu(), preds.cpu(),average='binary', zero_division=0)
+                        test_precision += precision_score(data.y.cpu().numpy(), preds.cpu().numpy(), average='binary', zero_division=0)
+                        test_recall += recall_score(data.y.cpu().numpy(), preds.cpu().numpy(),average='binary', zero_division=0)
+                        test_accuracy += balanced_accuracy_score(data.y.cpu().numpy(), preds.cpu().numpy(), sample_weight=None)
+                        test_f1 += f1_score(data.y.cpu().numpy(), preds.cpu().numpy(),average='binary', zero_division=0)
 
                         lr_list.append(optimizer.param_groups[0]["lr"])
                         tepoch.set_description(f"Test")
@@ -293,14 +323,21 @@ def SemanticTraining(args):
                     break
 
         if epoch > int(args.num_epochs*0.10) and not args.test:
-            best_ba_train = manager.save_best_model(train_accuracy/len(train_loader), best_ba_train, os.path.join(args.wdir,'model','ba-' + os.path.basename(args.model)))
-            best_f1_train = manager.save_best_model(train_f1/len(train_loader), best_f1_train, os.path.join(args.wdir,'model','f1-' + os.path.basename(args.model)))
-        
-        if args.test and epoch > int(args.num_epochs*0.5):
-            best_ba_test = manager.save_best_model(test_accuracy/len(test_loader), best_ba_test, os.path.join(args.wdir,'model','ba-' + os.path.basename(args.model)))
-            best_f1_test = manager.save_best_model(test_f1/len(test_loader), best_f1_test, os.path.join(args.wdir,'model','f1-' + os.path.basename(args.model)))
-            best_precision_test = manager.save_best_model(test_precision/len(test_loader), best_precision_test, os.path.join(args.wdir,'model','precision-' + os.path.basename(args.model)))
+            if train_precision/len(train_loader) > train_recall/len(train_loader):
+                best_ba_train = manager.save_best_model(train_accuracy/len(train_loader), best_ba_train, 
+                    os.path.join(args.wdir,'model','ba-' + os.path.basename(args.model)))
+                best_f1_train = manager.save_best_model(train_f1/len(train_loader), best_f1_train, 
+                    os.path.join(args.wdir,'model','f1-' + os.path.basename(args.model)))
 
+        if args.test and epoch > int(args.num_epochs*0.5):
+            if test_precision/len(test_loader) >= test_recall/len(test_loader):
+                best_ba_test = manager.save_best_model(test_accuracy/len(test_loader), best_ba_test, 
+                    os.path.join(args.wdir,'model','ba-' + os.path.basename(args.model)))
+                best_f1_test = manager.save_best_model(test_f1/len(test_loader), best_f1_test, 
+                    os.path.join(args.wdir,'model','f1-' + os.path.basename(args.model)))
+                best_precision_test = manager.save_best_model(test_precision/len(test_loader), best_precision_test, 
+                    os.path.join(args.wdir,'model','precision-' + os.path.basename(args.model)))
+        
         if epoch == args.num_epochs:
             print("Saving final GLOBAL model")
             torch.save({'model_state_dict': model.state_dict()}, os.path.join(args.wdir,'model',args.model))

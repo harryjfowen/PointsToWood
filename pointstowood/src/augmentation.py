@@ -23,34 +23,45 @@ def random_rescale(points, scale_range=(0.9, 1.1)):
     return points
 
 def silence_reflectance(feature):
-    feature = torch.zeros_like(feature)
-    return feature
+    # Pure Gaussian noise centered at 0 with very small std
+    # Most values will naturally fall within [-0.06, 0.06] (2 std)
+    small_noise = torch.randn_like(feature) * 0.02  # std=0.02
+    return small_noise
+    
+    # Or if you want ultra-small values:
+    # return torch.randn_like(feature) * 0.01  # std=0.01
 
 def perturb_reflectance(feature):
     noise = torch.normal(mean=0.0, std=0.1, size=feature.size())
     feature = feature + noise
     return feature
 
-def random_downsample(points, reflectance, label):
-    resolution = torch.rand(1).item() * 0.03 + 0.01
+def random_grid_downsample(points, reflectance, label, resolution_range=(0.01, 0.02)):
+    resolution = torch.rand(1).item() * (resolution_range[1] - resolution_range[0]) + resolution_range[0]
     shuffled_points = points[torch.randperm(points.size(0))]
     voxel_indices = voxel_grid(shuffled_points, resolution)
     _, idx = consecutive_cluster(voxel_indices)
     return points[idx], reflectance[idx], label[idx]
 
+def random_downsample(points, reflectance, label, keep_ratio=0.75):
+    num_points = points.size(0)
+    num_keep = int(num_points * keep_ratio)
+    keep_indices = torch.randperm(num_points)[:num_keep]
+    return points[keep_indices], reflectance[keep_indices], label[keep_indices]
+
 def augmentations(pos, reflectance, label, mode='train'):
     rand_val_refl = torch.rand(1)
     rand_val_pos = torch.rand(1)
-    if rand_val_refl < 0.25:
+    if rand_val_refl < 0.15:
         reflectance = silence_reflectance(reflectance)
-    if mode == 'train':
-        if rand_val_refl >= 0.25 and rand_val_refl < 0.5:
-            reflectance = perturb_reflectance(reflectance)
+    # if mode == 'train':
+    #     if rand_val_refl >= 0.25 and rand_val_refl < 0.5:
+    #         reflectance = perturb_reflectance(reflectance)
     if rand_val_pos < 0.25:
         pos = rotate_3d(pos)
     # if rand_val_pos > 0.25 and rand_val_pos <= 0.375:
-    #     pos = random_rescale(pos)
-    # if (rand_val_pos) > 0.375 and rand_val_pos <= 0.50:
-    #     pos = random_noise_addition(pos)
+    #     pos, reflectance, label = random_grid_downsample(pos, reflectance, label)
+    # if rand_val_pos > 0.375 and rand_val_pos <= 0.5:
+    #     pos, reflectance, label = random_downsample(pos, reflectance, label)
     return pos, reflectance, label
 

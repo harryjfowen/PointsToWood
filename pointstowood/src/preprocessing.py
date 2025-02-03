@@ -7,13 +7,13 @@ from tqdm import tqdm
 import torch_scatter
 
 class Voxelise:
-    def __init__(self, pos, vxpath, minpoints=512, maxpoints=16384, gridsize=[2.0,4.0], pointspacing=0.01):
+    def __init__(self, pos, vxpath, minpoints=512, maxpoints=16384, gridsize=[2.0,4.0], pointspacing=None):
         self.pos = pos
         self.vxpath = vxpath
         self.minpoints = minpoints
         self.maxpoints = maxpoints
         self.gridsize = gridsize
-        self.pointspacing = min(self.gridsize) / 100.0
+        self.pointspacing = None
 
     def quantile_normalize_reflectance(self):
         reflectance_tensor = self.pos[:, 3].view(-1)
@@ -26,13 +26,25 @@ class Voxelise:
         normalized_reflectance = torch.erfinv(2 * empirical_quantiles - 1) * torch.sqrt(torch.tensor(2.0)).to(reflectance_tensor.device)
         min_val = normalized_reflectance.min()
         max_val = normalized_reflectance.max()
+        # -1 to 1
         scaled_reflectance = 2 * (normalized_reflectance - min_val) / (max_val - min_val) - 1
+        # 0-1
+        # scaled_reflectance = (normalized_reflectance - min_val) / (max_val - min_val)  # Scale to [0, 1]
         return scaled_reflectance
     
+    # def downsample(self):
+    #     voxelised = voxel_grid(self.pos, self.pointspacing)
+    #     _, idx = consecutive_cluster(voxelised)
+    #     return self.pos[idx]
+    
     def downsample(self):
-        voxelised = voxel_grid(self.pos, self.pointspacing)
-        _, idx = consecutive_cluster(voxelised)
-        return self.pos[idx]
+        coords, values = self.pos[:, :3], self.pos[:, 3]
+        voxel_indices = voxel_grid(pos=coords, size=self.pointspacing)
+        _, remapped_indices = torch.unique(voxel_indices, return_inverse=True)
+        _, max_indices = torch_scatter.scatter_max(values, remapped_indices, dim=0)
+        valid_max_indices = max_indices[max_indices != -1]
+        downsampled_pos = self.pos[valid_max_indices]
+        return downsampled_pos
 
     def gpu_ground(self):
         self.pos = self.pos.contiguous()
@@ -50,7 +62,7 @@ class Voxelise:
         min_z_per_point = min_z_values[grid_inverse_indices]
         normalized_z = z - min_z_per_point  # Preserve units in meters
         self.pos = torch.cat((self.pos, normalized_z.view(-1, 1)), dim=1)
-        return self.pos
+        return normalized_z.view(-1, 1).cpu()#self.pos
         
     def grid(self):
         indices_list = []
@@ -77,24 +89,30 @@ class Voxelise:
         return self.pos
     
     def write_voxels(self):
-        # Check if 'n_z' is in the DataFrame before converting to tensor
-        if 'n_z' not in self.pos.columns:
-            print('Height Normalising Point Cloud')
-            self.pos = torch.tensor(self.pos.values, dtype=torch.float).to(device='cuda')
-            self.pos = self.gpu_ground()
+        do_ground = 'n_z' not in self.pos.columns
+        if not do_ground:
+            grd = torch.tensor(self.pos[['n_z']].values, dtype=torch.float)
         else:
-            self.pos = torch.tensor(self.pos.values, dtype=torch.float).to(device='cuda')
-                
+            grd = None
+
+        self.pos = torch.tensor(self.pos.values, dtype=torch.float).to(device='cuda')
+
+        if do_ground:
+            print('Height Normalising Point Cloud')
+            grd = self.gpu_ground()
+        else:
+            pass
+        
+        # if self.pointspacing:
+        #     self.pos = self.downsample()
+
         reflectance_not_zero = not torch.all(self.pos[:, 3] == 0)
         
-        #self.reflectance2intensity()
-
         if reflectance_not_zero:
             self.pos[:, 3] = self.quantile_normalize_reflectance()
 
         voxels = self.grid()
 
-        
         if reflectance_not_zero:
             weight = self.pos[:, 3] - self.pos[:, 3].min()
             mask = ~(torch.isnan(weight) | torch.isinf(weight))
@@ -124,7 +142,7 @@ class Voxelise:
             
             torch.save(voxel, os.path.join(self.vxpath, f'voxel_{file_counter}.pt'))
             file_counter += 1
-        return self.pos[:, -1]
+        return grd
 
 def preprocess(args):
     n_z = Voxelise(args.pc, vxpath=args.vxfile, minpoints=args.min_pts, maxpoints=args.max_pts, pointspacing=args.resolution, gridsize = args.grid_size).write_voxels()

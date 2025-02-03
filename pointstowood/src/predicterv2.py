@@ -19,43 +19,30 @@ import h5py
 import warnings
 warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
-
-os.environ['OMP_NUM_THREADS'] = str(os.cpu_count()-1)
-set_num_threads(30)
 sys.setrecursionlimit(10 ** 8) 
 
 class BalancedBatchSampler(Sampler):
-    """
-    Batch sampler that keeps fixed batch size but pairs long and short samples
-    to maintain more consistent total points per batch.
-    """
     def __init__(self, dataset, batch_size):
         self.dataset = dataset
         self.batch_size = batch_size
         
-        # Get length of each point cloud
         self.lengths = []
         for key in dataset.keys:
             pc = torch.load(key)
             self.lengths.append(len(pc))
             
-        # Sort indices by length
         self.indices = np.argsort(self.lengths)
         
     def __iter__(self):
-        # Create iterator that pairs short and long samples
         n = len(self.indices)
         half_batch = self.batch_size // 2
         
-        # Shuffle both halves independently to maintain size distribution
-        # but add randomness between epochs
         short_samples = self.indices[:n//2].copy()
         long_samples = self.indices[n//2:].copy()
         
         np.random.shuffle(short_samples)
         np.random.shuffle(long_samples)
         
-        # Combine short and long samples into batches
         for i in range(0, len(short_samples) - half_batch + 1, half_batch):
             if i + half_batch <= len(long_samples):
                 batch = list(short_samples[i:i + half_batch])
@@ -96,7 +83,18 @@ class TestingDataset(Dataset, ABC):
         if nan_mask.any(): print(f"Encountered NaN values in sample at index {index}")
         data = Data(pos=pos, reflectance=reflectance, local_shift=local_shift, sf = scaling_factor)
         return data        
-        
+
+def append_to_h5(f, dataset_name, new_data):
+    if dataset_name in f:
+        dataset = f[dataset_name]
+        current_size = dataset.shape[0]
+        new_size = current_size + new_data.shape[0]
+        dataset.resize(new_size, axis=0)  # Resize along the first dimension
+        dataset[current_size:new_size, ...] = new_data  # Append new data
+    else:
+        max_shape = (None,) + new_data.shape[1:]  # Unlimited rows, fixed other dimensions
+        dataset = f.create_dataset(dataset_name, data=new_data, maxshape=max_shape, chunks=True)
+
 from collections import OrderedDict
 def load_model(path, model, device):
     checkpoint = torch.load(path, map_location=device)
@@ -108,48 +106,95 @@ def load_model(path, model, device):
     model.load_state_dict(adjusted_state_dict, strict=False)
     return model
     
+# class PointCloudClassifier:
+#     def __init__(self, is_wood, any_wood):
+#         self.is_wood = is_wood
+#         self.any_wood = any_wood
+
+#     @staticmethod
+#     @jit(nopython=True, parallel=True)
+#     def compute_labels(nbr_classification, labels, any_wood):
+#         num_neighborhoods = labels.shape[0]
+#         num_classes = nbr_classification.shape[1]
+#         for i in prange(num_neighborhoods):
+#             labels[i, 1] = np.median(nbr_classification[i, :, -1])
+#             if any_wood != 1:
+#                 over_threshold = nbr_classification[i, :, -2] > any_wood
+#                 labels[i, 0] = np.where(np.any(over_threshold), 1, 0)  
+#             else:
+#                 class_votes = np.zeros(num_classes)
+#                 for j in range(num_classes):
+#                     class_votes[j] = np.sum((nbr_classification[i, :, -2] == j) * nbr_classification[i, :, -1])
+#                 labels[i, 0] = np.argmax(class_votes)  
+#         return labels
+
+#     def collect_predictions(self, classification, original):
+#         original = original.drop(columns=[c for c in original.columns if c in ['label', 'pwood', 'pleaf']])
+#         indices_file = os.path.join('nbrs.npy')
+        
+#         if os.path.exists(indices_file):
+#             indices = np.load(indices_file)
+#         else:
+#             kd_tree = KDTree(classification[:, :3])
+#             _, indices = kd_tree.query(original.values[:, :3], k = 32 if self.any_wood != 1 else 64)
+
+#         labels = np.zeros((original.shape[0], 2))
+#         labels = self.compute_labels(classification[indices], labels, self.any_wood)
+#         original.loc[:, ['label', 'pwood']] = labels
+#         return original
+
+from torch_geometric.nn.pool import voxel_grid
+
 class PointCloudClassifier:
-    def __init__(self, is_wood, any_wood):
+    def __init__(self, is_wood, any_wood, voxel_size):
         self.is_wood = is_wood
         self.any_wood = any_wood
+        self.voxel_size = voxel_size  
 
-    @staticmethod
-    @jit(nopython=True, parallel=True)
-    def compute_labels(nbr_classification, labels, any_wood):
-        num_neighborhoods = labels.shape[0]
-        num_classes = nbr_classification.shape[1]
-        for i in prange(num_neighborhoods):
-            labels[i, 1] = np.median(nbr_classification[i, :, -1])
-            if any_wood != 1:
-                over_threshold = nbr_classification[i, :, -2] > any_wood
-                labels[i, 0] = np.where(np.any(over_threshold), 1, 0)  
+    def classify_voxels(self, data, voxel_indices):
+        unique_voxels = torch.unique(voxel_indices)
+        labels = torch.zeros_like(voxel_indices, dtype=torch.long)
+        pwood = torch.zeros_like(voxel_indices, dtype=torch.float)
+
+        for voxel_id in unique_voxels:
+            points_in_voxel = data[voxel_indices == voxel_id]
+
+            if self.any_wood != 1:
+                pwood[voxel_indices == voxel_id] = (
+                    1 if torch.any(points_in_voxel[:, -2] > self.any_wood) else 0
+                )
+                labels[voxel_indices == voxel_id] = 0  
             else:
-                class_votes = np.zeros(num_classes)
-                for j in range(num_classes):
-                    class_votes[j] = np.sum((nbr_classification[i, :, -2] == j) * nbr_classification[i, :, -1])
-                labels[i, 0] = np.argmax(class_votes)  
-        return labels
+                class_votes = torch.bincount(
+                    points_in_voxel[:, -2].long(),  
+                    weights=points_in_voxel[:, -1]  
+                )
+                labels[voxel_indices == voxel_id] = torch.argmax(class_votes)
+                pwood[voxel_indices == voxel_id] = torch.max(points_in_voxel[:, -1])
+
+        return labels, pwood
 
     def collect_predictions(self, classification, original):
-        original = original.drop(columns=[c for c in original.columns if c in ['label', 'pwood', 'pleaf']])
-        indices_file = os.path.join('nbrs.npy')
-        
-        if os.path.exists(indices_file):
-            indices = np.load(indices_file)
-        else:
-            kd_tree = KDTree(classification[:, :3])
-            _, indices = kd_tree.query(original.values[:, :3], k = 32 if self.any_wood != 1 else 64)
 
-        labels = np.zeros((original.shape[0], 2))
-        labels = self.compute_labels(classification[indices], labels, self.any_wood)
-        original.loc[:, ['label', 'pwood']] = labels
-        return original
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        classification = torch.tensor(classification).to(device)
+        original = torch.tensor(original.values).to(device)
 
-    
+        voxel_indices = voxel_grid(
+            pos=classification[:, :3], 
+            size=self.voxel_size,
+            batch=None
+        )
+
+        labels, pwood = self.classify_voxels(classification, voxel_indices)
+
+        original[:, -2] = labels.cpu()
+        original[:, -1] = pwood.cpu()
+
+        return original.cpu().numpy()
 #########################################################################################################
 #                                       SEMANTIC INFERENCE FUNCTION                                     #
 #                                       ==========================                                      #
-
 
 def SemanticSegmentation(args):
 
@@ -169,8 +214,6 @@ def SemanticSegmentation(args):
         load_model(os.path.join(args.wdir,'model',args.model), model, device)
     except KeyError:
         raise Exception(f'No model loaded at {os.path.join(args.wdir,"model",args.model)}')
-    
-    args.odir_features = args.odir.replace('_ours.ply', '_features.h5')
 
     #####################################################################################################
     
@@ -192,55 +235,52 @@ def SemanticSegmentation(args):
     '''
     Initialise model
     '''
-
     model.eval()
 
-    with h5py.File(args.odir_features, 'w') as f_features:
-        total_points = sum(len(torch.load(key)) for key in test_dataset.keys)
-        dset_features = f_features.create_dataset('features', 
-                                                shape=(total_points, 19),  # 3 (xyz) + 16 (reduced features)
-                                                chunks=True)
-        current_idx = 0
-        output_list = []  
+    output_list = []
 
-        with torch.no_grad():
-            with tqdm(total=len(test_loader), colour='white', ascii="▒█", bar_format='{l_bar}{bar:20}{r_bar}{bar:-20b}', desc = "Inference") as pbar:
-                for _, data in enumerate(test_loader):
-                    data = data.to(device)
-                    
-                    with torch.cuda.amp.autocast():
-                        outputs, reduced_features = model(data)
-                        outputs = torch.nan_to_num(outputs)
-                    
-                    probs = torch.sigmoid(outputs).to(device)
-                    preds = (probs>=args.is_wood).type(torch.int64).cpu()
-                    preds = np.expand_dims(preds, axis=1)
+    if args.transfer_features:
+        h5_file = h5py.File('features.h5', 'a')
+    else:
+        h5_file = None
 
-                    batches = np.unique(data.batch.cpu())
-                    pos = data.pos.cpu().numpy()
-                    probs_2d = np.expand_dims(probs.detach().cpu().numpy(), axis=1)  
-                    output = np.concatenate((pos, preds, probs_2d), axis=1)
-                    reduced_features = reduced_features.cpu().numpy()
+    with h5py.File('features.h5', 'a') as f:
+        with tqdm(total=len(test_loader), colour='white', ascii="▒█", bar_format='{l_bar}{bar:20}{r_bar}{bar:-20b}', desc = "Inference") as pbar:
+            for _, data in enumerate(test_loader):
 
-                    for batch in batches:
-                        # Handle predictions
-                        outputb = np.asarray(output[data.batch.cpu() == batch])
-                        outputb[:, :3] = outputb[:, :3] + np.asarray(data.local_shift.cpu())[3 * batch : 3 + (3 * batch)]
-                        output_list.append(outputb)
-                        
-                        # Handle features
-                        batch_mask = data.batch.cpu() == batch
-                        features_with_xyz = np.concatenate([
-                            data.pos[batch_mask, :3].cpu().numpy() + data.local_shift.cpu()[3 * batch : 3 + (3 * batch)],
-                            reduced_features[batch_mask]
-                        ], axis=1)
-                        
-                        dset_features[current_idx:current_idx + len(features_with_xyz)] = features_with_xyz
-                        current_idx += len(features_with_xyz)
-                    
-                    pbar.update(1)
-            
+                data = data.to(device)
+                
+                with torch.cuda.amp.autocast():
+                    outputs, features = model(data)
+                    outputs = torch.nan_to_num(outputs)
+
+                probs = torch.sigmoid(outputs).to(device)
+                preds = (probs>=args.is_wood).type(torch.int64).cpu()
+                preds = np.expand_dims(preds, axis=1)
+
+                batches = np.unique(data.batch.cpu())
+                pos = data.pos.cpu().numpy()
+                probs_2d = np.expand_dims(probs.detach().cpu().numpy(), axis=1)  
+                output = np.concatenate((pos, preds, probs_2d), axis=1)
+                outputb = None
+
+                for batch in batches:
+                    outputb = np.asarray(output[data.batch.cpu() == batch])
+                    outputb[:, :3] = outputb[:, :3] + np.asarray(data.local_shift.cpu())[3 * batch : 3 + (3 * batch)]
+                    output_list.append(outputb)
+                
+                if args.transfer_features:
+                    batch_features = features[data.batch == batch].cpu().detach().numpy()
+                    append_to_h5(h5_file, 'pos', outputb[:, :3])
+                    append_to_h5(h5_file, 'labels', outputb[:, -2:])
+                    append_to_h5(h5_file, 'features', batch_features)
+                
+                pbar.update(1)
+    
         classified_pc = np.vstack(output_list)
+
+        if h5_file is not None:
+            h5_file.close()
 
     #####################################################################################################
     
