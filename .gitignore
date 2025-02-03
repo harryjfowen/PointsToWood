@@ -6,6 +6,7 @@
 pointstowood/instance_all.py
 
 # Ignore any archived or data folder in subdirectories
+**/archive/
 **/archived/
 **/data/
 
