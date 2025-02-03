@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import knn_interpolate
 from torch.nn import Sequential as Seq, Linear as Lin, ReLU, BatchNorm1d as BN, LeakyReLU, SiLU
 from torch_geometric.nn import knn, radius
-from src.pointnet2 import PointNetConv
+from src.pointnet import PointNetConv
 from torch_geometric.nn import Set2Set
 from torch_scatter import scatter_max, scatter_mean, scatter_softmax
 from torch_geometric.nn import voxel_grid
