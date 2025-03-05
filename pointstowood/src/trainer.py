@@ -352,7 +352,7 @@ def SemanticTraining(args):
                 best_f1_train = manager.save_best_model(train_f1/len(train_loader), best_f1_train, 
                     os.path.join(args.wdir,'model','f1-' + os.path.basename(args.model)))
 
-        if args.test and epoch > int(args.num_epochs*0.5):
+        if args.test and epoch > int(args.num_epochs*0.25):
             if test_precision/len(test_loader) >= 0.99 * test_recall/len(test_loader):
                 best_ba_test = manager.save_best_model(test_accuracy/len(test_loader), best_ba_test, 
                     os.path.join(args.wdir,'model','ba-' + os.path.basename(args.model)))

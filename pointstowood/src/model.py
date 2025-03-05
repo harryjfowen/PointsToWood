@@ -7,8 +7,6 @@ from src.pointnet import PointNetConv
 from torch_geometric.nn import Set2Set
 from torch_geometric.nn import voxel_grid
 from torch_geometric.nn.pool.consecutive import consecutive_cluster
-import torch.nn as nn
-from src.sampling import DifferentiableSampler
 from src.attention import ReflectanceGatingAttention
 
 def initialize_weights(model):
@@ -149,7 +147,6 @@ class SAModule(torch.nn.Module):
         super().__init__()
         self.resolution = resolution
         self.k = k
-        self.sampler = DifferentiableSampler(in_channels=(NN[0]), tau_init=tau_init, tau_min=tau_min, num_epochs=num_epochs)
         self.conv = PointNetConv(local_nn=MLP(NN), global_nn=None, shape_kernel=None, add_self_loops=False, radius=None)
         self.residual_block = InvertedResidualBlock(RNN, RNN)
         self.ratio = 0.5
