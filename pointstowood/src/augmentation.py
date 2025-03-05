@@ -27,9 +27,7 @@ def silence_reflectance(feature):
     # Most values will naturally fall within [-0.06, 0.06] (2 std)
     small_noise = torch.randn_like(feature) * 0.02  # std=0.02
     return small_noise
-    
-    # Or if you want ultra-small values:
-    # return torch.randn_like(feature) * 0.01  # std=0.01
+
 
 def perturb_reflectance(feature):
     noise = torch.normal(mean=0.0, std=0.1, size=feature.size())
@@ -43,25 +41,39 @@ def random_grid_downsample(points, reflectance, label, resolution_range=(0.01, 0
     _, idx = consecutive_cluster(voxel_indices)
     return points[idx], reflectance[idx], label[idx]
 
-def random_downsample(points, reflectance, label, keep_ratio=0.75):
+def random_downsample(points, reflectance, label, keep_ratio=0.80):
     num_points = points.size(0)
     num_keep = int(num_points * keep_ratio)
     keep_indices = torch.randperm(num_points)[:num_keep]
     return points[keep_indices], reflectance[keep_indices], label[keep_indices]
 
 def augmentations(pos, reflectance, label, mode='train'):
-    rand_val_refl = torch.rand(1)
-    rand_val_pos = torch.rand(1)
-    if rand_val_refl < 0.15:
-        reflectance = silence_reflectance(reflectance)
-    # if mode == 'train':
-    #     if rand_val_refl >= 0.25 and rand_val_refl < 0.5:
-    #         reflectance = perturb_reflectance(reflectance)
-    if rand_val_pos < 0.25:
-        pos = rotate_3d(pos)
-    # if rand_val_pos > 0.25 and rand_val_pos <= 0.375:
-    #     pos, reflectance, label = random_grid_downsample(pos, reflectance, label)
-    # if rand_val_pos > 0.375 and rand_val_pos <= 0.5:
-    #     pos, reflectance, label = random_downsample(pos, reflectance, label)
+    """
+    Apply critical augmentations in both train and test
+    Args:
+        pos: Position tensor
+        reflectance: Reflectance tensor
+        label: Label tensor
+        mode: 'train' or 'test'
+    """
+    # Training-only augmentations
+    if mode == 'train':
+        rand_val_pos = torch.rand(1)
+
+        if rand_val_pos < 0.25:
+            pos = rotate_3d(pos)
+        
+        if rand_val_pos < 0.5 and rand_val_pos > 0.25:
+            pos, reflectance, label = random_downsample(pos, reflectance, label)
+            
+        rand_val_refl = torch.rand(1)
+
+        if rand_val_refl < 0.25:
+            reflectance = silence_reflectance(reflectance)
+    else:
+        # Test mode: directly zero out 25% of reflectance values
+        mask = torch.rand_like(reflectance) < 0.25
+        reflectance = torch.where(mask, torch.zeros_like(reflectance), reflectance)
+        
     return pos, reflectance, label
 

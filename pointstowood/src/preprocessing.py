@@ -13,7 +13,7 @@ class Voxelise:
         self.minpoints = minpoints
         self.maxpoints = maxpoints
         self.gridsize = gridsize
-        self.pointspacing = None
+        self.pointspacing = pointspacing
 
     def quantile_normalize_reflectance(self):
         reflectance_tensor = self.pos[:, 3].view(-1)
@@ -32,18 +32,21 @@ class Voxelise:
         # scaled_reflectance = (normalized_reflectance - min_val) / (max_val - min_val)  # Scale to [0, 1]
         return scaled_reflectance
     
-    # def downsample(self):
-    #     voxelised = voxel_grid(self.pos, self.pointspacing)
-    #     _, idx = consecutive_cluster(voxelised)
-    #     return self.pos[idx]
-    
     def downsample(self):
-        coords, values = self.pos[:, :3], self.pos[:, 3]
-        voxel_indices = voxel_grid(pos=coords, size=self.pointspacing)
-        _, remapped_indices = torch.unique(voxel_indices, return_inverse=True)
-        _, max_indices = torch_scatter.scatter_max(values, remapped_indices, dim=0)
-        valid_max_indices = max_indices[max_indices != -1]
-        downsampled_pos = self.pos[valid_max_indices]
+        # Check if we have a 4th column (intensity/reflectance)
+        if self.pos.shape[1] > 3:
+            coords, values = self.pos[:, :3], self.pos[:, 3]
+            voxel_indices = voxel_grid(pos=coords, size=self.pointspacing)
+            _, remapped_indices = torch.unique(voxel_indices, return_inverse=True)
+            _, max_indices = torch_scatter.scatter_max(values, remapped_indices, dim=0)
+            valid_max_indices = max_indices[max_indices != -1]
+            downsampled_pos = self.pos[valid_max_indices]
+        else:
+            # Simple voxel grid sampling for xyz-only points
+            voxel_indices = voxel_grid(pos=self.pos, size=self.pointspacing)
+            _, idx = consecutive_cluster(voxel_indices)
+            downsampled_pos = self.pos[idx]
+        
         return downsampled_pos
 
     def gpu_ground(self):
@@ -89,22 +92,12 @@ class Voxelise:
         return self.pos
     
     def write_voxels(self):
-        do_ground = 'n_z' not in self.pos.columns
-        if not do_ground:
-            grd = torch.tensor(self.pos[['n_z']].values, dtype=torch.float)
-        else:
-            grd = None
-
+        
         self.pos = torch.tensor(self.pos.values, dtype=torch.float).to(device='cuda')
 
-        if do_ground:
-            print('Height Normalising Point Cloud')
-            grd = self.gpu_ground()
-        else:
-            pass
-        
-        # if self.pointspacing:
-        #     self.pos = self.downsample()
+        if self.pointspacing:
+            print(f'Downsampling to {self.pointspacing}m spacing')
+            self.pos = self.downsample()
 
         reflectance_not_zero = not torch.all(self.pos[:, 3] == 0)
         
@@ -142,11 +135,10 @@ class Voxelise:
             
             torch.save(voxel, os.path.join(self.vxpath, f'voxel_{file_counter}.pt'))
             file_counter += 1
-        return grd
+        return -1
 
 def preprocess(args):
-    n_z = Voxelise(args.pc, vxpath=args.vxfile, minpoints=args.min_pts, maxpoints=args.max_pts, pointspacing=args.resolution, gridsize = args.grid_size).write_voxels()
-    args.pc['n_z'] = n_z.detach().numpy()
+    Voxelise(args.pc, vxpath=args.vxfile, minpoints=args.min_pts, maxpoints=args.max_pts, pointspacing=args.resolution, gridsize = args.grid_size).write_voxels()
 
 
 

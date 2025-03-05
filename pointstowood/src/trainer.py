@@ -1,3 +1,4 @@
+#from src.model_edgeconv import Net
 from src.model import Net
 from src.augmentation import augmentations
 from tqdm import tqdm
@@ -16,6 +17,7 @@ from src.cosine_scheduler import CosineAnnealingWarmupRestarts
 import warnings
 import copy
 import glob
+import random
 from torch.amp import autocast_mode
 torch.backends.cudnn.benchmark = False
 torch.set_float32_matmul_precision('medium')
@@ -60,15 +62,8 @@ class TrainingDataset(Dataset, ABC):
         scaling_factor = torch.sqrt((pos ** 2).sum(dim=1)).max()
         if torch.any(torch.isnan(reflectance)):
             print('nans in relfectance')
-        # Compute pointwise class ratio
         label_weighting = self.calculate_pointwise_weight(y)
-        #sample_ratio = self.sample_pos_weight(y)
-        data = Data(pos=pos, reflectance=reflectance, y=y, sf=scaling_factor, label_weighting=label_weighting)
-        # output_dir = '/home/harryowen/Desktop/voxels/'
-        # os.makedirs(output_dir, exist_ok=True)
-        # filename = os.path.join(output_dir, f'{index + 1}_.txt')
-        # write_xyz_to_file(pos, filename)
-    
+        data = Data(pos=pos, reflectance=reflectance, y=y, sf=scaling_factor, label_weighting=label_weighting)    
         return data
     
     def calculate_pointwise_weight(self, y, min_weight=0.5):
@@ -80,7 +75,7 @@ class TrainingDataset(Dataset, ABC):
         weight = torch.clamp(weight, min=min_weight)
         weights = torch.full_like(y, weight, dtype=torch.float, device=y.device)
         return weights
-
+    
 class ModelManager:
     def __init__(self, model, device):
         self.model = model
@@ -126,6 +121,7 @@ def SemanticTraining(args):
         
     
     model = Net(num_classes=1, num_epochs=args.num_epochs).to(device)
+    #model = Net(num_classes=1).to(device)
     print('Model contains', sum(p.numel() for p in model.parameters()), ' parameters')
 
     train_dataset = TrainingDataset(voxels=args.trfile, augmentation=args.augmentation, mode='train', device=device, max_pts=args.max_pts)
@@ -140,10 +136,11 @@ def SemanticTraining(args):
     )
 
     if args.test:
-        test_dataset = TrainingDataset(voxels=args.tefile, augmentation=args.augmentation, mode='test', device=device, max_pts=args.max_pts)
+        test_dataset = TrainingDataset(voxels=args.tefile, augmentation=True, mode='test', device=device, max_pts=args.max_pts)
         test_loader = DataLoader(test_dataset, batch_size=int(args.batch_size/2), shuffle=True, drop_last=True, num_workers=32, sampler=None, pin_memory=True)
 
-    criterion = Poly1FocalLoss(reduction="mean", gamma = 2.0, alpha = None, label_smoothing = 0.1)
+    criterion = FocalLoss(reduction="mean", gamma = 2.0, alpha = None, label_smoothing = None)
+    #criterion = CyclicalFocalLoss(gamma_hc=3.0, gamma_lc=0.5, fc=4.0, num_epochs=args.num_epochs, alpha=None, label_smoothing = None)
 
     optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=5e-5, weight_decay=1e-4)
     lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=5e-5, total_steps=args.num_epochs, pct_start=0.08, anneal_strategy='cos', div_factor = 100)
@@ -177,6 +174,7 @@ def SemanticTraining(args):
     for epoch in range(1, args.num_epochs + 1):
 
         model.train()
+        criterion.current_epoch = epoch 
 
         train_loss, train_accuracy, train_precision, train_recall, train_f1 = 0.0, 0.0, 0.0, 0.0, 0.0
 
@@ -197,10 +195,12 @@ def SemanticTraining(args):
                         device_type='cuda' if torch.cuda.is_available() else 'cpu',
                         enabled=True, 
                         dtype=torch.bfloat16
+                        #dtype=torch.float32
                     ):
                         outputs = model(data)
                         outputs = torch.clamp(outputs, min=-20.0, max=20.0)  # This is your safety net
                         loss, gamma = criterion(outputs, data.y, data.label_weighting)
+                        
 
                     pre_backward_stats = {
                         'outputs_mean': outputs.mean().item(),
@@ -226,10 +226,24 @@ def SemanticTraining(args):
                     preds = (probs >= 0.50).type(torch.int64).detach()
 
                 train_loss += loss.item()
-                train_precision += precision_score(data.y.cpu().numpy(), preds.cpu().numpy(), average='binary', zero_division=0)
-                train_recall += recall_score(data.y.cpu().numpy(), preds.cpu().numpy(), average='binary', zero_division=0)
-                train_accuracy += balanced_accuracy_score(data.y.cpu().numpy(), preds.cpu().numpy(), sample_weight=None)
-                train_f1 += f1_score(data.y.cpu().numpy(), preds.cpu().numpy(), average='binary', zero_division=0)
+                
+                # Safely get wood-specific metrics
+                y_true = data.y.cpu().numpy()
+                y_pred = preds.cpu().numpy()
+                
+                # Handle case where only one class is present
+                try:
+                    class_precision = precision_score(y_true, y_pred, pos_label=1, average=None)
+                    class_recall = recall_score(y_true, y_pred, pos_label=1, average=None)
+                    train_precision += class_precision[1] if len(class_precision) > 1 else 0
+                    train_recall += class_recall[1] if len(class_recall) > 1 else 0
+                except:
+                    # If metrics can't be computed (e.g., no positive class), use 0
+                    train_precision += 0
+                    train_recall += 0
+                
+                train_accuracy += balanced_accuracy_score(y_true, y_pred, sample_weight=None)
+                train_f1 += f1_score(y_true, y_pred, average='binary', zero_division=0)
 
                 lr_list.append(optimizer.param_groups[0]["lr"])
                 tepoch.set_description(f"Train")
@@ -237,9 +251,9 @@ def SemanticTraining(args):
                 tepoch.set_postfix({
                     'Lr': optimizer.param_groups[0]["lr"],
                     'Lo': np.around(train_loss / (i + 1), 5),
-                    'Ac': np.around(train_accuracy / (i + 1), 3),
-                    'Pr': np.around(train_precision / (i + 1), 3),
-                    'Re': np.around(train_recall / (i + 1), 3),
+                    'BAcc': np.around(train_accuracy / (i + 1), 3),
+                    'Wood_Pr': np.around(train_precision / (i + 1), 3),
+                    'Wood_Re': np.around(train_recall / (i + 1), 3),
                     'F1': np.around(train_f1 / (i + 1), 3),
                     'Ga': np.around(gamma, 3)
                 })
@@ -251,44 +265,53 @@ def SemanticTraining(args):
         test_accuracy, test_precision, test_recall, test_f1 = 0.0, 0.0, 0.0, 0.0
 
         if args.test:
-
             model.eval()
             sleep(0.1) 
 
             with tqdm(total=len(test_loader), colour='white', ascii="▒█", bar_format='{l_bar}{bar:20}{r_bar}{bar:-20b}') as tepoch:
                 with torch.no_grad():
                     for j, data in enumerate(test_loader):
-
                         data.y = data.y.to(device)
 
-                        with torch.no_grad():  
-                            outputs = model(data.to(device))
-                            probs = torch.sigmoid(outputs).detach()
-                            preds = (probs >= 0.50).type(torch.int64).detach()                        
+                        outputs = model(data.to(device))
+                        probs = torch.sigmoid(outputs).detach()
+                        preds = (probs >= 0.50).type(torch.int64).detach()                        
 
-                        test_precision += precision_score(data.y.cpu().numpy(), preds.cpu().numpy(), average='binary', zero_division=0)
-                        test_recall += recall_score(data.y.cpu().numpy(), preds.cpu().numpy(),average='binary', zero_division=0)
-                        test_accuracy += balanced_accuracy_score(data.y.cpu().numpy(), preds.cpu().numpy(), sample_weight=None)
-                        test_f1 += f1_score(data.y.cpu().numpy(), preds.cpu().numpy(),average='binary', zero_division=0)
+                        # Safely get wood-specific metrics
+                        y_true = data.y.cpu().numpy()
+                        y_pred = preds.cpu().numpy()
+                        
+                        # Handle case where only one class is present
+                        try:
+                            class_precision = precision_score(y_true, y_pred, pos_label=1, average=None)
+                            class_recall = recall_score(y_true, y_pred, pos_label=1, average=None)
+                            test_precision += class_precision[1] if len(class_precision) > 1 else 0
+                            test_recall += class_recall[1] if len(class_recall) > 1 else 0
+                        except:
+                            # If metrics can't be computed (e.g., no positive class), use 0
+                            test_precision += 0
+                            test_recall += 0
+                        
+                        test_accuracy += balanced_accuracy_score(y_true, y_pred, sample_weight=None)
+                        test_f1 += f1_score(y_true, y_pred, average='binary', zero_division=0)
 
-                        lr_list.append(optimizer.param_groups[0]["lr"])
                         tepoch.set_description(f"Test")
                         tepoch.update()
                         tepoch.set_postfix({
-                            'Ac': np.around(test_accuracy / (j + 1), 3),
-                            'Pr': np.around(test_precision / (j + 1), 3),
-                            'Re': np.around(test_recall / (j + 1), 3),
-                            'F1': np.around(test_f1 / (j + 1), 3),
+                            'BAcc': np.around(test_accuracy / (j + 1), 3),
+                            'Wood_Pr': np.around(test_precision / (j + 1), 3),
+                            'Wood_Re': np.around(test_recall / (j + 1), 3),
+                            'Wood_F1': np.around(test_f1 / (j + 1), 3),
                         })
 
                     tepoch.close()
             
         epoch_results = np.array([[epoch, optimizer.param_groups[0]["lr"],
-                                   train_loss/len(train_loader),
-                                   train_accuracy/len(train_loader),
-                                   train_f1/len(train_loader),
-                                   train_precision/len(train_loader),
-                                   train_recall/len(train_loader)]])
+                                 train_loss/len(train_loader),
+                                 train_accuracy/len(train_loader),
+                                 train_f1/len(train_loader),
+                                 train_precision/len(train_loader),
+                                 train_recall/len(train_loader)]])
 
         if args.test:
             epoch_results = np.append(epoch_results, [[test_accuracy / len(test_loader),
@@ -330,7 +353,7 @@ def SemanticTraining(args):
                     os.path.join(args.wdir,'model','f1-' + os.path.basename(args.model)))
 
         if args.test and epoch > int(args.num_epochs*0.5):
-            if test_precision/len(test_loader) >= test_recall/len(test_loader):
+            if test_precision/len(test_loader) >= 0.99 * test_recall/len(test_loader):
                 best_ba_test = manager.save_best_model(test_accuracy/len(test_loader), best_ba_test, 
                     os.path.join(args.wdir,'model','ba-' + os.path.basename(args.model)))
                 best_f1_test = manager.save_best_model(test_f1/len(test_loader), best_f1_test, 
@@ -344,6 +367,8 @@ def SemanticTraining(args):
 
         t_acc =  test_accuracy / len(test_loader) if args.test else 0.0
         t_f1 =  test_f1 / len(test_loader) if args.test else 0.0
+        t_recall = test_recall / len(test_loader) if args.test else 0.0
+        t_precision = test_precision / len(test_loader) if args.test else 0.0
 
         if args.wandb:
             wandb.log({"Epoch": epoch, 
@@ -354,4 +379,6 @@ def SemanticTraining(args):
                 "Recall": np.around(train_recall/len(train_loader), 4),
                 "F1": np.around(train_f1/len(train_loader), 4),
                 "Test F1": np.around(t_f1, 4),
-                "Test Accuracy": np.around(t_acc, 4)})
+                "Test Accuracy": np.around(t_acc, 4),
+                "Test Precision": np.around(t_precision, 4),
+                "Test Recall": np.around(t_recall, 4)})

@@ -22,18 +22,18 @@ class PointNetConv(MessagePassing):
     def __init__(self, local_nn: Optional[Callable] = None,
                  global_nn: Optional[Callable] = None,
                  shape_kernel: Optional[Callable] = None,
-                 attention_nn: Optional[Callable] = None,
                  add_self_loops: bool = True, **kwargs):
         
         self.radius = kwargs.pop('radius', None)
         
-        kwargs.setdefault('aggr', 'max')
+        kwargs.setdefault('aggr', 'max')#original approach
+        #kwargs.setdefault('aggr', 'sum')#gsa approach
+
         super().__init__(**kwargs)
 
         self.local_nn = local_nn
         self.global_nn = global_nn
         self.shape_kernel = shape_kernel
-        self.attention_nn = attention_nn
         self.add_self_loops = add_self_loops
 
         self.reset_parameters()
@@ -88,13 +88,14 @@ class PointNetConv(MessagePassing):
         max_distances = scatter_max(distances, edge_index_i, dim=0)[0][edge_index_i]
         relative_pos = relative_pos / max_distances
         msg = relative_pos
-        shape_features = self.shape_kernel(relative_pos, edge_index_i)  
-        msg = torch.cat([msg, shape_features], dim=-1)
-
-        if x_j is not None:            
-            msg = torch.cat([msg, (x_j - (x_i if x_i is not None else 0) + 1e-8)], dim=-1)
 
         msg = torch.cat([msg, pos_j[:, 3].unsqueeze(-1)], dim=-1)
+
+        if x_j is not None:    
+            msg = torch.cat([msg, x_j], dim=-1)        
+            #msg = torch.cat([msg, (x_j - (x_i if x_i is not None else 0) + 1e-8)], dim=-1)
+            #msg = torch.cat([msg, (x_j - (x_i if x_i is not None else 0) + 1e-8), x_j], dim=-1)
+
         if self.local_nn is not None:
             msg = self.local_nn(msg)
         return msg
@@ -102,5 +103,3 @@ class PointNetConv(MessagePassing):
     def __repr__(self) -> str:
         return (f'{self.__class__.__name__}(local_nn={self.local_nn}, '
                 f'global_nn={self.global_nn})')
-
-

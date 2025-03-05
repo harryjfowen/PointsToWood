@@ -126,7 +126,8 @@ class PointCloudClassifier:
             else:
                 class_votes = np.zeros(num_classes)
                 for j in range(num_classes):
-                    class_votes[j] = np.sum((nbr_classification[i, :, -2] == j) * nbr_classification[i, :, -1])
+                    #class_votes[j] = np.sum((nbr_classification[i, :, -2] == j) * nbr_classification[i, :, -1])
+                    class_votes[j] = np.sum((nbr_classification[i, :, -2] == j))
                 labels[i, 0] = np.argmax(class_votes)  
         return labels
 
@@ -138,12 +139,13 @@ class PointCloudClassifier:
             indices = np.load(indices_file)
         else:
             kd_tree = KDTree(classification[:, :3])
-            _, indices = kd_tree.query(original.values[:, :3], k = 32 if self.any_wood != 1 else 64)
+            _, indices = kd_tree.query(original.values[:, :3], k = 8 if self.any_wood != 1 else 16)
 
         labels = np.zeros((original.shape[0], 2))
         labels = self.compute_labels(classification[indices], labels, self.any_wood)
         original.loc[:, ['label', 'pwood']] = labels
         return original
+    
 
     
 #########################################################################################################
@@ -195,52 +197,54 @@ def SemanticSegmentation(args):
 
     model.eval()
 
-    with h5py.File(args.odir_features, 'w') as f_features:
-        total_points = sum(len(torch.load(key)) for key in test_dataset.keys)
-        dset_features = f_features.create_dataset('features', 
-                                                shape=(total_points, 19),  # 3 (xyz) + 16 (reduced features)
-                                                chunks=True)
-        current_idx = 0
-        output_list = []  
+    # with h5py.File(args.odir_features, 'w') as f_features:
+    #     total_points = sum(len(torch.load(key)) for key in test_dataset.keys)
+    #     dset_features = f_features.create_dataset('features', 
+    #                                             shape=(total_points, 19),  # 3 (xyz) + 16 (reduced features)
+    #                                             chunks=True)
+    #     current_idx = 0
+    #     output_list = []  
 
-        with torch.no_grad():
-            with tqdm(total=len(test_loader), colour='white', ascii="▒█", bar_format='{l_bar}{bar:20}{r_bar}{bar:-20b}', desc = "Inference") as pbar:
-                for _, data in enumerate(test_loader):
-                    data = data.to(device)
-                    
-                    with torch.cuda.amp.autocast():
-                        outputs, reduced_features = model(data)
-                        outputs = torch.nan_to_num(outputs)
-                    
-                    probs = torch.sigmoid(outputs).to(device)
-                    preds = (probs>=args.is_wood).type(torch.int64).cpu()
-                    preds = np.expand_dims(preds, axis=1)
+    output_list = []  
+    with torch.no_grad():
+        with tqdm(total=len(test_loader), colour='white', ascii="▒█", bar_format='{l_bar}{bar:20}{r_bar}{bar:-20b}', desc = "Inference") as pbar:
+            for _, data in enumerate(test_loader):
+                data = data.to(device)
+                
+                with torch.cuda.amp.autocast():
+                    outputs = model(data)
+                    #outputs, features = model(data)
+                    outputs = torch.nan_to_num(outputs)
+                
+                probs = torch.sigmoid(outputs).to(device)
+                preds = (probs>=args.is_wood).type(torch.int64).cpu()
+                preds = np.expand_dims(preds, axis=1)
 
-                    batches = np.unique(data.batch.cpu())
-                    pos = data.pos.cpu().numpy()
-                    probs_2d = np.expand_dims(probs.detach().cpu().numpy(), axis=1)  
-                    output = np.concatenate((pos, preds, probs_2d), axis=1)
-                    reduced_features = reduced_features.cpu().numpy()
+                batches = np.unique(data.batch.cpu())
+                pos = data.pos.cpu().numpy()
+                probs_2d = np.expand_dims(probs.detach().cpu().numpy(), axis=1)  
+                output = np.concatenate((pos, preds, probs_2d), axis=1)
+                #reduced_features = reduced_features.cpu().numpy()
 
-                    for batch in batches:
-                        # Handle predictions
-                        outputb = np.asarray(output[data.batch.cpu() == batch])
-                        outputb[:, :3] = outputb[:, :3] + np.asarray(data.local_shift.cpu())[3 * batch : 3 + (3 * batch)]
-                        output_list.append(outputb)
-                        
-                        # Handle features
-                        batch_mask = data.batch.cpu() == batch
-                        features_with_xyz = np.concatenate([
-                            data.pos[batch_mask, :3].cpu().numpy() + data.local_shift.cpu()[3 * batch : 3 + (3 * batch)],
-                            reduced_features[batch_mask]
-                        ], axis=1)
-                        
-                        dset_features[current_idx:current_idx + len(features_with_xyz)] = features_with_xyz
-                        current_idx += len(features_with_xyz)
+                for batch in batches:
+                    # Handle predictions
+                    outputb = np.asarray(output[data.batch.cpu() == batch])
+                    outputb[:, :3] = outputb[:, :3] + np.asarray(data.local_shift.cpu())[3 * batch : 3 + (3 * batch)]
+                    output_list.append(outputb)
                     
-                    pbar.update(1)
-            
-        classified_pc = np.vstack(output_list)
+                    # # Handle features
+                    # batch_mask = data.batch.cpu() == batch
+                    # features_with_xyz = np.concatenate([
+                    #     data.pos[batch_mask, :3].cpu().numpy() + data.local_shift.cpu()[3 * batch : 3 + (3 * batch)],
+                    #     reduced_features[batch_mask]
+                    # ], axis=1)
+                    
+                    # dset_features[current_idx:current_idx + len(features_with_xyz)] = features_with_xyz
+                    # current_idx += len(features_with_xyz)
+                
+                pbar.update(1)
+        
+    classified_pc = np.vstack(output_list)
 
     #####################################################################################################
     
@@ -256,7 +260,7 @@ def SemanticSegmentation(args):
     Save final classified point cloud. 
     '''
 
-    headers = list(dict.fromkeys(args.headers+['n_z', 'label', 'pwood']))
+    headers = list(dict.fromkeys(args.headers+['label', 'pwood']))
     save_file(args.odir, args.pc.copy(), additional_fields= headers, verbose=False)    
     
     return args
