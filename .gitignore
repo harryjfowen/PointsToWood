@@ -1,3 +1,6 @@
+# Ignore the DS_Store file
+.DS_Store
+
 # Ignore the archived folder
 /archive/
 
