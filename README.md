@@ -56,13 +56,13 @@ conda activate myenv.
 2. Navigate to the PointsToWood directory.
    
 ```
-cd ~/points2wood/points2wood/
+cd ~/PointsToWood/pointstowood/
 ```
 
 3. Run PointsToWood.
    
 ```
-python3 predict.py --point-cloud /x/x/cloud.ply --model global.pth --batch_size 8 --is-wood 0.50 --grid_size 2.0 4.0 --min_pts 128 --max_pts 16384;
+python3 predict.py --point-cloud /x/x/cloud.ply --model eu.pth --batch_size 16 --is-wood 0.50 --grid_size 1.0 2.0 --min_pts 512;
 ```
 
 *NOTE Make sure the point cloud contains columns x y z as a minimum and x y z reflectance if available to you.
