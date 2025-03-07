@@ -14,14 +14,13 @@ from collections import OrderedDict
 from numba import jit, prange, set_num_threads
 import glob
 from torch.utils.data import Sampler
-import h5py
 
 import warnings
 warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 os.environ['OMP_NUM_THREADS'] = str(os.cpu_count()-1)
-set_num_threads(30)
+set_num_threads(int(os.cpu_count()-1))
 sys.setrecursionlimit(10 ** 8) 
 
 class BalancedBatchSampler(Sampler):
@@ -33,34 +32,28 @@ class BalancedBatchSampler(Sampler):
         self.dataset = dataset
         self.batch_size = batch_size
         
-        # Get length of each point cloud
         self.lengths = []
         for key in dataset.keys:
             pc = torch.load(key)
             self.lengths.append(len(pc))
             
-        # Sort indices by length
         self.indices = np.argsort(self.lengths)
         
     def __iter__(self):
-        # Create iterator that pairs short and long samples
         n = len(self.indices)
         half_batch = self.batch_size // 2
         
-        # Shuffle both halves independently to maintain size distribution
-        # but add randomness between epochs
         short_samples = self.indices[:n//2].copy()
         long_samples = self.indices[n//2:].copy()
         
         np.random.shuffle(short_samples)
         np.random.shuffle(long_samples)
         
-        # Combine short and long samples into batches
         for i in range(0, len(short_samples) - half_batch + 1, half_batch):
             if i + half_batch <= len(long_samples):
                 batch = list(short_samples[i:i + half_batch])
                 batch.extend(list(long_samples[i:i + half_batch]))
-                np.random.shuffle(batch)  # Shuffle within batch
+                np.random.shuffle(batch)  
                 yield batch
                 
     def __len__(self):
