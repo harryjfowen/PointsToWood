@@ -61,8 +61,6 @@ cd ~/PointsToWood/pointstowood/
 
 3. Run PointsToWood.
 
-Use `--is-wood` parameter to apply a more conservative wood labeling strategy. With this option, a point is classified as wood if ALL neighboring points within its local neighborhood exceed the wood probability threshold. This approach increases wood detection specificity, reducing false positives but may miss potential wood structures that might otherwise be detected.
-
 ```
 python3 predict.py --point-cloud /x/x/cloud.ply --model eu.pth --batch_size 16 --is-wood 0.55 --grid_size 1.0 2.0 --min_pts 512;
 ```
