@@ -114,7 +114,6 @@ if __name__ == '__main__':
                         args.pc, args.headers = load_file(filename=p, additional_headers=True, verbose=True)
                         args.pc, args.reflectance = preprocess_point_cloud_data(args.pc)
                         args.vxfile = args.trfile
-                        print(args.pc)
                         
                         print(f'Voxelising to {args.grid_size} grid sizes')
                         preprocess(args)

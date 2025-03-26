@@ -23,21 +23,21 @@ class PointCloudDownsampler:
         return selected_indices
 
 # Create an empty DataFrame to store the statistics
-statistics_df = pd.DataFrame(columns=['File', 'Precision_fsct', 'Recall_fsct', 'Precision_ours', 'Recall_ours', 'Accuracy_fsct', 'Accuracy_ours', 'Weighted_accuracy_fsct', 'Weighted_accuracy_ours'])
+statistics_df = pd.DataFrame(columns=['File', 'Precision_fsct', 'Recall_fsct', 'Precision_wood', 'Recall_wood', 'Accuracy_fsct', 'Accuracy_wood', 'Weighted_accuracy_fsct', 'Weighted_accuracy_wood'])
 
 # Get a list of all the file names in the folder
 file_names = glob.glob(os.path.join(sys.argv[1], '*fsct.ply'))
 
 # Wrap file_names with tqdm for the progress bar
 for file_name in tqdm(file_names, desc='Processing files', unit='file'):
-    # Load the ours and fsct point clouds
+    # Load the wood and fsct point clouds
     base_name = os.path.basename(file_name).replace('_fsct.ply', '')
-    ours_file = os.path.join(sys.argv[1], base_name + '_ours.ply')
+    wood_file = os.path.join(sys.argv[1], base_name + '_wood.ply')
     fsct_file = os.path.join(sys.argv[1], base_name + '_fsct.ply')
     print(file_name)
-    ours = load_file(ours_file)
-    ours.rename(columns=lambda x: x.replace('scalar_', '') if 'scalar_' in x else x, inplace=True)
-    ours = ours[(ours['label'] != 2)]
+    wood = load_file(wood_file)
+    wood.rename(columns=lambda x: x.replace('scalar_', '') if 'scalar_' in x else x, inplace=True)
+    wood = wood[(wood['label'] != 2)]
     fsct = load_file(fsct_file)
     fsct.rename(columns=lambda x: x.replace('scalar_', '') if 'scalar_' in x else x, inplace=True)
     fsct = fsct[(fsct['label'] != 2)]
@@ -45,16 +45,16 @@ for file_name in tqdm(file_names, desc='Processing files', unit='file'):
     #fsct['label'] = fsct['label'].replace({1: 0, 3: 1})
 
     # Assuming 'df' is your DataFrame
-    if 'label' in ours.columns:
+    if 'label' in wood.columns:
         # Get all occurrences of 'label' in the columns
-        label_cols = [col for col in ours.columns if col == 'label']
+        label_cols = [col for col in wood.columns if col == 'label']
         if len(label_cols) > 1:
             # Find the first occurrence and drop it
-            first_label_index = ours.columns.get_loc('label')
+            first_label_index = wood.columns.get_loc('label')
             # Create a new DataFrame without the first 'label' column
-            ours = pd.concat([
-                ours.iloc[:, :first_label_index],  # Columns before the first 'label'
-                ours.iloc[:, first_label_index+1:]  # Columns after the first 'label'
+            wood = pd.concat([
+                wood.iloc[:, :first_label_index],  # Columns before the first 'label'
+                wood.iloc[:, first_label_index+1:]  # Columns after the first 'label'
             ], axis=1)
 
         # Assuming 'df' is your DataFrame
@@ -73,9 +73,9 @@ for file_name in tqdm(file_names, desc='Processing files', unit='file'):
     fsct['label'] = (fsct['label'] == 3).astype(int) if fsct['label'].nunique() > 2 else fsct['label']
 
     # Downsample the point clouds
-    # downsampler = PointCloudDownsampler(ours[['x','y','z']].values, 0.02)
-    # ours = ours.iloc[downsampler.random_voxelisation()]
-    # ours.reset_index(drop=True, inplace=True)
+    # downsampler = PointCloudDownsampler(wood[['x','y','z']].values, 0.02)
+    # wood = wood.iloc[downsampler.random_voxelisation()]
+    # wood.reset_index(drop=True, inplace=True)
     
     # downsampler = PointCloudDownsampler(fsct[['x','y','z']].values, 0.02)
     # fsct = fsct.iloc[downsampler.random_voxelisation()]
@@ -83,41 +83,41 @@ for file_name in tqdm(file_names, desc='Processing files', unit='file'):
     
     # Compare the two point clouds and calculate the statistics
     f1_fsct = f1_score(fsct[['truth']].astype(int), fsct[['label']].astype(int), average='binary', zero_division=0)
-    f1_ours = f1_score(ours[['truth']].astype(int), ours[['label']].astype(int), average='binary', zero_division=0)
+    f1_wood = f1_score(wood[['truth']].astype(int), wood[['label']].astype(int), average='binary', zero_division=0)
 
     precision_fsct = precision_score(fsct[['truth']].astype(int), fsct[['label']].astype(int), average='binary', zero_division=0)
     recall_fsct = recall_score(fsct[['truth']].astype(int), fsct[['label']].astype(int), average='binary', zero_division=0)
 
-    precision_ours = precision_score(ours[['truth']].astype(int), ours[['label']].astype(int), average='binary', zero_division=0)
-    recall_ours = recall_score(ours[['truth']].astype(int), ours[['label']].astype(int), average='binary', zero_division=0)
+    precision_wood = precision_score(wood[['truth']].astype(int), wood[['label']].astype(int), average='binary', zero_division=0)
+    recall_wood = recall_score(wood[['truth']].astype(int), wood[['label']].astype(int), average='binary', zero_division=0)
 
     accuracy_fsct = balanced_accuracy_score(fsct[['truth']].astype(int), fsct[['label']].astype(int))
-    accuracy_ours = balanced_accuracy_score(ours[['truth']].astype(int), ours[['label']].astype(int))
+    accuracy_wood = balanced_accuracy_score(wood[['truth']].astype(int), wood[['label']].astype(int))
 
     print(file_name)
-    print(f'Accuracy fsct: {accuracy_fsct}, Accuracy ours: {accuracy_ours}')
+    print(f'Accuracy fsct: {accuracy_fsct}, Accuracy wood: {accuracy_wood}')
 
     if 'pathlength' not in fsct.columns:
         fsct['pathlength'] = 1
-    if 'pathlength' not in ours.columns:
-        ours['pathlength'] = 1
+    if 'pathlength' not in wood.columns:
+        wood['pathlength'] = 1
 
     weighted_accuracy_fsct = balanced_accuracy_score(fsct[['truth']].astype(int), fsct[['label']].astype(int), sample_weight=fsct['pathlength'])
-    weighted_accuracy_ours = balanced_accuracy_score(ours[['truth']].astype(int), ours[['label']].astype(int), sample_weight=ours['pathlength'])
+    weighted_accuracy_wood = balanced_accuracy_score(wood[['truth']].astype(int), wood[['label']].astype(int), sample_weight=wood['pathlength'])
 
     # Create a DataFrame with the statistics
     statistics = pd.DataFrame({
         'File': [base_name],
         #'F1_fsct': [f1_fsct],
-        #'F1_ours': [f1_ours],
+        #'F1_wood': [f1_wood],
         'Precision_fsct': [precision_fsct],
         'Recall_fsct': [recall_fsct],
-        'Precision_ours': [precision_ours],
-        'Recall_ours': [recall_ours],
+        'Precision_wood': [precision_wood],
+        'Recall_wood': [recall_wood],
         'Accuracy_fsct': [accuracy_fsct],
-        'Accuracy_ours': [accuracy_ours],
+        'Accuracy_wood': [accuracy_wood],
         'Accuracy_weighted_fsct': [weighted_accuracy_fsct],
-        'Accuracy_weighted_ours': [weighted_accuracy_ours]
+        'Accuracy_weighted_wood': [weighted_accuracy_wood]
     })
 
     # Concatenate the statistics DataFrame with the existing statistics_df DataFrame

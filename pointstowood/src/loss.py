@@ -2,14 +2,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+import numpy as np
 
 class FocalLoss(nn.Module):
     def __init__(
         self,
-        epsilon: float = 0.1,  # Reduced from 1.0 to improve stability
+        epsilon: float = None, 
         gamma: float = 2.0,
-        alpha: float = 0.25,  # Added default for imbalance
-        reduction: str = "none",
+        alpha: float = 0.5,  
+        reduction: str = "mean",
         weight: Tensor = None,
         label_smoothing: float = None,
         eps: float = 1e-6
@@ -22,12 +23,28 @@ class FocalLoss(nn.Module):
         self.weight = weight
         self.label_smoothing = label_smoothing
         self.eps = eps
+        
+        self.register_buffer('running_pos_weight', torch.tensor(1.0))
+        self.momentum = 0.9  
 
-    def forward(self, logits: Tensor, labels: Tensor, label_weights: Tensor) -> Tensor:
+    def forward(self, logits: Tensor, labels: Tensor) -> Tensor:
         logits = torch.clamp(logits, min=-10, max=10)
         
         if self.label_smoothing is not None:
             labels = labels * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
+        
+        num_neg = (labels == 0).sum().float()
+        num_pos = (labels == 1).sum().float()
+        current_pos_weight = num_neg / num_pos if num_pos > 0 else torch.tensor(1.0, device=labels.device)
+        current_pos_weight = torch.clamp(current_pos_weight, min=1.0, max=2.0)
+        
+        with torch.no_grad():  
+            self.running_pos_weight = (
+                self.momentum * self.running_pos_weight + 
+                (1 - self.momentum) * current_pos_weight
+            )
+        
+        smoothed_pos_weight = self.running_pos_weight.clone()
         
         p = torch.sigmoid(logits)
         p = torch.clamp(p, min=self.eps, max=1 - self.eps)
@@ -36,7 +53,7 @@ class FocalLoss(nn.Module):
             input=logits,
             target=labels,
             reduction="none",
-            pos_weight=label_weights  # Use label_weights as the weight parameter
+            pos_weight=smoothed_pos_weight  # Use smoothed weight
         )
                 
         pt = labels * p + (1 - labels) * (1 - p)
@@ -59,28 +76,30 @@ class FocalLoss(nn.Module):
 class CyclicalFocalLoss(nn.Module):
     def __init__(
         self,
-        gamma_hc: float = 3.0,    # gamma for high-confidence term
-        gamma_lc: float = 0.5,    # gamma for low-confidence term
-        fc: float = 4.0,          # cyclical factor (paper uses 4)
+        gamma_lc: float = 0.5,    # LOW gamma for confident predictions (early/late)
+        gamma_hc: float = 3.0,    # HIGH gamma for hard examples (middle)
+        fc: float = 4.0,          
         num_epochs: int = None,
-        alpha: float = 0.25,
-        reduction: str = "mean",  # Changed default to "mean"
+        alpha: float = None,
+        reduction: str = "mean",
         label_smoothing: float = None,
-        eps: float = 1e-6
+        eps: float = 1e-7
     ):
-        super(CyclicalFocalLoss, self).__init__()
-        self.gamma_hc = gamma_hc
+        super().__init__()
         self.gamma_lc = gamma_lc
+        self.gamma_hc = gamma_hc
         self.fc = fc
         self.num_epochs = num_epochs
         self.current_epoch = 0
         self.alpha = alpha
-        self.reduction = reduction
+        self._reduction = reduction
         self.label_smoothing = label_smoothing
         self.eps = eps
+        
+        self.register_buffer('running_pos_weight', torch.tensor(1.0))
+        self.momentum = 0.9
 
     def get_xi(self) -> float:
-        """Calculate mixing factor ξ according to paper's equation 8"""
         if self.num_epochs is None:
             return 0.5
             
@@ -89,15 +108,27 @@ class CyclicalFocalLoss(nn.Module):
         fc = self.fc
         
         if fc * ei <= en:
-            return 1.0 - (fc * ei / en)
+            xi = 1.0 - (fc * ei / en)
         else:
-            return (fc * ei / en - 1.0) / (fc - 1.0)
+            xi = (fc * ei / en - 1.0) / (fc - 1.0)
+        return xi
 
-    def forward(self, logits: Tensor, labels: Tensor, label_weights: Tensor) -> Tensor:
+    def forward(self, logits: Tensor, labels: Tensor) -> Tensor:
         logits = torch.clamp(logits, min=-10, max=10)
         
         if self.label_smoothing is not None:
             labels = labels * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
+        
+        num_neg = (labels == 0).sum().float()
+        num_pos = (labels == 1).sum().float()
+        current_pos_weight = num_neg / num_pos if num_pos > 0 else torch.tensor(1.0, device=labels.device)
+        current_pos_weight = torch.clamp(current_pos_weight, min=1.0, max=2.0)
+        
+        with torch.no_grad():
+            self.running_pos_weight = (
+                self.momentum * self.running_pos_weight + 
+                (1 - self.momentum) * current_pos_weight
+            )
         
         p = torch.sigmoid(logits)
         p = torch.clamp(p, min=self.eps, max=1 - self.eps)
@@ -106,37 +137,38 @@ class CyclicalFocalLoss(nn.Module):
             input=logits,
             target=labels,
             reduction="none",
-            pos_weight=label_weights
+            pos_weight=self.running_pos_weight
         )
                 
         pt = labels * p + (1 - labels) * (1 - p)
         pt = torch.clamp(pt, min=self.eps, max=1)
         
-        # Get current xi value
         xi = self.get_xi()
         
-        # High confidence term (equation 2 in paper)
-        focal_weight_hc = torch.pow(1 - pt, self.gamma_hc)
-        loss_hc = focal_weight_hc * ce_loss
+        current_gamma = xi * self.gamma_lc + (1 - xi) * self.gamma_hc
         
-        # Low confidence term (equation 1 in paper)
-        focal_weight_lc = torch.pow(1 - pt, self.gamma_lc)
-        loss_lc = focal_weight_lc * ce_loss
-        
-        # Combine using equation 9
-        focal_loss = xi * loss_hc + (1 - xi) * loss_lc
+        modulating_factor = torch.pow(1 - pt, current_gamma)
+        loss = modulating_factor * ce_loss
         
         if self.alpha is not None:
             alpha_t = self.alpha * labels + (1 - self.alpha) * (1 - labels)
-            focal_loss = alpha_t * focal_loss
+            loss = alpha_t * loss
         
-        # Always reduce to scalar before returning
-        if self.reduction == "mean":
-            focal_loss = focal_loss.mean()
-        elif self.reduction == "sum":
-            focal_loss = focal_loss.sum()
-        else:  # Force mean reduction if none specified
-            focal_loss = focal_loss.mean()
+        if self._reduction == "mean":
+            loss = loss.mean()
+        elif self._reduction == "sum":
+            loss = loss.sum()
         
-        return focal_loss, xi
+        return loss, current_gamma
+
+    @property
+    def reduction(self):
+        return self._reduction
+
+    @reduction.setter
+    def reduction(self, value):
+        self._reduction = value
+
+    def set_epoch(self, epoch):
+        self.current_epoch = epoch
 

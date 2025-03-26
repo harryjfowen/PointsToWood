@@ -43,6 +43,12 @@ PointsToWood: A deep learning framework for complete canopy leaf-wood segmentati
 
 📎 [Pytorch Geometric](https://pytorch-geometric.readthedocs.io/en/latest/notes/installation.html) instructions for each OS can be found here.
 
+5. Install git lfs to enable the model file to be downloaded.
+
+'''
+sudo apt-get install git-lfs
+'''
+
 #
 
 ### Running PointsToWood
@@ -62,12 +68,12 @@ cd ~/PointsToWood/pointstowood/
 3. Run PointsToWood.
 
 ```
-python3 predict.py --point-cloud /x/x/cloud.ply --model eu.pth --batch_size 16 --is-wood 0.55 --grid_size 1.0 2.0 --min_pts 512;
+python3 predict.py --point-cloud /x/x/cloud.ply --model eu.pth --batch_size 16 --is-wood 0.55 --grid_size 2.0 --min_pts 512;
 ```
  <sub> 3.1 Use `--is-wood` parameter to apply a more conservative wood labeling strategy. With this option, a point is classified as wood if ALL neighboring points within its local neighborhood exceed the wood probability threshold. This approach increases wood detection specificity, reducing false positives but may miss potential wood structures that might otherwise be detected.
 
 ```
-python3 predict.py --point-cloud /x/x/cloud.ply --model eu.pth --batch_size 16 --any-wood 0.55 --grid_size 1.0 2.0 --min_pts 512;
+python3 predict.py --point-cloud /x/x/cloud.ply --model eu.pth --batch_size 16 --any-wood 0.55 --grid_size 2.0 --min_pts 512;
 ```
  <sub> 3.2 Use `--any-wood` parameter to apply a more aggressive wood labeling strategy. With this option, a point is classified as wood if ANY neighboring point within its local neighborhood exceeds the wood probability threshold. This approach increases wood detection sensitivity, capturing more potential wood structures that might otherwise be missed but may increase false positives.
 
@@ -89,5 +95,4 @@ Within the model folder, we have biome specific as well as more general ecosyste
 <sub>Weiser, Hannah; Ulrich, Veit; Winiwarter, Lukas; Esmorís, Alberto M.; Höfle, Bernhard, 2024, "Manually labeled terrestrial laser scanning point clouds of individual trees for leaf-wood separation", https://doi.org/10.11588/data/UUMEDI, heiDATA, V1, UNF:6:9U7BGTgjjsWd1GduT1qXjA== [fileUNF]. Distributed under a Creative Commons Attribution 4.0 International Deed.<</sub>
 
 <sub>Harry, J. F. O., Emily, L., & Grieve, S. (2024). Plot-level semantically labelled terrestrial laser scanning point clouds (1.0) [Data set]. Zenodo. https://doi.org/10.5281/zenodo.13268500<</sub>
-
 

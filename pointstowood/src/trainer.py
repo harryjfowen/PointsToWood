@@ -1,4 +1,3 @@
-#from src.model_edgeconv import Net
 from src.model import Net
 from src.augmentation import augmentations
 from tqdm import tqdm
@@ -13,19 +12,26 @@ from sklearn.metrics import balanced_accuracy_score, precision_score, recall_sco
 from collections import OrderedDict
 from src.loss import *
 from torch.optim import AdamW
-from src.cosine_scheduler import CosineAnnealingWarmupRestarts
 import warnings
-import copy
 import glob
 import random
-from torch.amp import autocast_mode
+import wandb
+
+# Configure PyTorch settings
 torch.backends.cudnn.benchmark = False
 torch.set_float32_matmul_precision('medium')
 warnings.filterwarnings("ignore", category=UserWarning)
 torch.autograd.set_detect_anomaly(True)
 
+# Set random seed for reproducibility
 seed = 141190
 torch.manual_seed(seed)
+np.random.seed(seed)
+random.seed(seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
 def write_xyz_to_file(tensor: torch.Tensor, filename: str):
     tensor_np = tensor.cpu().numpy()    
     with open(filename, 'w') as f:
@@ -34,7 +40,6 @@ def write_xyz_to_file(tensor: torch.Tensor, filename: str):
 
 class TrainingDataset(Dataset, ABC):
     def __init__(self, voxels, augmentation, mode, max_pts, device):
-
         if not voxels:
             raise ValueError("The 'voxels' parameter cannot be empty.")
         self.voxels = voxels
@@ -50,32 +55,29 @@ class TrainingDataset(Dataset, ABC):
         return len(self.keys) 
 
     def __getitem__(self, index):
-
         point_cloud = torch.load(self.keys[index], weights_only=True)
         pos = torch.as_tensor(point_cloud[:, :3], dtype=torch.float).requires_grad_(False)
         reflectance = torch.as_tensor(point_cloud[:, self.reflectance_index], dtype=torch.float)
         y = torch.as_tensor(point_cloud[:, self.label_index], dtype=torch.float)
+        
         if self.augmentation:
             pos, reflectance, y = augmentations(pos, reflectance, y, self.mode)
+        
         local_shift = torch.mean(pos[:, :3], axis=0).requires_grad_(False)
         pos = pos - local_shift
-        scaling_factor = torch.sqrt((pos ** 2).sum(dim=1)).max()
+        
         if torch.any(torch.isnan(reflectance)):
-            print('nans in relfectance')
-        label_weighting = self.calculate_pointwise_weight(y)
-        data = Data(pos=pos, reflectance=reflectance, y=y, sf=scaling_factor, label_weighting=label_weighting)    
+            print('nans in reflectance')
+                
+        data = Data(
+            pos=pos,
+            reflectance=reflectance,
+            y=y,
+            local_shift=local_shift,
+            label_weighting=None
+        )    
         return data
-    
-    def calculate_pointwise_weight(self, y, min_weight=0.5):
-        num_pos = (y == 1).sum().float()
-        num_neg = (y == 0).sum().float()
-        total = num_pos + num_neg
-        pos_ratio = num_pos / total
-        weight = 1.0 - torch.abs(pos_ratio - 0.5) * 2.0
-        weight = torch.clamp(weight, min=min_weight)
-        weights = torch.full_like(y, weight, dtype=torch.float, device=y.device)
-        return weights
-    
+
 class ModelManager:
     def __init__(self, model, device):
         self.model = model
@@ -92,7 +94,7 @@ class ModelManager:
         return self.model
 
     def save_checkpoints(self, args, epoch):
-        checkpoint_folder = os.path.join(args.wdir,'checkpoints')
+        checkpoint_folder = os.path.join(args.wdir, 'checkpoints')
         if not os.path.isdir(checkpoint_folder):
             os.mkdir(checkpoint_folder)
         file = checkpoint_folder + '/'f'epoch_{epoch}.pth'
@@ -102,7 +104,7 @@ class ModelManager:
     def save_best_model(self, stat, best_stat, save_path):
         if stat > best_stat:
             best_stat = stat
-            torch.save({'model_state_dict': self.model.state_dict()},  save_path)
+            torch.save({'model_state_dict': self.model.state_dict()}, save_path)
             print(f'Saving ', save_path)
         return best_stat
 
@@ -111,274 +113,289 @@ class ModelManager:
 #                                       ==========================                                      #
 
 def SemanticTraining(args):
-
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')    
-    torch.autograd.set_detect_anomaly(True)
-
-    if args.wandb:
-        import wandb
-        wandb.init(project="PointsToWood", config={"architecture": "pointnet++","dataset": "high resolution 2 & 4 m voxels","epochs": args.num_epochs,})
-        
     
+    # Initialize wandb if enabled
+    if args.wandb:
+        wandb.init(
+            project="pointstowood",
+            config={
+                "learning_rate": 5e-5,
+                "batch_size": args.batch_size,
+                "max_pts": args.max_pts,
+                "augmentation": args.augmentation,
+                "num_epochs": args.num_epochs
+            }
+        )
+    
+    # Initialize model and manager
     model = Net(num_classes=1, num_epochs=args.num_epochs).to(device)
-    #model = Net(num_classes=1).to(device)
+    manager = ModelManager(model, device)
     print('Model contains', sum(p.numel() for p in model.parameters()), ' parameters')
 
-    train_dataset = TrainingDataset(voxels=args.trfile, augmentation=args.augmentation, mode='train', device=device, max_pts=args.max_pts)
+    # Setup data loaders
+    num_workers = min(8, os.cpu_count() or 1)
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=32,              # Increase from default
-        pin_memory=True,           # Faster data transfer to GPU
-        persistent_workers=True,    # Keep workers alive between epochs
-        prefetch_factor=2          # Prefetch batches
+        TrainingDataset(voxels=args.trfile, augmentation=args.augmentation, mode='train', device=device, max_pts=args.max_pts),
+        batch_size=args.batch_size, shuffle=True, num_workers=num_workers,
+        pin_memory=True, persistent_workers=True, prefetch_factor=2
     )
 
+    test_loader = None
     if args.test:
-        test_dataset = TrainingDataset(voxels=args.tefile, augmentation=True, mode='test', device=device, max_pts=args.max_pts)
-        test_loader = DataLoader(test_dataset, batch_size=int(args.batch_size/2), shuffle=True, drop_last=True, num_workers=32, sampler=None, pin_memory=True)
+        test_loader = DataLoader(
+            TrainingDataset(voxels=args.tefile, augmentation=True, mode='test', device=device, max_pts=args.max_pts),
+            batch_size=int(args.batch_size/2), shuffle=True, drop_last=True, 
+            num_workers=num_workers, pin_memory=True
+        )
 
-    criterion = FocalLoss(reduction="mean", gamma = 2.0, alpha = None, label_smoothing = None)
-    #criterion = CyclicalFocalLoss(gamma_hc=3.0, gamma_lc=0.5, fc=4.0, num_epochs=args.num_epochs, alpha=None, label_smoothing = None)
-
+    # Setup training components
+    criterion = FocalLoss(reduction="mean", gamma=3.0, alpha=None, label_smoothing=None)
+    #criterion = CyclicalFocalLoss(gamma_hc=4.0, gamma_lc=0.5, fc=4.0, num_epochs=args.num_epochs, alpha=None, label_smoothing = 0.2)
+    
     optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=5e-5, weight_decay=1e-4)
-    lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=5e-5, total_steps=args.num_epochs, pct_start=0.08, anneal_strategy='cos', div_factor = 100)
-            
-    manager = ModelManager(model, device)
+    lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=5e-5, total_steps=args.num_epochs, 
+                                                      pct_start=0.08, anneal_strategy='cos', div_factor=100)
 
-    if os.path.isfile(os.path.join(args.wdir,'model',args.model)):
-        print("Loading model")
+    # Load or create model
+    model_path = os.path.join(args.wdir, 'model', args.model)
+    if os.path.isfile(model_path):
         try:
-            manager.load_model(os.path.join(args.wdir,'model',args.model))
+            manager.load_model(model_path)
         except KeyError:
-            print("Failed to load, creating new...")
-            torch.save(model.state_dict(), os.path.join(args.wdir,'model',args.model))
+            torch.save({'model_state_dict': model.state_dict()}, model_path)
     else:
-        print("\nModel not found, creating new file...")
-        torch.save(model.state_dict(), os.path.join(args.wdir,'model',args.model))
+        torch.save({'model_state_dict': model.state_dict()}, model_path)
 
-    def log_history(args,history):
-        try:
-            history = np.savetxt(os.path.join(args.wdir, 'model', os.path.splitext(args.model)[0] + "_history.csv"), history)
-            print("Saved training history successfully.")
+    # Initialize tracking variables
+    best_metrics = {
+        'ba_train': 0.0, 'f1_train': 0.0,
+        'ba_test': 0.0, 'f1_test': 0.0,
+        'precision_test': 0.0, 'recall_test': 0.0
+    }
+    history = None
 
-        except OSError:
-            history = np.savetxt(os.path.join(args.wdir, 'model', os.path.splitext(args.model)[0] + "_history_backup.csv"), history)
-            pass
+    def calculate_metrics(y_true, y_pred):
+        """Calculate metrics for both wood and leaf, plus class ratio"""
+        return {
+            'precision': precision_score(y_true, y_pred, pos_label=1, average='binary', zero_division=0),
+            'recall': recall_score(y_true, y_pred, pos_label=1, average='binary', zero_division=0),
+            'f1': f1_score(y_true, y_pred, average='binary', zero_division=0),
+            'bacc': balanced_accuracy_score(y_true, y_pred),
+            'leaf_pr': precision_score(y_true, y_pred, pos_label=0, average='binary', zero_division=0),
+            'leaf_re': recall_score(y_true, y_pred, pos_label=0, average='binary', zero_division=0),
+            'wood_ratio': np.mean(y_true)
+        }
 
-    lr_list = []
-    gamma = 0.0,0.0
-    best_ba_train, best_f1_train, best_ba_test, best_f1_test, best_precision_test = 0.0, 0.0, 0.0, 0.0, 0.0
+    def process_batch(data, model, criterion, optimizer=None, is_training=True):
+        """Process a single batch of data"""
+        data = data.to(device)
+        
+        if is_training:
+            optimizer.zero_grad()
+        
+        with torch.autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu', 
+                           enabled=True, dtype=torch.bfloat16):
+            outputs = model(data)
+            outputs = torch.clamp(outputs, min=-20.0, max=20.0)
+            loss, gamma = criterion(outputs, data.y)
+
+        if is_training:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+        with torch.no_grad():
+            preds = (torch.sigmoid(outputs) >= 0.50).type(torch.int64)
+            metrics = calculate_metrics(data.y.cpu().numpy(), preds.cpu().numpy())
+            
+        return loss.item(), metrics, gamma if is_training else None
 
     for epoch in range(1, args.num_epochs + 1):
-
+        print("\n" + "="*93)
+        print(f"EPOCH {epoch}")
+        
+        # Training phase
         model.train()
-        criterion.current_epoch = epoch 
-
-        train_loss, train_accuracy, train_precision, train_recall, train_f1 = 0.0, 0.0, 0.0, 0.0, 0.0
-
-        sleep(0.1)
-        print("\n=============================================================================================")
-        print("EPOCH ", epoch)
-
-        with tqdm(total=len(train_loader), colour='white', ascii="░▒", bar_format='{l_bar}{bar:20}{r_bar}{bar:-20b}') as tepoch:
-            for i, (data) in enumerate(train_loader):
-                
-                data = data.to(device)
-                optimizer.zero_grad()
-
+        criterion.current_epoch = epoch
+        train_stats = {
+            'loss': 0.0, 
+            'bacc': 0.0, 
+            'precision': 0.0, 
+            'recall': 0.0, 
+            'f1': 0.0,
+            'leaf_pr': 0.0,
+            'leaf_re': 0.0,
+            'wood_ratio': 0.0
+        }
+        valid_batches = 0
+        
+        with tqdm(total=len(train_loader), colour='white', ascii="░▒", 
+                  bar_format='{l_bar}{bar:20}{r_bar}') as pbar:
+            for i, data in enumerate(train_loader):
                 try:
-                    model_params_before = copy.deepcopy(model.state_dict())
+                    loss, metrics, gamma = process_batch(data, model, criterion, optimizer, is_training=True)
                     
-                    with autocast_mode.autocast(
-                        device_type='cuda' if torch.cuda.is_available() else 'cpu',
-                        enabled=True, 
-                        dtype=torch.bfloat16
-                        #dtype=torch.float32
-                    ):
-                        outputs = model(data)
-                        outputs = torch.clamp(outputs, min=-20.0, max=20.0)  # This is your safety net
-                        loss, gamma = criterion(outputs, data.y, data.label_weighting)
-                        
-
-                    pre_backward_stats = {
-                        'outputs_mean': outputs.mean().item(),
-                        'outputs_std': outputs.std().item(),
-                        'loss_value': loss.item(),
-                        'max_abs_output': torch.abs(outputs).max().item()
-                    }
-
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
-                    optimizer.zero_grad()
-                
+                    # Update running statistics
+                    valid_batches += 1
+                    train_stats['loss'] += loss
+                    for k, v in metrics.items():
+                        train_stats[k] = ((train_stats[k] * (valid_batches-1)) + v) / valid_batches
+                    
+                    # Update progress bar
+                    pbar.set_description("Train")
+                    pbar.set_postfix({
+                        'Lo': f"{train_stats['loss']/valid_batches:.3f}",
+                        'BAcc': f"{train_stats['bacc']:.3f}",
+                        'F1': f"{train_stats['f1']:.3f}",
+                        'W_Pr': f"{train_stats['precision']:.3f}",
+                        'W_Re': f"{train_stats['recall']:.3f}",
+                        'L_Pr': f"{train_stats['leaf_pr']:.3f}",
+                        'L_Re': f"{train_stats['leaf_re']:.3f}",
+                        'Ratio': f"{train_stats['wood_ratio']:.2f}",
+                        'Ga': f"{gamma:.3f}"
+                    })
+                    pbar.update()
+                    
                 except RuntimeError as e:
                     print(f"\nSkipping batch due to error: {str(e)}")
-                    print(f"Last known good values: {pre_backward_stats}")
-                    model.load_state_dict(model_params_before)
-                    optimizer.zero_grad()
                     continue
-
-                with torch.no_grad():
-                    probs = torch.sigmoid(outputs).detach()
-                    preds = (probs >= 0.50).type(torch.int64).detach()
-
-                train_loss += loss.item()
-                
-                # Safely get wood-specific metrics
-                y_true = data.y.cpu().numpy()
-                y_pred = preds.cpu().numpy()
-                
-                # Handle case where only one class is present
-                try:
-                    class_precision = precision_score(y_true, y_pred, pos_label=1, average=None)
-                    class_recall = recall_score(y_true, y_pred, pos_label=1, average=None)
-                    train_precision += class_precision[1] if len(class_precision) > 1 else 0
-                    train_recall += class_recall[1] if len(class_recall) > 1 else 0
-                except:
-                    # If metrics can't be computed (e.g., no positive class), use 0
-                    train_precision += 0
-                    train_recall += 0
-                
-                train_accuracy += balanced_accuracy_score(y_true, y_pred, sample_weight=None)
-                train_f1 += f1_score(y_true, y_pred, average='binary', zero_division=0)
-
-                lr_list.append(optimizer.param_groups[0]["lr"])
-                tepoch.set_description(f"Train")
-                tepoch.update()
-                tepoch.set_postfix({
-                    'Lr': optimizer.param_groups[0]["lr"],
-                    'Lo': np.around(train_loss / (i + 1), 5),
-                    'BAcc': np.around(train_accuracy / (i + 1), 3),
-                    'Wood_Pr': np.around(train_precision / (i + 1), 3),
-                    'Wood_Re': np.around(train_recall / (i + 1), 3),
-                    'F1': np.around(train_f1 / (i + 1), 3),
-                    'Ga': np.around(gamma, 3)
-                })
-
-            tepoch.close()
 
             lr_scheduler.step()
 
-        test_accuracy, test_precision, test_recall, test_f1 = 0.0, 0.0, 0.0, 0.0
-
+        # Testing phase
         if args.test:
             model.eval()
-            sleep(0.1) 
-
-            with tqdm(total=len(test_loader), colour='white', ascii="▒█", bar_format='{l_bar}{bar:20}{r_bar}{bar:-20b}') as tepoch:
-                with torch.no_grad():
-                    for j, data in enumerate(test_loader):
-                        data.y = data.y.to(device)
-
-                        outputs = model(data.to(device))
-                        probs = torch.sigmoid(outputs).detach()
-                        preds = (probs >= 0.50).type(torch.int64).detach()                        
-
-                        # Safely get wood-specific metrics
-                        y_true = data.y.cpu().numpy()
-                        y_pred = preds.cpu().numpy()
-                        
-                        # Handle case where only one class is present
-                        try:
-                            class_precision = precision_score(y_true, y_pred, pos_label=1, average=None)
-                            class_recall = recall_score(y_true, y_pred, pos_label=1, average=None)
-                            test_precision += class_precision[1] if len(class_precision) > 1 else 0
-                            test_recall += class_recall[1] if len(class_recall) > 1 else 0
-                        except:
-                            # If metrics can't be computed (e.g., no positive class), use 0
-                            test_precision += 0
-                            test_recall += 0
-                        
-                        test_accuracy += balanced_accuracy_score(y_true, y_pred, sample_weight=None)
-                        test_f1 += f1_score(y_true, y_pred, average='binary', zero_division=0)
-
-                        tepoch.set_description(f"Test")
-                        tepoch.update()
-                        tepoch.set_postfix({
-                            'BAcc': np.around(test_accuracy / (j + 1), 3),
-                            'Wood_Pr': np.around(test_precision / (j + 1), 3),
-                            'Wood_Re': np.around(test_recall / (j + 1), 3),
-                            'Wood_F1': np.around(test_f1 / (j + 1), 3),
-                        })
-
-                    tepoch.close()
+            test_stats = {
+                'bacc': 0.0, 
+                'precision': 0.0, 
+                'recall': 0.0, 
+                'f1': 0.0,
+                'leaf_pr': 0.0,
+                'leaf_re': 0.0,
+                'wood_ratio': 0.0
+            }
+            valid_batches = 0
             
-        epoch_results = np.array([[epoch, optimizer.param_groups[0]["lr"],
-                                 train_loss/len(train_loader),
-                                 train_accuracy/len(train_loader),
-                                 train_f1/len(train_loader),
-                                 train_precision/len(train_loader),
-                                 train_recall/len(train_loader)]])
+            with torch.no_grad(), tqdm(total=len(test_loader), colour='white', ascii="▒█",
+                                     bar_format='{l_bar}{bar:20}{r_bar}') as pbar:
+                for j, data in enumerate(test_loader):
+                    try:
+                        _, metrics, _ = process_batch(data, model, criterion, is_training=False)
+                        
+                        # Accumulate metrics
+                        valid_batches += 1
+                        for k, v in metrics.items():
+                            test_stats[k] = ((test_stats[k] * (valid_batches-1)) + v) / valid_batches
+                        
+                        # Update progress bar with running averages
+                        pbar.set_description("Test")
+                        pbar.set_postfix({
+                            'Lo': f"{test_stats['loss']/valid_batches:.3f}" if 'loss' in test_stats else "N/A",
+                            'BAcc': f"{test_stats['bacc']:.3f}",
+                            'F1': f"{test_stats['f1']:.3f}",
+                            'W_Pr': f"{test_stats['precision']:.3f}",
+                            'W_Re': f"{test_stats['recall']:.3f}",
+                            'L_Pr': f"{test_stats['leaf_pr']:.3f}",
+                            'L_Re': f"{test_stats['leaf_re']:.3f}",
+                            'Ratio': f"{test_stats['wood_ratio']:.2f}",
+                        })
+                        pbar.update()
+                        
+                    except Exception as e:
+                        print(f"\nSkipping batch due to error: {str(e)}")
+                        continue
 
-        if args.test:
-            epoch_results = np.append(epoch_results, [[test_accuracy / len(test_loader),
-                                                       test_f1 / len(test_loader),
-                                                       test_precision / len(test_loader),
-                                                       test_recall / len(test_loader)]], axis=1)
+                # No need for final averaging since we've been doing running averages
+                if valid_batches == 0:
+                    test_stats = None
+
+        # Save history and checkpoints
+        epoch_results = np.array([[
+            epoch, optimizer.param_groups[0]["lr"],
+            train_stats['loss']/len(train_loader),
+            train_stats['bacc']/len(train_loader),
+            train_stats['f1']/len(train_loader),
+            train_stats['precision']/len(train_loader),
+            train_stats['recall']/len(train_loader)
+        ]])
         
-        if epoch == 1:
-            history = epoch_results
-        else:
-            history = np.vstack((history,epoch_results))
-
-        log_history(args,history)
-
+        if args.test and test_stats is not None:
+            epoch_results = np.append(epoch_results, [[
+                test_stats['bacc']/len(test_loader),
+                test_stats['f1']/len(test_loader),
+                test_stats['precision']/len(test_loader),
+                test_stats['recall']/len(test_loader)
+            ]], axis=1)
+        elif args.test:
+            # Add zeros if no valid test batch was processed
+            epoch_results = np.append(epoch_results, [[0.0, 0.0, 0.0, 0.0]], axis=1)
+        
+        history = epoch_results if epoch == 1 else np.vstack((history, epoch_results))
+        np.savetxt(os.path.join(args.wdir, 'model', f"{os.path.splitext(args.model)[0]}_history.csv"), history)
+        
         if epoch in args.checkpoints:
             manager.save_checkpoints(args, epoch)
-        
-        if args.stop_early:
-            consec_decreases = 0  
-            if epoch > 10: 
-                current_acc = history[-1, 3] 
-                prev_acc = history[-2, 3]     
+
+        # Early stopping with consecutive decreases
+        if args.stop_early and epoch > 10:
+            if not hasattr(SemanticTraining, 'consec_decreases'):
+                SemanticTraining.consec_decreases = 0
+            
+            current_acc = history[-1, 3]
+            prev_acc = history[-2, 3]
+            
+            if current_acc < prev_acc:
+                SemanticTraining.consec_decreases += 1
+            else:
+                SemanticTraining.consec_decreases = 0
                 
-                if current_acc < prev_acc:
-                    consec_decreases += 1
-                else:
-                    consec_decreases = 0  
-                    
-                if consec_decreases >= 10: 
-                    print(f"\nStopping early at epoch {epoch} - training accuracy decreased for {consec_decreases} consecutive epochs")
-                    print(f"Best accuracy was {max(history[:, 3]):.4f} at epoch {np.argmax(history[:, 3]) + 1}")
-                    break
+            if SemanticTraining.consec_decreases >= 10:
+                print(f"\nStopping early at epoch {epoch} - training accuracy decreased for {SemanticTraining.consec_decreases} consecutive epochs")
+                print(f"Best accuracy was {max(history[:, 3]):.4f} at epoch {np.argmax(history[:, 3]) + 1}")
+                break
 
-        if epoch > int(args.num_epochs*0.10) and not args.test:
-            if train_precision/len(train_loader) > train_recall/len(train_loader):
-                best_ba_train = manager.save_best_model(train_accuracy/len(train_loader), best_ba_train, 
-                    os.path.join(args.wdir,'model','ba-' + os.path.basename(args.model)))
-                best_f1_train = manager.save_best_model(train_f1/len(train_loader), best_f1_train, 
-                    os.path.join(args.wdir,'model','f1-' + os.path.basename(args.model)))
+        # Save best models - testing
+        if args.test and test_stats is not None and epoch > int(args.num_epochs*0.25):
+            test_precision = test_stats['precision']/len(test_loader)
+            test_recall = test_stats['recall']/len(test_loader)
+            #if test_precision >= 0.99 * test_recall:
+            best_metrics['ba_test'] = manager.save_best_model(
+                test_stats['bacc']/len(test_loader),
+                best_metrics['ba_test'],
+                os.path.join(args.wdir, 'model', f'ba-{args.model}'))
+            best_metrics['f1_test'] = manager.save_best_model(
+                test_stats['f1']/len(test_loader),
+                best_metrics['f1_test'],
+                os.path.join(args.wdir, 'model', f'f1-{args.model}'))
+            best_metrics['precision_test'] = manager.save_best_model(
+                test_precision,
+                best_metrics['precision_test'],
+                os.path.join(args.wdir, 'model', f'precision-{args.model}'))
 
-        if args.test and epoch > int(args.num_epochs*0.25):
-            if test_precision/len(test_loader) >= 0.99 * test_recall/len(test_loader):
-                best_ba_test = manager.save_best_model(test_accuracy/len(test_loader), best_ba_test, 
-                    os.path.join(args.wdir,'model','ba-' + os.path.basename(args.model)))
-                best_f1_test = manager.save_best_model(test_f1/len(test_loader), best_f1_test, 
-                    os.path.join(args.wdir,'model','f1-' + os.path.basename(args.model)))
-                best_precision_test = manager.save_best_model(test_precision/len(test_loader), best_precision_test, 
-                    os.path.join(args.wdir,'model','precision-' + os.path.basename(args.model)))
-        
+        # Log to wandb if enabled
+        if args.wandb:
+            wandb_metrics = {
+                "Epoch": epoch,
+                "Learning Rate": optimizer.param_groups[0]["lr"],
+                "Loss": np.around(train_stats['loss']/valid_batches, 4),
+                "Accuracy": np.around(train_stats['bacc'], 4),
+                "Precision": np.around(train_stats['precision'], 4),
+                "Recall": np.around(train_stats['recall'], 4),
+                "F1": np.around(train_stats['f1'], 4)
+            }
+            
+            if args.test:
+                wandb_metrics.update({
+                    "Test F1": np.around(test_stats['f1'], 4),
+                    "Test Accuracy": np.around(test_stats['bacc'], 4),
+                    "Test Precision": np.around(test_stats['precision'], 4),
+                    "Test Recall": np.around(test_stats['recall'], 4)
+                })
+            
+            wandb.log(wandb_metrics)
+
+        # Save final model at last epoch
         if epoch == args.num_epochs:
             print("Saving final GLOBAL model")
-            torch.save({'model_state_dict': model.state_dict()}, os.path.join(args.wdir,'model',args.model))
-
-        t_acc =  test_accuracy / len(test_loader) if args.test else 0.0
-        t_f1 =  test_f1 / len(test_loader) if args.test else 0.0
-        t_recall = test_recall / len(test_loader) if args.test else 0.0
-        t_precision = test_precision / len(test_loader) if args.test else 0.0
-
-        if args.wandb:
-            wandb.log({"Epoch": epoch, 
-                "Learning Rate": optimizer.param_groups[0]["lr"],
-                "Loss": np.around(train_loss/len(train_loader), 4),
-                "Accuracy": np.around(train_accuracy/len(train_loader), 4),
-                "Precision": np.around(train_precision/len(train_loader), 4),
-                "Recall": np.around(train_recall/len(train_loader), 4),
-                "F1": np.around(train_f1/len(train_loader), 4),
-                "Test F1": np.around(t_f1, 4),
-                "Test Accuracy": np.around(t_acc, 4),
-                "Test Precision": np.around(t_precision, 4),
-                "Test Recall": np.around(t_recall, 4)})
+            torch.save({'model_state_dict': model.state_dict()}, model_path)

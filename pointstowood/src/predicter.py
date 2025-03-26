@@ -73,22 +73,25 @@ class TestingDataset(Dataset, ABC):
         return len(self.keys)  
 
     def __getitem__(self, index):
-
         point_cloud = torch.load(self.keys[index])
         pos = torch.as_tensor(point_cloud[:, :3], dtype=torch.float).requires_grad_(False)
         reflectance = torch.as_tensor(point_cloud[:, self.reflectance_index], dtype=torch.float)
 
+        nan_mask = torch.isnan(pos).any(dim=1) | torch.isnan(reflectance)
+        if nan_mask.any():
+            print(f"Encountered NaN values in sample at index {index}")
+            pos = pos[~nan_mask]
+            reflectance = reflectance[~nan_mask]
+        
         local_shift = torch.mean(pos[:, :3], axis=0).requires_grad_(False)
         pos = pos - local_shift
-        scaling_factor = torch.sqrt((pos ** 2).sum(dim=1)).max()
-
-        nan_mask = torch.isnan(pos).any(dim=1) | torch.isnan(reflectance)
-        pos = pos[~nan_mask]
-        reflectance = reflectance[~nan_mask]
-
-        if nan_mask.any(): print(f"Encountered NaN values in sample at index {index}")
-        data = Data(pos=pos, reflectance=reflectance, local_shift=local_shift, sf = scaling_factor)
-        return data        
+        
+        data = Data(
+            pos=pos, 
+            reflectance=reflectance, 
+            local_shift=local_shift,
+        )
+        return data
         
 from collections import OrderedDict
 def load_model(path, model, device):
@@ -132,7 +135,7 @@ class PointCloudClassifier:
             indices = np.load(indices_file)
         else:
             kd_tree = KDTree(classification[:, :3])
-            _, indices = kd_tree.query(original.values[:, :3], k = 8 if self.any_wood != 1 else 16)
+            _, indices = kd_tree.query(original.values[:, :3], k = 8 if self.any_wood != 1 else 32)
 
         labels = np.zeros((original.shape[0], 2))
         labels = self.compute_labels(classification[indices], labels, self.any_wood)
@@ -220,9 +223,12 @@ def SemanticSegmentation(args):
                 #reduced_features = reduced_features.cpu().numpy()
 
                 for batch in batches:
-                    # Handle predictions
-                    outputb = np.asarray(output[data.batch.cpu() == batch])
-                    outputb[:, :3] = outputb[:, :3] + np.asarray(data.local_shift.cpu())[3 * batch : 3 + (3 * batch)]
+                    batch_mask = data.batch.cpu() == batch
+                    outputb = np.asarray(output[batch_mask])
+                    
+                    batch_local_shift = data.local_shift[batch*3:(batch+1)*3].cpu().numpy()                    
+                    outputb[:, :3] = outputb[:, :3] + batch_local_shift
+                    
                     output_list.append(outputb)
                     
                     # # Handle features

@@ -55,6 +55,27 @@ class Voxelise:
                 indices_list.append(voxel.to('cpu'))
         return indices_list
     
+    def grid2(self):
+        indices_list = []
+        sorted_sizes = sorted(self.gridsize) 
+        current_pos = self.pos
+        original_spacing = self.pointspacing 
+        for i, size in enumerate(sorted_sizes):
+            if i == 0:
+                print(f"No downsampling for grid size {size}m")
+            if i > 0:
+                self.pointspacing = size * 0.01
+                print(f"Downsampling to {self.pointspacing:.2f} m spacing for grid size {size}m")
+                current_pos = self.downsample()
+            voxelised = voxel_grid(current_pos.cpu(), size)
+            for vx in torch.unique(voxelised):
+                voxel = (voxelised == vx).nonzero(as_tuple=True)[0]
+                if voxel.size(0) < self.minpoints:
+                    continue
+                indices_list.append(voxel.to('cpu'))
+        self.pointspacing = original_spacing
+        return indices_list
+    
     
     def write_voxels(self):
         
