@@ -44,9 +44,13 @@ PointsToWood: A deep learning framework for complete canopy leaf-wood segmentati
 📎 [Pytorch Geometric](https://pytorch-geometric.readthedocs.io/en/latest/notes/installation.html) instructions for each OS can be found here.
 
 5. Install git lfs to enable the model file to be downloaded.
-
 '''
 sudo apt-get install git-lfs
+'''
+
+6. Install opt_einsum which is a requirement for KAN module 
+'''
+pip install opt_einsum
 '''
 
 #
@@ -68,12 +72,12 @@ cd ~/PointsToWood/pointstowood/
 3. Run PointsToWood.
 
 ```
-python3 predict.py --point-cloud /x/x/cloud.ply --model eu.pth --batch_size 16 --is-wood 0.55 --grid_size 2.0 --min_pts 512;
+python3 predict.py --point-cloud /x/x/cloud.ply --model eu.pth --batch_size 16 --is-wood 0.55 --grid_size 2.0 4.0 --min_pts 512 --max_pts 16384;
 ```
  <sub> 3.1 Use `--is-wood` parameter to apply a more conservative wood labeling strategy. With this option, a point is classified as wood if ALL neighboring points within its local neighborhood exceed the wood probability threshold. This approach increases wood detection specificity, reducing false positives but may miss potential wood structures that might otherwise be detected.
 
 ```
-python3 predict.py --point-cloud /x/x/cloud.ply --model eu.pth --batch_size 16 --any-wood 0.55 --grid_size 2.0 --min_pts 512;
+python3 predict.py --point-cloud /x/x/cloud.ply --model eu.pth --batch_size 16 --any-wood 0.55 grid_size 2.0 4.0 --min_pts 512 --max_pts 16384;
 ```
  <sub> 3.2 Use `--any-wood` parameter to apply a more aggressive wood labeling strategy. With this option, a point is classified as wood if ANY neighboring point within its local neighborhood exceeds the wood probability threshold. This approach increases wood detection sensitivity, capturing more potential wood structures that might otherwise be missed but may increase false positives.
 
