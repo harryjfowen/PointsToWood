@@ -105,9 +105,6 @@ The model will append two new columns to your point cloud:
   - Trained on European forest data
   - Recommended for most use cases
 
-### Model Selection
-The `fbeta-eu.pth` model uses F-beta score optimization with β = 0.9, giving slightly higher weight to precision over recall. This is ideal for applications where false positive wood detections are more costly than missing some wood structures.
-
 Within the model folder, we have biome specific as well as more general ecosystem agnostic models. 
 
 
