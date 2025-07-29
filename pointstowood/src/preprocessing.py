@@ -1,94 +1,63 @@
 import torch
-from torch_geometric.nn import voxel_grid
-from torch_geometric.nn.pool.consecutive import consecutive_cluster
 import glob
 import os
 from tqdm import tqdm
-import torch_scatter
+
+from src.utils import (
+    clear_gpu_memory,
+    quantile_normalize_reflectance,
+    minmax_normalize_reflectance,
+    downsample_points,
+    create_point_grid
+)
 
 class Voxelise:
-    def __init__(self, pos, vxpath, minpoints=512, maxpoints=9999999, gridsize=[1.0,2.0], pointspacing=None):
+    def __init__(self, pos, vxpath, minpoints=512, maxpoints=9999999, gridsize=[2.0, 4.0], pointspacing=None, overlap: float = 0.0):
+        """
+        Initialize the voxelization process.
+        
+        Args:
+            pos (Tensor): Point cloud positions and optional reflectance
+            vxpath (str): Output path for voxel files
+            minpoints (int): Minimum points required per voxel
+            maxpoints (int): Maximum points per voxel
+            gridsize (List[float]): List of grid sizes to use
+            pointspacing (float, optional): Spacing for downsampling
+        """
         self.pos = pos
         self.vxpath = vxpath
         self.minpoints = minpoints
         self.maxpoints = maxpoints
         self.gridsize = gridsize
+        self.overlap = overlap
         self.pointspacing = pointspacing
-
-    def quantile_normalize_reflectance(self):
-        reflectance_tensor = self.pos[:, 3].view(-1)
-        if torch.isnan(reflectance_tensor).any():
-            raise ValueError("Input reflectance tensor contains NaN values.")
-        _, indices = torch.sort(reflectance_tensor)
-        ranks = torch.argsort(indices)
-        empirical_quantiles = (ranks.float() + 1) / (len(ranks) + 1)
-        empirical_quantiles = torch.clamp(empirical_quantiles, 1e-7, 1 - 1e-7)
-        normalized_reflectance = torch.erfinv(2 * empirical_quantiles - 1) * torch.sqrt(torch.tensor(2.0)).to(reflectance_tensor.device)
-        min_val = normalized_reflectance.min()
-        max_val = normalized_reflectance.max()
-        scaled_reflectance = 2 * (normalized_reflectance - min_val) / (max_val - min_val) - 1
-        return scaled_reflectance
     
     def downsample(self):
-        if self.pos.shape[1] > 3:
-            coords, values = self.pos[:, :3], self.pos[:, 3]
-            voxel_indices = voxel_grid(pos=coords, size=self.pointspacing)
-            _, remapped_indices = torch.unique(voxel_indices, return_inverse=True)
-            _, max_indices = torch_scatter.scatter_max(values, remapped_indices, dim=0)
-            valid_max_indices = max_indices[max_indices != -1]
-            downsampled_pos = self.pos[valid_max_indices]
-        else:
-            voxel_indices = voxel_grid(pos=self.pos, size=self.pointspacing)
-            _, idx = consecutive_cluster(voxel_indices)
-            downsampled_pos = self.pos[idx]
-        
-        return downsampled_pos
-
+        """Downsample point cloud to specified spacing."""
+        return downsample_points(self.pos, self.pointspacing)
+    
     def grid(self):
-        indices_list = []
-        for size in self.gridsize:
-            voxelised = voxel_grid(self.pos, size)
-            for vx in torch.unique(voxelised):
-                voxel = (voxelised == vx).nonzero(as_tuple=True)[0]
-                if voxel.size(0) < self.minpoints:
-                    continue
-                indices_list.append(voxel.to('cpu'))
-        return indices_list
-    
-    def grid2(self):
-        indices_list = []
-        sorted_sizes = sorted(self.gridsize) 
-        current_pos = self.pos
-        original_spacing = self.pointspacing 
-        for i, size in enumerate(sorted_sizes):
-            if i == 0:
-                print(f"No downsampling for grid size {size}m")
-            if i > 0:
-                self.pointspacing = size * 0.01
-                print(f"Downsampling to {self.pointspacing:.2f} m spacing for grid size {size}m")
-                current_pos = self.downsample()
-            voxelised = voxel_grid(current_pos.cpu(), size)
-            for vx in torch.unique(voxelised):
-                voxel = (voxelised == vx).nonzero(as_tuple=True)[0]
-                if voxel.size(0) < self.minpoints:
-                    continue
-                indices_list.append(voxel.to('cpu'))
-        self.pointspacing = original_spacing
-        return indices_list
-    
+        """Create grid of voxels from point cloud."""
+        return create_point_grid(
+            self.pos,
+            self.gridsize,
+            min_points=self.minpoints,
+            max_points=self.maxpoints,
+            overlap=self.overlap,
+        )
     
     def write_voxels(self):
-        
-        self.pos = torch.tensor(self.pos.values, dtype=torch.float).to(device='cuda')
+        """Process and write voxels to disk."""
+        if not isinstance(self.pos, torch.Tensor):
+            self.pos = torch.tensor(self.pos.values, dtype=torch.float).to(device='cuda')
 
         if self.pointspacing:
-            print(f'Downsampling to {self.pointspacing}m spacing')
             self.pos = self.downsample()
 
-        reflectance_not_zero = not torch.all(self.pos[:, 3] == 0)
+        reflectance_not_zero = self.pos.shape[1] > 3 and not torch.all(self.pos[:, 3] == 0)
         
         if reflectance_not_zero:
-            self.pos[:, 3] = self.quantile_normalize_reflectance()
+            self.pos[:, 3] = minmax_normalize_reflectance(self.pos[:, 3])
 
         voxels = self.grid()
 
@@ -104,6 +73,7 @@ class Voxelise:
             weight = None
 
         self.pos = self.pos.detach().clone().to('cpu')
+        
         file_counter = len(glob.glob(os.path.join(self.vxpath, 'voxel_*.pt')))
 
         for _, voxel_indices in enumerate(tqdm(voxels, desc='Writing voxels')):
@@ -121,10 +91,19 @@ class Voxelise:
             
             torch.save(voxel, os.path.join(self.vxpath, f'voxel_{file_counter}.pt'))
             file_counter += 1
+        
+        del voxel, voxel_indices, weight, self.pos
+        clear_gpu_memory()
         return -1
 
 def preprocess(args):
-    Voxelise(args.pc, vxpath=args.vxfile, minpoints=args.min_pts, maxpoints=args.max_pts, pointspacing=args.resolution, gridsize = args.grid_size).write_voxels()
-
-
-
+    """Process point cloud data based on command-line arguments."""
+    Voxelise(
+        args.pc, 
+        vxpath=args.vxfile, 
+        minpoints=args.min_pts, 
+        maxpoints=args.max_pts, 
+        pointspacing=args.resolution, 
+        gridsize=args.grid_size,
+        overlap=args.overlap
+    ).write_voxels()

@@ -29,7 +29,14 @@ def read_ply(fp, newline=None):
                 fmt = 'ascii' 
             if 'element vertex' in line: N = int(split_line[2])
             if 'property' in line: 
-                dtype.append(dtype_map[split_line[1]])
+                if split_line[1] not in dtype_map:
+                    # Handle int32 specifically
+                    if split_line[1] == 'int32':
+                        dtype.append('i4')
+                    else:
+                        dtype.append('i')  # Default to int
+                else:
+                    dtype.append(dtype_map[split_line[1]])
                 prop.append(split_line[2])
             if 'element face' in line:
                 raise Exception('.ply appears to be a mesh')

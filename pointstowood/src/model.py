@@ -1,35 +1,39 @@
 import torch
 import torch.nn.functional as F
 from torch_geometric.nn import knn_interpolate
-from torch_geometric.nn import knn
-from src.pointnet_attention import AttentivePointNetConv
-from torch_geometric.nn import Set2Set, voxel_grid, knn, global_max_pool
+from torch.nn import Sequential as Seq, Linear as Lin, BatchNorm1d as BN
+from torch_geometric.nn import PointNetConv, radius, voxel_grid, knn
+from src.PointNet import PointNetConv
+from src.AnisotropicConv import AnisotropicConv
 from torch_geometric.nn.pool.consecutive import consecutive_cluster
-from torch_scatter import scatter_add   
-from src.kan import KAN
+import torch.nn as nn
+import math
+from torchvision.ops import stochastic_depth
+from torch_scatter import scatter_mean
 
 def initialize_weights(model):
     for m in model.modules():
         if isinstance(m, (torch.nn.Conv1d, torch.nn.Linear)):
-            fan_in = m.weight.size(1)
-            fan_out = m.weight.size(0)
-            
-            if fan_in == 0 or fan_out == 0:
-                continue
-                
-            if isinstance(m, torch.nn.Conv1d):
-                torch.nn.init.kaiming_uniform_(
-                    m.weight, 
-                    mode='fan_in',
-                    nonlinearity='linear',
-                    a=1.0
-                )
-            else: 
-                torch.nn.init.xavier_uniform_(m.weight, gain=0.1)
-                
+            torch.nn.init.xavier_uniform_(m.weight)
             if m.bias is not None:
                 torch.nn.init.constant_(m.bias, 0)
+            if isinstance(m, torch.nn.Conv1d):
+                torch.nn.init.kaiming_uniform_(m.weight, mode='fan_in', nonlinearity='relu')
 
+class SqueezeExcite(nn.Module):
+    def __init__(self, channels: int, reduction: int = 4):
+        super().__init__()
+        hidden = max(channels // reduction, 1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, hidden, bias=False), nn.ReLU(inplace=True),
+            nn.Linear(hidden, channels, bias=False), nn.Sigmoid()
+        )
+
+    def forward(self, x, batch):
+        z = scatter_mean(x, batch, dim=0)
+        s = self.fc(z)[batch]
+        return x * s
+    
 class DepthwiseSeparableConv1d(torch.nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=1, stride=1, padding=0):
         super(DepthwiseSeparableConv1d, self).__init__()
@@ -48,34 +52,37 @@ class DepthwiseSeparableConv1d(torch.nn.Module):
             kernel_size=1  
         )
         self.pointwise_bn = torch.nn.BatchNorm1d(in_channels)
+        self.leaky_relu = torch.nn.LeakyReLU()
         
     def forward(self, x):
         out = self.depthwise_conv(x)
         out = self.depthwise_bn(out)
-        out = F.relu(out, inplace=True)
+        out = self.leaky_relu(out)
         out = self.pointwise_conv(out)
         out = self.pointwise_bn(out)
+        out = self.leaky_relu(out)
         return out
     
 class InvertedResidualBlock(torch.nn.Module):
-    def __init__(self, in_channels, out_channels, expansion_factor=4):
-        super().__init__()
+    def __init__(self, in_channels, out_channels, expansion_factor=4, layer_idx=0, total_layers=5, pL=0.5):
+        super(InvertedResidualBlock, self).__init__()
+        self.expansion_factor = expansion_factor
         expanded_channels = in_channels * expansion_factor
+        
         self.expand = torch.nn.Sequential(
             torch.nn.Conv1d(in_channels, expanded_channels, kernel_size=1),
             torch.nn.BatchNorm1d(expanded_channels),
-            torch.nn.ReLU(inplace=True),
+            torch.nn.LeakyReLU(),
         )
         self.conv = torch.nn.Sequential(
             DepthwiseSeparableConv1d(expanded_channels, expanded_channels, kernel_size=1),
-            torch.nn.BatchNorm1d(expanded_channels),
-            DepthwiseSeparableConv1d(expanded_channels, expanded_channels, kernel_size=1),  
             torch.nn.BatchNorm1d(expanded_channels),
         )
         self.project = torch.nn.Sequential(
             torch.nn.Conv1d(expanded_channels, out_channels, kernel_size=1),
             torch.nn.BatchNorm1d(out_channels)
         )
+        
         if in_channels != out_channels:
             self.shortcut = torch.nn.Sequential(
                 torch.nn.Conv1d(in_channels, out_channels, kernel_size=1),
@@ -84,215 +91,201 @@ class InvertedResidualBlock(torch.nn.Module):
         else:
             self.shortcut = torch.nn.Sequential()
 
+        self.survival_prob = round(0.1 + (layer_idx / (total_layers-1)) * (0.5 - 0.1), 2)
+
+        self.leaky_relu = torch.nn.LeakyReLU()
+
     def forward(self, x):
         residual = x
+        
         out = x.unsqueeze(0).permute(0, 2, 1)
         out = self.expand(out)
         out = self.conv(out)
         out = self.project(out)
         out = out.permute(0, 2, 1).squeeze(0)
+        
+        out = stochastic_depth(out, p=self.survival_prob, mode="batch", training=self.training)
+        
         residual = self.shortcut(residual)
         out += residual
-        out = F.relu(out, inplace=True)
+        out = self.leaky_relu(out)
         return out
 
-class GlobalSAModule(torch.nn.Module):
-    def __init__(self, NN):
-        super().__init__()
-        self.NN = KAN(NN)
-        self.norm = torch.nn.LayerNorm(NN[-1])
-        self.size = (NN[-1] * 2)
-        self.set2set = Set2Set(NN[-1], processing_steps=8)
-        
-    def forward(self, x, pos, batch, reflectance):
-        x = self.NN(x)
-        x = self.norm(x)
-        x = self.set2set(x, batch)
-        pos = pos.new_zeros((self.size, 3))
-        batch = torch.arange(self.size, device=batch.device)
-        reflectance = reflectance.new_zeros(self.size)
-        return x, pos, batch, reflectance
-
-    def __repr__(self) -> str:
-        return f'{self.__class__.__name__}(in_channels={self.set2set.in_channels}, processing_steps=32)'
-
-class FPModule(torch.nn.Module):
-    def __init__(self, k, NN):
-        super().__init__()
-        self.k = k
-        self.NN = KAN(NN)
-
-    def forward(self, x, pos, batch, x_skip, pos_skip, batch_skip):
-        x = knn_interpolate(x, pos, pos_skip, batch, batch_skip, k=self.k)
-        if x_skip is not None:
-            x = torch.cat([x, x_skip], dim=1)
-        identity = x
-        x = self.NN(x)
-        if x.shape == identity.shape:  # Add residual if shapes match
-            x = x + identity
-        return x, pos_skip, batch_skip
-
-def apply_spatial_dropout(tensor, dropout_layer):
-    if tensor.size(0) <= 4: 
-        return tensor
-    coord_channels = tensor[:4]
-    feature_channels = tensor[4:].unsqueeze(0).permute(0, 2, 1)
-    feature_channels = dropout_layer(feature_channels).permute(0, 2, 1).squeeze(0)
-    return torch.cat((coord_channels, feature_channels), dim=0)
-    
 class SAModule(torch.nn.Module):
-    def __init__(self, resolution, k, NN, RNN, num_epochs):
-        super().__init__()
-        self.resolution = resolution 
+    def __init__(self, resolution, k, NN, num_blocks=1, start_layer_idx=0, total_layers=5, num_kernel_points=16):
+        super(SAModule, self).__init__()
+        self.resolution = resolution
         self.k = k
-        self.base_ratio = 0.2 
-        self.ratio_range = 0.05 
-        
-        in_channels = max(1, NN[0] - 4) 
-        
-        self.reflectance_gate = BinaryReflectanceGate(hidden_dim=NN[0])
-        
-        self.conv = AttentivePointNetConv(
-            local_nn=KAN(NN), 
-            attn_dim=in_channels//2, 
-            in_channels=in_channels,
-            global_nn=None, 
+
+        self.conv = AnisotropicConv(
+            local_nn=MLP(NN),
+            global_nn=None,
             add_self_loops=False,
-            attention_type='softmax'
+            num_kernel_points=num_kernel_points
         )
-        self.residual_block = InvertedResidualBlock(RNN, RNN)
-        self.num_epochs = num_epochs
-    
+        
+        self.residual_blocks = nn.ModuleList([
+            InvertedResidualBlock(
+                NN[-1], 
+                NN[-1],
+                layer_idx=start_layer_idx + i,
+                total_layers=total_layers
+            ) 
+            for i in range(num_blocks)
+        ])
+
+        self.se = SqueezeExcite(NN[-1], reduction=4)
+
+        
     def voxelsample(self, pos, batch, resolution):
         voxel_indices = voxel_grid(pos, resolution, batch)
         _, idx = consecutive_cluster(voxel_indices)
         return idx
     
-    def random_sample(self, pos, batch, ratio):
+    def forward(self, x, pos, batch, reflectance, sf):
+        pos = torch.cat([pos[:, :3], reflectance.unsqueeze(-1)], dim=-1)
 
-        rand_ratio = ratio + (torch.rand(1).item() * 2 - 1) * self.ratio_range 
-        rand_ratio = max(0.15, min(0.25, rand_ratio)) 
-        
-        device = pos.device
-        batch_size = batch.max() + 1
-        ones = torch.ones_like(batch)
-        counts = scatter_add(ones, batch, dim=0, dim_size=batch_size)        
-        samples_per_batch = (counts * rand_ratio).long() 
-        rand = torch.rand(batch.size(0), device=device)
-        rand = rand + batch.float()        
-        sorted_indices = rand.argsort()        
-        batch_positions = torch.arange(len(batch), device=device) - torch.zeros_like(batch).scatter_add(0, batch, ones).cumsum(0)[batch] + ones.scatter_add(0, batch, ones)[batch]        
-        keep_mask = batch_positions <= samples_per_batch[batch]
-        return sorted_indices[keep_mask]
-
-    def forward(self, x, pos, batch, reflectance):
-        if reflectance is not None and torch.abs(reflectance).mean() > 1e-6:
-            reflectance = self.reflectance_gate(pos, reflectance, batch)
-
-        if pos.size(1) == 3:  
-            pos_with_refl = torch.cat([pos, reflectance.unsqueeze(-1)], dim=-1)
-        else:
-            pos_with_refl = pos  
-
-        # if self.training: 
-        #     idx = self.random_sample(pos[:, :3], batch, self.base_ratio)
-        # else:
-        #     idx = self.voxelsample(pos[:, :3], batch, self.resolution)
-        
         idx = self.voxelsample(pos[:, :3], batch, self.resolution)
 
-        row, col = knn(x=pos[:, :3], y=pos[idx, :3], k=self.k, batch_x=batch, batch_y=batch[idx])
-        
+        row, col = knn(pos[:, :3], pos[idx, :3], k=self.k, batch_x=batch, batch_y=batch[idx])
         edge_index = torch.stack([col, row], dim=0)
+
+        pos[:, :3] = pos[:, :3] / sf[batch].unsqueeze(-1)
+        x = self.conv(x, (pos, pos[idx]), edge_index)
+        pos[:, :3] = pos[:, :3] * sf[batch].unsqueeze(-1)
         
-        if x is not None:
-            x = self.conv((x, x[idx]), (pos_with_refl, pos_with_refl[idx]), edge_index)
-        else:
-            x = self.conv((x, x), (pos_with_refl, pos_with_refl[idx]), edge_index)
-        
-        x = self.residual_block(x)
+        for block in self.residual_blocks:
+            x = block(x)
+
+        x = self.se(x, batch[idx])
         
         pos, batch, reflectance = pos[idx, :3], batch[idx], reflectance[idx]
-        return x, pos, batch, reflectance
+        return x, pos, batch, reflectance, sf
 
-class BinaryReflectanceGate(torch.nn.Module):
-    def __init__(self, hidden_dim=16, temperature=1.0):
+class FPModule(torch.nn.Module):
+    def __init__(self, k, NN):
+        super(FPModule, self).__init__()
+        self.k = k
+        self.NN = MLP(NN)
+
+    def forward(self, x, pos, batch, x_skip, pos_skip, batch_skip):
+        x = knn_interpolate(x, pos, pos_skip, batch, batch_skip, k=self.k)
+        if x_skip is not None:
+            x = torch.cat([x, x_skip], dim=1)
+        x = self.NN(x)
+        return x, pos_skip, batch_skip
+
+def MLP(channels):
+    return Seq(*[
+        Seq(*( [Lin(channels[i - 1], channels[i]), torch.nn.LeakyReLU()] + ([BN(channels[i])] if i != 1 else []) ))
+        for i in range(1, len(channels))
+    ])
+
+class STEM(torch.nn.Module):
+    def __init__(self, k, NN):
         super().__init__()
-        self.hidden_dim, self.temperature = hidden_dim, temperature
-        self.point_nn = torch.nn.Sequential(torch.nn.Linear(4, hidden_dim), torch.nn.ReLU(), torch.nn.Linear(hidden_dim, hidden_dim), torch.nn.ReLU())
-        self.gate_nn = torch.nn.Linear(hidden_dim, 2)
-        self.gate_nn.bias.data = torch.tensor([0.0, 2.0])
+        self.k = k
+        self.conv = PointNetConv(
+            local_nn=MLP(NN), 
+            global_nn=None, 
+            add_self_loops=False,
+            radius = None, 
+        )
+        
+    def forward(self, x, pos, batch, reflectance, sf):
+        pos = torch.cat([pos[:, :3], reflectance.unsqueeze(-1)], dim=-1)
+        row, col = radius(pos[:, :3], pos[:, :3], 0.02 * 2.1, batch, batch, max_num_neighbors=self.k)
+        edge_index = torch.stack([col, row], dim=0) 
+        pos[:, :3] = pos[:, :3] / sf[batch].unsqueeze(-1)
+        x = self.conv(x, (pos, pos), edge_index)
+        pos[:, :3] = pos[:, :3] * sf[batch].unsqueeze(-1)
+        return x, pos[:, :3], batch, reflectance, sf
 
-    def gumbel_softmax(self, logits, tau=1.0, hard=True):
-        gumbels = -torch.empty_like(logits).exponential_().log()
-        y_soft = F.softmax((logits + gumbels) / tau, dim=-1)
-        if hard:
-            index = y_soft.argmax(dim=-1, keepdim=True)
-            y_hard = torch.zeros_like(logits).scatter_(-1, index, 1.0)
-            return (y_hard - y_soft).detach() + y_soft
-        return y_soft
-
-    def forward(self, pos, reflectance, batch):
-        features = torch.cat([pos, reflectance.unsqueeze(-1)], dim=-1)
-        point_features = self.point_nn(features)
-        sample_features = global_max_pool(point_features, batch)
-        gate_logits = self.gate_nn(sample_features)
-        gate_decision = self.gumbel_softmax(gate_logits, tau=self.temperature, hard=False)
-        use_reflectance = gate_decision[:, 1][batch].unsqueeze(-1)
-        return (use_reflectance * reflectance.unsqueeze(-1)).squeeze(-1)
-
-    def update_temperature(self, epoch, max_epochs):
-        self.temperature = max(1.0 * (1 - epoch / (2 * max_epochs)), 0.1)
-
+    
 class Net(torch.nn.Module):
-    def __init__(self, num_classes, C=16, num_epochs=None):
-        super().__init__()
-        self.num_epochs = num_epochs
-        self.C = C
+    def __init__(self, num_classes, C=32, num_kernel_points=16):
+        super(Net, self).__init__()
 
-        self.sa1_module = SAModule(0.04, 32, [4, C * 4], C * 4, num_epochs)
-        self.sa2_module = SAModule(0.08, 32, [C * 4 + 4, C * 8], C * 8, num_epochs)
-        self.sa3_module = SAModule(0.16, 32, [C * 8 + 4, C * 8], C * 8, num_epochs)
-        self.sa4_module = GlobalSAModule([C * 8, C * 8])
+        vx_1 = 0.02 * 1.618 # 0.03236
+        vx_2 = vx_1 * 1.618 # 0.05242
+        vx_3 = vx_2 * 1.618 # 0.08466
+        vx_4 = vx_3 * 1.618 # 0.13684
 
-        self.fp4_module = FPModule(1, [C * 24, C * 8])
-        self.fp3_module = FPModule(2, [C * 16, C * 8])
-        self.fp2_module = FPModule(2, [C * 12, C * 8])
-        self.fp1_module = FPModule(2, [C * 8, C * 8])
+        sqrt2 = 1.414
+        def round_to_power_of_2(x):
+            return 2 ** round(math.log2(x))
 
-        self.feature_reducer = KAN([C * 8, C * 8, C])
-        self.conv1 = torch.nn.Conv1d(C * 8, C * 8, 1)
-        self.norm = torch.nn.BatchNorm1d(C * 8)
-        self.conv2 = torch.nn.Conv1d(C * 8, num_classes, 1)
+        C0h = int(C * sqrt2)                  
+        C0 = round_to_power_of_2(C0h * sqrt2)
+
+        C1h = int(C0 * sqrt2)                
+        C1 = round_to_power_of_2(C1h * sqrt2) 
+
+        C2h = int(C1 * sqrt2)                
+        C2 = round_to_power_of_2(C2h * sqrt2)
+
+        C3h = int(C2 * sqrt2)              
+        C3 = round_to_power_of_2(C3h * sqrt2) 
+        C4h = int(C3 * sqrt2)                
+
+        C4 = round_to_power_of_2(C4h * sqrt2)
+        
+        total_blocks = 12        
+        current_layer_idx = 0
+
+        self.stem = STEM(8, [4, C0h, C0])
+
+        self.sa1_module = SAModule(vx_1, 16, [(C0 + 5) * num_kernel_points, C1h, C1], num_blocks=3, 
+                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points)
+        current_layer_idx += 3 
+        
+        self.sa2_module = SAModule(vx_2, 16, [(C1 + 5) * num_kernel_points, C2h, C2], num_blocks=6, 
+                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points)
+        current_layer_idx += 6  
+        
+        self.sa3_module = SAModule(vx_3, 16, [(C2 + 5) * num_kernel_points, C3h, C3], num_blocks=2, 
+                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points)
+        current_layer_idx += 2  
+        
+        self.sa4_module = SAModule(vx_4, 16, [(C3 + 5) * num_kernel_points, C4h, C4], num_blocks=1, 
+                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points)
+        
+        self.fp4_module = FPModule(1, [C4 + C3, C4, C4])
+        self.fp3_module = FPModule(1, [C4 + C2, C4, C4])
+        self.fp2_module = FPModule(1, [C4 + C1, C4, C4])
+        self.fp1_module = FPModule(1, [C4 + C0, C4, C4])
+
+        self.conv1 = torch.nn.Conv1d(C4, C4, 1)
+        self.feat_head = torch.nn.Conv1d(C4, 32, 1)
+        self.conv2 = torch.nn.Conv1d(C4, num_classes, 1)
+        self.norm = torch.nn.BatchNorm1d(C4)
 
         initialize_weights(self)
 
-    def forward(self, data):
-        sa0_out = (data.x, data.pos, data.batch, data.reflectance)
+    def forward(self, data, return_feats: bool = False):
         
+        sa0_out = (data.x, data.pos, data.batch, data.reflectance, data.sf)
+
+        sa0_out = self.stem(*sa0_out)
+
         sa1_out = self.sa1_module(*sa0_out)
         sa2_out = self.sa2_module(*sa1_out)
         sa3_out = self.sa3_module(*sa2_out)
         sa4_out = self.sa4_module(*sa3_out)
 
-        fp4_out = self.fp4_module(sa4_out[0], sa4_out[1], sa4_out[2], 
-                                sa3_out[0], sa3_out[1], sa3_out[2])
-        fp3_out = self.fp3_module(fp4_out[0], fp4_out[1], fp4_out[2],
-                                sa2_out[0], sa2_out[1], sa2_out[2])
-        fp2_out = self.fp2_module(fp3_out[0], fp3_out[1], fp3_out[2], 
-                                sa1_out[0], sa1_out[1], sa1_out[2])
-        fp1_out, _, _ = self.fp1_module(fp2_out[0], fp2_out[1], fp2_out[2],
-                                      sa0_out[0], sa0_out[1], sa0_out[2])
+        fp4_out = self.fp4_module(*sa4_out[:-2], *sa3_out[:-2])
+        fp3_out = self.fp3_module(*fp4_out, *sa2_out[:-2])
+        fp2_out = self.fp2_module(*fp3_out, *sa1_out[:-2])
+        x, _, _ = self.fp1_module(*fp2_out, *sa0_out[:-2])
 
-        with torch.no_grad():
-            compressed = self.feature_reducer(fp1_out)
+        x = self.conv1(x.unsqueeze(dim=0).permute(0, 2, 1))
+        x = F.leaky_relu(self.norm(x))                       
 
-        output = self.conv1(fp1_out.unsqueeze(dim=0).permute(0, 2, 1))
-        output = F.relu(self.norm(output))
-        output = torch.squeeze(self.conv2(output)).to(torch.float)
+        feat32 = torch.squeeze(self.feat_head(x)).to(torch.float)  
+        logits = torch.squeeze(self.conv2(x)).to(torch.float)     
 
-        return output
+        if return_feats:
+            return logits, feat32
+        return logits
 
-    def train(self, mode=True):
-        return super().train(mode)
-        
+

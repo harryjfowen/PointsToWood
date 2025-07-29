@@ -1,4 +1,22 @@
 import torch
+from pykdtree.kdtree import KDTree
+
+
+def sor_filter(pos, reflectance, label, k=16, std_threshold=None):
+    if std_threshold is None:
+        std_threshold = torch.rand(1, device=pos.device) * 2.0 + 1.0
+    tree = KDTree(pos.cpu().numpy())  
+    distances, _ = tree.query(pos.cpu().numpy(), k=k)
+    distances = torch.from_numpy(distances).to(pos.device)  
+    mean_distances = torch.mean(distances, dim=1)
+    mean = torch.mean(mean_distances)
+    std = torch.std(mean_distances)
+    threshold = mean + std_threshold * std
+    mask = mean_distances < threshold
+    pos_filtered = pos[mask]
+    reflectance_filtered = reflectance[mask] if reflectance is not None else None
+    label_filtered = label[mask] if label is not None else None
+    return pos_filtered, reflectance_filtered, label_filtered
 
 def rotate_3d(points):
     rotations = torch.deg2rad(torch.rand(3) * 180 - 90)
@@ -13,77 +31,89 @@ def random_scale_change(points, min_multiplier, max_multiplier):
     scale_factor = torch.FloatTensor(1).uniform_(min_multiplier, max_multiplier).to(points.device)
     return points * scale_factor
 
-def perturb_leaf_reflectance(feature, label):
-    feature_new = feature.clone()    
-    leaf_mask = (label == 0)
-    if leaf_mask.sum() > 0:
-        feature_new[leaf_mask] = torch.rand(leaf_mask.sum()) * 0.3 + 0.7
-    return feature_new
+def jitter_points(points, std):
+    noise = torch.normal(mean=0.0, std=std, size=points.size())
+    points = points + noise
+    return points
 
-def perturb_wood_reflectance(feature, label):
-    feature_new = feature.clone()    
-    wood_mask = (label == 1)
-    if wood_mask.sum() > 0:
-        wood_noise = torch.randn_like(feature[wood_mask]) * 0.1
-        feature_new[wood_mask] += wood_noise
-    feature_new = torch.clamp(feature_new, min=-1.0, max=1.0)
-    return feature_new
+def random_flip(points):
+    if torch.rand(1) < 0.5:
+        points = points.clone()
+        points[:, 0] = -points[:, 0]
+    return points
 
-def selective_downsample(points, reflectance, label, min_points=4096):
-    keep_mask = torch.ones(points.shape[0], dtype=torch.bool, device=points.device)
+def perturb_reflectance(feature):
+    noise = torch.normal(mean=0.0, std=0.01, size=feature.size())
+    feature = feature + noise
+    return feature
     
-    leaf_mask = (label == 0)
-    if leaf_mask.sum() > min_points:
-        leaf_indices = torch.nonzero(leaf_mask).squeeze(1)
-        leaf_keep_ratio = torch.FloatTensor(1).uniform_(0.3, 0.7).item()
-        num_leaf_keep = max(int(leaf_indices.size(0) * leaf_keep_ratio), min_points)
-        
-        perm = torch.randperm(leaf_indices.size(0))
-        leaf_drop_indices = leaf_indices[perm[num_leaf_keep:]]
-        if len(leaf_drop_indices) > 0:
-            keep_mask[leaf_drop_indices] = False
+def match_leaf_to_wood_reflectance(reflectance, label):
+    wood_mask = label == 1
+    leaf_mask = label == 0
     
-    wood_mask = (label == 1)
-    if wood_mask.sum() > min_points:
-        wood_indices = torch.nonzero(wood_mask).squeeze(1)
-        wood_drop_ratio = torch.FloatTensor(1).uniform_(0.0, 0.10).item()
-        num_wood_drop = int(wood_indices.size(0) * wood_drop_ratio)
+    if wood_mask.sum() > 10 and leaf_mask.sum() > 10: 
+        wood_mean = reflectance[wood_mask].mean()
+        wood_std = reflectance[wood_mask].std()
         
-        if num_wood_drop > 0:
-            perm = torch.randperm(wood_indices.size(0))
-            wood_drop_indices = wood_indices[perm[:num_wood_drop]]
-            keep_mask[wood_drop_indices] = False
+        leaf_noise = torch.randn_like(reflectance[leaf_mask]) * wood_std
+        leaf_reflectance = leaf_noise + wood_mean
+        
+        reflectance = reflectance.clone()
+        reflectance[leaf_mask] = leaf_reflectance
+            
+    return reflectance
+
+def random_point_dropout(pos, reflectance=None, label=None, drop_ratio: float = 0.10):
     
-    return points[keep_mask], reflectance[keep_mask], label[keep_mask]
+    if drop_ratio <= 0.0:
+        return pos, reflectance, label
 
-def augmentations(pos, reflectance, label, mode='train'):
-    if mode == 'train':
-
-        rand_val_pos = torch.rand(1)
-
-        if rand_val_pos < 0.25:
-            pos = rotate_3d(pos)
-        
-        if rand_val_pos >= 0.25 and rand_val_pos < 0.50:
-            pos, reflectance, label = selective_downsample(pos, reflectance, label)
-            
-        if rand_val_pos >= 0.50 and rand_val_pos < 0.75:
-            pos = random_scale_change(pos, 0.8, 2.0)
-            
-        rand_val_refl = torch.rand(1)
-
-        if rand_val_refl < 0.125:
-            reflectance = perturb_leaf_reflectance(reflectance, label)
-        
-        if rand_val_refl >= 0.125 and rand_val_refl < 0.25:
-            reflectance = perturb_wood_reflectance(reflectance, label)
-
-        if rand_val_refl >= 0.25 and rand_val_refl < 0.50:
-            reflectance = torch.zeros_like(reflectance)
-        
-        assert not torch.isnan(pos).any(), "NaN detected in positions"
-        assert not torch.isnan(reflectance).any(), "NaN detected in reflectance"
-        assert not torch.isnan(label).any(), "NaN detected in labels"
-            
+    keep_mask = torch.rand(len(pos), device=pos.device) > drop_ratio
+    pos = pos[keep_mask]
+    reflectance = reflectance[keep_mask] if reflectance is not None else None
+    label = label[keep_mask] if label is not None else None
     return pos, reflectance, label
 
+def augmentations(pos, reflectance, label, mode: str = "train"):
+    """Apply geometry and reflectance augmentations.
+
+    Geometry augs and reflectance augs are *independent*; one of each can
+    fire in the same call.
+    """
+
+    # ---------------- Geometry branch ----------------
+    if mode == "train":
+        p_geom = torch.rand(1)
+
+        if p_geom < 0.20:
+            pos = rotate_3d(pos)
+
+        elif p_geom > 0.20 and p_geom < 0.40:
+            pos = random_scale_change(pos, 0.95, 1.05)
+
+        elif p_geom > 0.40 and p_geom < 0.60:
+            if len(pos) > 4096:
+                pos, reflectance, label = sor_filter(pos, reflectance, label)
+
+        elif p_geom > 0.60 and p_geom < 0.80:
+            pos = jitter_points(pos, 0.005)
+
+        elif p_geom > 0.90:
+            pos = random_flip(pos)
+
+    # ---------------- Reflectance branch ----------------
+    p_refl = torch.rand(1)
+
+    if mode == "train":
+        if p_refl < 0.20:
+            reflectance = torch.zeros_like(reflectance)
+
+        elif p_refl > 0.20 and p_refl < 0.30:
+            reflectance = perturb_reflectance(reflectance)
+
+    elif mode == "test":
+
+        if p_refl < 0.20:
+            reflectance = torch.zeros_like(reflectance)
+
+    return pos, reflectance, label

@@ -10,7 +10,7 @@ import os
 import scicomap as sc
 
 def load_ply(filepath):
-    """Load PLY file with xyz coordinates, label, pwood, and reflectance columns using plyfile"""
+    """Load PLY file with xyz coordinates, pred, pwood, and reflectance columns using plyfile"""
     print(f"Loading PLY file: {filepath}")
     try:
         plydata = PlyData.read(filepath)
@@ -32,13 +32,13 @@ def load_ply(filepath):
             standard_name = prop.lower().replace('scalar_', '')
             property_map[standard_name] = prop
         
-        # Handle label property
-        if 'label' in property_map:
-            labels = vertex[property_map['label']]
-            print(f"Found label property as '{property_map['label']}'")
+        # Handle pred property
+        if 'pred' in property_map:
+            preds = vertex[property_map['pred']]
+            print(f"Found pred property as '{property_map['pred']}'")
         else:
-            print("Warning: No label property found, using default value 0")
-            labels = np.zeros(len(x))
+            print("Warning: No pred property found, using default value 0")
+            preds = np.zeros(len(x))
             
         # Handle pwood property
         if 'pwood' in property_map:
@@ -53,7 +53,7 @@ def load_ply(filepath):
             'x': x, 
             'y': y, 
             'z': z, 
-            'label': labels, 
+            'pred': preds, 
             'pwood': pwood
         })
         
@@ -81,7 +81,7 @@ def load_ply(filepath):
             # Look for any other scalar properties that might be useful
             for prop in properties:
                 standard_name = prop.lower().replace('scalar_', '')
-                if standard_name not in ['x', 'y', 'z', 'label', 'pwood']:
+                if standard_name not in ['x', 'y', 'z', 'pred', 'pwood']:
                     try:
                         df['reflectance'] = vertex[prop]
                         print(f"Using '{prop}' as reflectance substitute")
@@ -106,9 +106,9 @@ def load_ply(filepath):
         print(f"Data columns: {df.columns.tolist()}")
         print(f"Sample data:\n{df.head()}")
         
-        # Print label distribution
-        label_counts = df['label'].value_counts()
-        print(f"Label distribution:\n{label_counts}")
+        # Print pred distribution
+        pred_counts = df['pred'].value_counts()
+        print(f"pred distribution:\n{pred_counts}")
         
         # Print reflectance statistics
         print(f"Reflectance statistics: min={df['reflectance'].min()}, max={df['reflectance'].max()}, mean={df['reflectance'].mean():.4f}")
@@ -136,9 +136,9 @@ def apply_smoothing(image, smoothing_level=1):
     
     return pil_img
 
-def render_textured_xray_view(df, output_path, width=6000, height=6000, smoothing_level=1):
+def render_predictions_xray_view(df, output_path, width=6000, height=6000, smoothing_level=1):
     """Render tree with X-ray effect and red wood based on pwood"""
-    print("Creating smoothed textured X-ray visualization...")
+    print("Creating smoothed predictions X-ray visualization...")
     
     # Calculate data ranges to determine aspect ratio
     x_range = (df['x'].min(), df['x'].max())
@@ -149,9 +149,17 @@ def render_textured_xray_view(df, output_path, width=6000, height=6000, smoothin
     y_span = y_range[1] - y_range[0]
     z_span = z_range[1] - z_range[0]
     
+    # Determine which side view is more informative
+    xz_area = x_span * z_span
+    yz_area = y_span * z_span
+    use_xz = xz_area >= yz_area
+    
+    print(f"Side view extents: XZ area = {xz_area:.2f}, YZ area = {yz_area:.2f}")
+    print(f"Using {'XZ' if use_xz else 'YZ'} projection for side view")
+    
     # Create separate dataframes for wood and leaves
-    wood_df = df[df['label'] == 1].copy()
-    leaf_df = df[df['label'] == 0].copy()
+    wood_df = df[df['pred'] == 1].copy()
+    leaf_df = df[df['pred'] == 0].copy()
     
     print(f"Wood points: {len(wood_df)}, Leaf points: {len(leaf_df)}")
     
@@ -167,11 +175,11 @@ def render_textured_xray_view(df, output_path, width=6000, height=6000, smoothin
         # Create synthetic values if pwood doesn't exist
         wood_df['pwood_norm'] = np.random.random(len(wood_df))
     
-    # Side view (XZ)
-    print("\nCreating textured side view (XZ)...")
+    # Side view (XZ or YZ)
+    print("\nCreating predictions side view...")
     
-    # Create canvas with proper aspect ratio for XZ view
-    aspect_ratio = x_span / z_span
+    # Create canvas with proper aspect ratio for side view
+    aspect_ratio = (x_span if use_xz else y_span) / z_span
     
     # Adjust canvas dimensions to maintain aspect ratio
     if aspect_ratio > 1:
@@ -192,22 +200,19 @@ def render_textured_xray_view(df, output_path, width=6000, height=6000, smoothin
     # Create canvas with proper dimensions
     canvas = ds.Canvas(plot_width=canvas_width, plot_height=canvas_height)
     
-    # Render leaves with solid black color
-    print("Rendering leaves with solid black color...")
+    # Render leaves with density-based alpha transparency
+    print("Rendering leaves with density-based alpha (more transparent in dense areas)...")
     if len(leaf_df) > 0:
         # Aggregate density for leaf presence
         leaf_agg = canvas.points(
             leaf_df, 
-            'x',  # x-axis 
+            'x' if use_xz else 'y',  # x-axis or y-axis depending on chosen view
             'z',  # z-axis (height)
             ds.count()  # Just count points to determine presence
         )
         
-        # Create a solid black colormap with fixed opacity
-        black_cmap = LinearSegmentedColormap.from_list('black', [(0, 0, 0, 0.7), (0, 0, 0, 0.7)])
-        
-        # Apply the colormap
-        leaf_img = tf.shade(leaf_agg, cmap=black_cmap, how='linear')
+        # Use density-based alpha: high density -> more transparent, low density -> more opaque
+        leaf_img = tf.shade(leaf_agg, cmap='black', how='linear', alpha=200, min_alpha=40)
         
         # Apply a larger spread to fill gaps between points
         leaf_img = tf.spread(leaf_img, px=3)
@@ -224,7 +229,7 @@ def render_textured_xray_view(df, output_path, width=6000, height=6000, smoothin
         # Use pwood_norm for coloring
         wood_agg = canvas.points(
             wood_df, 
-            'x',  # x-axis
+            'x' if use_xz else 'y',  # x-axis or y-axis depending on chosen view
             'z',  # z-axis (height)
             ds.mean('pwood_norm')  # Use normalized pwood for coloring
         )
@@ -260,7 +265,7 @@ def render_textured_xray_view(df, output_path, width=6000, height=6000, smoothin
         wood_pil = None
     
     # Composite images for side view
-    print("Compositing textured side view...")
+    print("Compositing predictions side view...")
     
     # Create a white background image
     background = Image.new('RGBA', (canvas_width, canvas_height), color='white')
@@ -287,13 +292,13 @@ def render_textured_xray_view(df, output_path, width=6000, height=6000, smoothin
         # Resize with high quality
         side_view = side_view.resize((new_width, new_height), Image.LANCZOS)
     
-    # Save the side view
+    # Save the most informative side view
     side_view_path = output_path.replace('.png', '_side.png')
     side_view.save(side_view_path, quality=100)  # Maximum quality for PNG
-    print(f"Saved textured side view to {side_view_path}")
+    print(f"Saved predictions side view to {side_view_path} (using {'XZ' if use_xz else 'YZ'} projection)")
     
     # Bottom view (XY)
-    print("\nCreating textured bottom view (XY)...")
+    print("\nCreating predictions bottom view (XY)...")
     
     # Create canvas with proper aspect ratio for XY view
     aspect_ratio = x_span / y_span
@@ -317,8 +322,8 @@ def render_textured_xray_view(df, output_path, width=6000, height=6000, smoothin
     # Create canvas with proper dimensions for bottom view
     bottom_canvas = ds.Canvas(plot_width=bottom_width, plot_height=bottom_height)
     
-    # Render leaves for bottom view with solid black color
-    print("Rendering leaves for bottom view with solid black color...")
+    # Render leaves for bottom view with density-based alpha transparency
+    print("Rendering leaves for bottom view with density-based alpha...")
     if len(leaf_df) > 0:
         # Aggregate density for leaf presence
         bottom_leaf_agg = bottom_canvas.points(
@@ -328,8 +333,8 @@ def render_textured_xray_view(df, output_path, width=6000, height=6000, smoothin
             ds.count()  # Just count points to determine presence
         )
         
-        # Apply the same black colormap
-        bottom_leaf_img = tf.shade(bottom_leaf_agg, cmap=black_cmap, how='linear')
+        # Use same density-based alpha approach
+        bottom_leaf_img = tf.shade(bottom_leaf_agg, cmap='black', how='linear', alpha=200, min_alpha=40)
         
         # Apply a larger spread to fill gaps between points
         bottom_leaf_img = tf.spread(bottom_leaf_img, px=3)
@@ -370,7 +375,7 @@ def render_textured_xray_view(df, output_path, width=6000, height=6000, smoothin
         bottom_wood_pil = None
     
     # Composite images for bottom view
-    print("Compositing textured bottom view...")
+    print("Compositing predictions bottom view...")
     
     # Create a white background image
     bottom_background = Image.new('RGBA', (bottom_width, bottom_height), color='white')
@@ -400,13 +405,21 @@ def render_textured_xray_view(df, output_path, width=6000, height=6000, smoothin
     # Save the bottom view
     bottom_view_path = output_path.replace('.png', '_bottom.png')
     bottom_view.save(bottom_view_path, quality=100)  # Maximum quality for PNG
-    print(f"Saved textured bottom view to {bottom_view_path}")
+    print(f"Saved predictions bottom view to {bottom_view_path}")
     
     return side_view, bottom_view
 
-def render_vik_xray_view(df, output_path, width=6000, height=6000):
-    """Render tree with X-ray effect and vik colormap for wood based on pwood"""
-    print("Creating vik-colored X-ray views...")
+def render_pwood_view(df, output_path, width=6000, height=6000, colormap='inferno'):
+    """Render tree with X-ray effect and specified colormap for wood based on raw pwood values
+    
+    Args:
+        df: DataFrame containing point cloud data
+        output_path: Path to save the output images
+        width: Width of the output image
+        height: Height of the output image
+        colormap: Name of matplotlib colormap to use for wood points (e.g., 'inferno', 'turbo', 'viridis')
+    """
+    print(f"Creating pwood-colored X-ray views using {colormap} colormap...")
     
     # Calculate data ranges to determine aspect ratio
     x_range = (df['x'].min(), df['x'].max())
@@ -417,53 +430,77 @@ def render_vik_xray_view(df, output_path, width=6000, height=6000):
     y_span = y_range[1] - y_range[0]
     z_span = z_range[1] - z_range[0]
     
+    # Determine which side view is more informative
+    xz_area = x_span * z_span
+    yz_area = y_span * z_span
+    use_xz = xz_area >= yz_area
+    
+    print(f"Side view extents: XZ area = {xz_area:.2f}, YZ area = {yz_area:.2f}")
+    print(f"Using {'XZ' if use_xz else 'YZ'} projection for side view")
+    
     # Create separate dataframes for wood and leaves
-    wood_df = df[df['label'] == 1].copy()
-    leaf_df = df[df['label'] == 0].copy()
+    wood_df = df[df['pred'] == 1].copy()
+    leaf_df = df[df['pred'] == 0].copy()
     
     print(f"Wood points: {len(wood_df)}, Leaf points: {len(leaf_df)}")
     
-    # Side view (XZ)
-    print("\nCreating vik side view (XZ)...")
+    # Normalize pwood values to full 0-1 range for better colormap utilization
+    if len(wood_df) > 0 and 'pwood' in wood_df.columns:
+        pwood_min = wood_df['pwood'].min()
+        pwood_max = wood_df['pwood'].max()
+        pwood_range = pwood_max - pwood_min
+        
+        print(f"Original pwood range: {pwood_min:.3f} to {pwood_max:.3f} (span: {pwood_range:.3f})")
+        
+        if pwood_range > 0:
+            # Normalize to 0-1 range
+            wood_df['pwood_normalized'] = (wood_df['pwood'] - pwood_min) / pwood_range
+            print(f"Normalized pwood to 0-1 range for full colormap utilization")
+        else:
+            # All values are the same
+            wood_df['pwood_normalized'] = np.ones(len(wood_df)) * 0.5
+            print(f"All pwood values are identical ({pwood_min:.3f}), using 0.5 for visualization")
+    else:
+        # Fallback if no pwood data
+        wood_df['pwood_normalized'] = np.ones(len(wood_df)) * 0.5 if len(wood_df) > 0 else []
+        print("No pwood data found, using 0.5 for visualization")
     
-    # Create canvas with proper aspect ratio for XZ view
-    aspect_ratio = x_span / z_span
+    # Side view setup
+    print("\nCreating pwood side view...")
+    
+    # Create canvas with proper aspect ratio for side view
+    aspect_ratio = (x_span if use_xz else y_span) / z_span
     
     # Adjust canvas dimensions to maintain aspect ratio
     if aspect_ratio > 1:
-        # Wider than tall
         canvas_width = width
         canvas_height = int(width / aspect_ratio)
     else:
-        # Taller than wide
         canvas_height = height
         canvas_width = int(height * aspect_ratio)
     
-    # Increase resolution for better detail and smoother rendering
+    # Increase resolution for better detail
     canvas_width = int(canvas_width * 1.5)
     canvas_height = int(canvas_height * 1.5)
     
     print(f"Canvas dimensions: {canvas_width}x{canvas_height}")
     
-    # Create canvas with proper dimensions
+    # Create canvas
     canvas = ds.Canvas(plot_width=canvas_width, plot_height=canvas_height)
     
-    # Render leaves with solid black color
-    print("Rendering leaves with solid black color...")
+    # Render leaves with density-based alpha transparency
+    print("Rendering leaves with density-based alpha (more transparent in dense areas)...")
     if len(leaf_df) > 0:
         # Aggregate density for leaf presence
         leaf_agg = canvas.points(
             leaf_df, 
-            'x',  # x-axis 
-            'z',  # z-axis (height)
-            ds.count()  # Just count points to determine presence
+            'x' if use_xz else 'y',
+            'z',
+            ds.count()
         )
         
-        # Create a solid black colormap with fixed opacity
-        black_cmap = LinearSegmentedColormap.from_list('black', [(0, 0, 0, 0.7), (0, 0, 0, 0.7)])
-        
-        # Apply the colormap
-        leaf_img = tf.shade(leaf_agg, cmap=black_cmap, how='linear')
+        # Use density-based alpha: high density -> more transparent, low density -> more opaque
+        leaf_img = tf.shade(leaf_agg, cmap='black', how='linear', alpha=200, min_alpha=40)
         
         # Apply a larger spread to fill gaps between points
         leaf_img = tf.spread(leaf_img, px=3)
@@ -473,200 +510,125 @@ def render_vik_xray_view(df, output_path, width=6000, height=6000):
     else:
         print("No leaf points found")
         leaf_pil = None
-    
-    # Render wood with vik colormap based on pwood
-    print("Rendering wood with vik colormap based on pwood...")
+
+    # Render wood with specified colormap (unchanged)
+    print(f"Rendering wood with {colormap} colormap...")
     if len(wood_df) > 0:
-        # Normalize pwood for coloring
-        if 'pwood' in wood_df.columns:
-            min_val = wood_df['pwood'].min()
-            max_val = wood_df['pwood'].max()
-            if min_val != max_val:
-                wood_df['pwood_norm'] = (wood_df['pwood'] - min_val) / (max_val - min_val)
-            else:
-                wood_df['pwood_norm'] = 0.5 * np.ones(len(wood_df))  # Use middle value if all pwood values are the same
-        else:
-            # Create synthetic values if pwood doesn't exist
-            wood_df['pwood_norm'] = np.random.random(len(wood_df))
-        
-        # Use pwood_norm for coloring
         wood_agg = canvas.points(
             wood_df, 
-            'x',  # x-axis
-            'z',  # z-axis (height)
-            ds.mean('pwood_norm')  # Use normalized pwood for coloring
+            'x' if use_xz else 'y',
+            'z',
+            ds.mean('pwood_normalized')  # Use normalized pwood values
         )
         
-        # Get the vik colormap from scicomap
-        # sc_map = sc.ScicoDiverging(cmap='pride')
-        # vik_cmap = sc_map.get_mpl_color_map()
-
-        sc_map = sc.ScicoMiscellaneous(cmap='rainbow-kov')
-        vik_cmap = sc_map.get_mpl_color_map()
+        # Use specified matplotlib colormap
+        from matplotlib import colormaps
+        cmap = colormaps[colormap]
+        wood_cmap = LinearSegmentedColormap.from_list(colormap, cmap(np.linspace(0, 1, 256)))
         
-        # Make sure the colormap has full opacity
-        vik_cmap._rgba_bad = (0, 0, 0, 0)  # Transparent for NaN values
-        
-        # Apply the colormap
-        wood_img = tf.shade(wood_agg, cmap=vik_cmap, how='linear')
-        
-        # Apply a larger spread to fill gaps between points
+        # Use explicit span to force full colormap range utilization
+        wood_img = tf.shade(wood_agg, cmap=wood_cmap, how='linear', span=(0, 1))
         wood_img = tf.spread(wood_img, px=3)
-        
-        # Convert to PIL image
         wood_pil = tf.Image(wood_img).to_pil()
         
-        # Apply a slight blur to smooth out the image
+        # Apply slight blur and sharpen for better visualization
         wood_pil = wood_pil.filter(ImageFilter.GaussianBlur(radius=1))
-        
-        # Then apply sharpening to enhance details while keeping the smoothness
         wood_pil = wood_pil.filter(ImageFilter.SHARPEN)
     else:
         print("No wood points found")
         wood_pil = None
     
-    # Composite images for side view
-    print("Compositing vik side view...")
-    
-    # Create a white background image
+    # Composite side view
+    print("Compositing pwood side view...")
     background = Image.new('RGBA', (canvas_width, canvas_height), color='white')
-    
-    # Composite images - leaves first, then wood on top
     side_view = background
     
     if leaf_pil is not None:
         side_view = Image.alpha_composite(side_view.convert('RGBA'), leaf_pil)
-    
     if wood_pil is not None:
         side_view = Image.alpha_composite(side_view.convert('RGBA'), wood_pil)
     
-    # Resize to original dimensions if needed
+    # Resize if needed
     if canvas_width > width or canvas_height > height:
-        # Calculate new dimensions while preserving aspect ratio
         if canvas_width / canvas_height > width / height:
             new_width = width
             new_height = int(canvas_height * (width / canvas_width))
         else:
             new_height = height
             new_width = int(canvas_width * (height / canvas_height))
-        
-        # Resize with high quality
         side_view = side_view.resize((new_width, new_height), Image.LANCZOS)
     
-    # Save the side view
+    # Save side view
     side_view_path = output_path.replace('.png', '_side.png')
-    side_view.save(side_view_path, quality=100)  # Maximum quality for PNG
-    print(f"Saved vik side view to {side_view_path}")
+    side_view.save(side_view_path, quality=100)
+    print(f"Saved pwood side view to {side_view_path} (using {'XZ' if use_xz else 'YZ'} projection)")
     
     # Bottom view (XY)
-    print("\nCreating vik bottom view (XY)...")
+    print("\nCreating pwood bottom view (XY)...")
     
-    # Create canvas with proper aspect ratio for XY view
+    # Setup bottom view canvas
     aspect_ratio = x_span / y_span
-    
-    # Adjust canvas dimensions to maintain aspect ratio
     if aspect_ratio > 1:
-        # Wider than tall
         bottom_width = width
         bottom_height = int(width / aspect_ratio)
     else:
-        # Taller than wide
         bottom_height = height
         bottom_width = int(height * aspect_ratio)
     
-    # Increase resolution for better detail and smoother rendering
     bottom_width = int(bottom_width * 1.5)
     bottom_height = int(bottom_height * 1.5)
     
     print(f"Bottom view dimensions: {bottom_width}x{bottom_height}")
-    
-    # Create canvas with proper dimensions for bottom view
     bottom_canvas = ds.Canvas(plot_width=bottom_width, plot_height=bottom_height)
     
-    # Render leaves for bottom view with solid black color
-    print("Rendering leaves for bottom view with solid black color...")
+    # Render leaves for bottom view
+    print("Rendering leaves for bottom view...")
     if len(leaf_df) > 0:
-        # Aggregate density for leaf presence
-        bottom_leaf_agg = bottom_canvas.points(
-            leaf_df, 
-            'x',  # x-axis 
-            'y',  # y-axis
-            ds.count()  # Just count points to determine presence
-        )
-        
-        # Apply the same black colormap
-        bottom_leaf_img = tf.shade(bottom_leaf_agg, cmap=black_cmap, how='linear')
-        
-        # Apply a larger spread to fill gaps between points
+        bottom_leaf_agg = bottom_canvas.points(leaf_df, 'x', 'y', ds.count())
+        # Use same corrected alpha approach: high density -> min_alpha (transparent), low density -> alpha (opaque)
+        bottom_leaf_img = tf.shade(bottom_leaf_agg, cmap='black', how='linear', alpha=200, min_alpha=40)
         bottom_leaf_img = tf.spread(bottom_leaf_img, px=3)
-        
-        # Convert to PIL image
         bottom_leaf_pil = tf.Image(bottom_leaf_img).to_pil()
     else:
-        print("No leaf points found")
         bottom_leaf_pil = None
     
-    # Render wood for bottom view with vik colormap
-    print("Rendering wood for bottom view with vik colormap...")
+    # Render wood for bottom view
+    print("Rendering wood for bottom view...")
     if len(wood_df) > 0:
-        # Use pwood_norm for coloring
-        bottom_wood_agg = bottom_canvas.points(
-            wood_df, 
-            'x',  # x-axis
-            'y',  # y-axis
-            ds.mean('pwood_norm')  # Use normalized pwood for coloring
-        )
-        
-        # Apply the same colormap
-        bottom_wood_img = tf.shade(bottom_wood_agg, cmap=vik_cmap, how='linear')
-        
-        # Apply a larger spread to fill gaps between points
+        bottom_wood_agg = bottom_canvas.points(wood_df, 'x', 'y', ds.mean('pwood_normalized'))
+        bottom_wood_img = tf.shade(bottom_wood_agg, cmap=wood_cmap, how='linear', span=(0, 1))
         bottom_wood_img = tf.spread(bottom_wood_img, px=3)
-        
-        # Convert to PIL image
         bottom_wood_pil = tf.Image(bottom_wood_img).to_pil()
-        
-        # Apply a slight blur to smooth out the image
+        # Apply slight blur and sharpen for better visualization
         bottom_wood_pil = bottom_wood_pil.filter(ImageFilter.GaussianBlur(radius=1))
-        
-        # Then apply sharpening to enhance details while keeping the smoothness
         bottom_wood_pil = bottom_wood_pil.filter(ImageFilter.SHARPEN)
     else:
-        print("No wood points found")
         bottom_wood_pil = None
     
-    # Composite images for bottom view
-    print("Compositing vik bottom view...")
-    
-    # Create a white background image
+    # Composite bottom view
+    print("Compositing pwood bottom view...")
     bottom_background = Image.new('RGBA', (bottom_width, bottom_height), color='white')
-    
-    # Composite images - leaves first, then wood on top
     bottom_view = bottom_background
     
     if bottom_leaf_pil is not None:
         bottom_view = Image.alpha_composite(bottom_view.convert('RGBA'), bottom_leaf_pil)
-    
     if bottom_wood_pil is not None:
         bottom_view = Image.alpha_composite(bottom_view.convert('RGBA'), bottom_wood_pil)
     
-    # Resize to original dimensions if needed
+    # Resize if needed
     if bottom_width > width or bottom_height > height:
-        # Calculate new dimensions while preserving aspect ratio
         if bottom_width / bottom_height > width / height:
             new_width = width
             new_height = int(bottom_height * (width / bottom_width))
         else:
             new_height = height
             new_width = int(bottom_width * (height / bottom_height))
-        
-        # Resize with high quality
         bottom_view = bottom_view.resize((new_width, new_height), Image.LANCZOS)
     
-    # Save the bottom view
+    # Save bottom view
     bottom_view_path = output_path.replace('.png', '_bottom.png')
-    bottom_view.save(bottom_view_path, quality=100)  # Maximum quality for PNG
-    print(f"Saved vik bottom view to {bottom_view_path}")
+    bottom_view.save(bottom_view_path, quality=100)
+    print(f"Saved pwood bottom view to {bottom_view_path}")
     
     return side_view, bottom_view
 
@@ -674,9 +636,12 @@ def main():
     # Check if a file path was provided as a command-line argument
     if len(sys.argv) > 1:
         input_file = sys.argv[1]
+        # Check if colormap is provided as second argument
+        colormap = sys.argv[2] if len(sys.argv) > 2 else 'inferno'
     else:
         # Default file path if none provided
         input_file = input("Enter path to PLY file: ")
+        colormap = 'inferno'  # Default colormap
     
     # Load the PLY file
     print(f"\nLoading PLY file: {input_file}")
@@ -686,19 +651,13 @@ def main():
     output_dir = os.path.dirname(input_file) if os.path.dirname(input_file) else os.path.dirname(os.path.abspath(__file__))
     base_name = os.path.splitext(os.path.basename(input_file))[0]
     
-    # Create the red wood visualization with smoothing
-    print(f"\nCreating smoothed textured X-ray visualization (red wood)...")
-    red_output_path = os.path.join(output_dir, f"{base_name}_textured_xray.png")
-    render_textured_xray_view(df, red_output_path, width=6000, height=6000, smoothing_level=1)
+    # Create output paths
+    predictions_output = os.path.join(output_dir, f"{base_name}_predictions.png")
+    pwood_output = os.path.join(output_dir, f"{base_name}_pwood.png")
     
-    # Create the vik wood visualization with smoothing
-    print(f"\nCreating smoothed vik-colored X-ray visualization...")
-    vik_output_path = os.path.join(output_dir, f"{base_name}_vik_xray.png")
-    render_vik_xray_view(df, vik_output_path, width=6000, height=6000)
-    
-    print("\nVisualizations complete!")
-    print(f"1. Smoothed red wood X-ray: {red_output_path}")
-    print(f"2. Smoothed vik wood X-ray: {vik_output_path}")
+    # Render views
+    render_predictions_xray_view(df, predictions_output)
+    render_pwood_view(df, pwood_output, colormap=colormap)
 
 if __name__ == "__main__":
     main()
