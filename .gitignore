@@ -1,5 +1,18 @@
-# Ignore the DS_Store file
+# macOS system files
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 
 # Ignore the archived folder
 /archive/
@@ -13,7 +26,7 @@ pointstowood/instance_all.py
 **/archived/
 **/data/
 
-# Optional: Ignore common Python-related files
+# Python-related files
 *.pyc
 __pycache__/
 *.pyo
@@ -21,6 +34,7 @@ __pycache__/
 .Python
 env/
 venv/
+.venv/
 pip-log.txt
 pip-delete-this-directory.txt
 .tox/
@@ -31,8 +45,53 @@ nosetests.xml
 coverage.xml
 *.cover
 *.log
-.git
 .mypy_cache
 .pytest_cache
-.hypothesispoints2wood/data/
-points2wood/archived/
+.hypothesis
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# PEP 582
+__pypackages__/
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+
+# Temporary files
+*.tmp
+*.temp
