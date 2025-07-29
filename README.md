@@ -71,15 +71,17 @@ cd ~/PointsToWood/pointstowood/
 
 3. Run PointsToWood.
 
-```
+**Aggressive Wood Detection (Recommended):**
+```bash
 python3 predict.py --point-cloud ~/PointsToWood/pointstowood/data/eu_eval/uk01_lw_pl_3.ply --model fbeta-eu.pth --batch-size 4 --any-wood 0.50 --grid-size 2.0 3.0 --resolution 0.02 --min-pts 512 --max-pts 16384
 ```
- <sub> 3.1 Use `--any-wood` parameter to apply a more aggressive wood labeling strategy. With this option, a point is classified as wood if ANY neighboring point within its local neighborhood exceeds the wood probability threshold. This approach increases wood detection sensitivity, capturing more potential wood structures that might otherwise be missed but may increase false positives.
+Use `--any-wood` parameter to apply a more aggressive wood labeling strategy. With this option, a point is classified as wood if ANY neighboring point within its local neighborhood exceeds the wood probability threshold. This approach increases wood detection sensitivity, capturing more potential wood structures that might otherwise be missed but may increase false positives.
 
-```
+**Conservative Wood Detection:**
+```bash
 python3 predict.py --point-cloud ~/PointsToWood/pointstowood/data/eu_eval/uk01_lw_pl_3.ply --model fbeta-eu.pth --batch-size 4 --is-wood 0.5 --grid-size 2.0 3.0 --resolution 0.02 --min-pts 512 --max-pts 16384 --max-probabilities
 ```
- <sub> 3.2 Use `--is-wood` parameter to apply a more conservative wood labeling strategy. With this option, a point is classified as wood if ALL neighboring points within its local neighborhood exceed the wood probability threshold. This approach increases wood detection specificity, reducing false positives but may miss potential wood structures that might otherwise be detected. The `--max-probabilities` flag selects the most confident prediction in each neighborhood.
+Use `--is-wood` parameter to apply a more conservative wood labeling strategy. With this option, a point is classified as wood if ALL neighboring points within its local neighborhood exceed the wood probability threshold. This approach increases wood detection specificity, reducing false positives but may miss potential wood structures that might otherwise be detected. The `--max-probabilities` flag selects the most confident prediction in each neighborhood.
 
 ## Data Requirements
 
