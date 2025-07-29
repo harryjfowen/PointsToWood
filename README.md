@@ -4,8 +4,8 @@
 ![Probability of wood predicted by our model from blue to red (Data from Wang et al., 2021](images/our_tropical.png)
 <sub>Figure is displaying probability of wood predicted by our model from blue (low probability) to red (high probability). (Data sourced from Wang et al., 2021)</sub>
 
-### This model is described in the preprint:
-PointsToWood: A deep learning framework for complete canopy leaf-wood segmentation of TLS data across diverse European forests. Owen, H. J. F.,  Allen, M. J. A., Grieve S.W.D., Wilkes P., Lines, E. R. (preprint, under review)
+### This model is described in the paper:
+PointsToWood: A deep learning framework for complete canopy leaf-wood segmentation of TLS data across diverse European forests. Owen, H. J. F.,  Allen, M. J. A., Grieve S.W.D., Wilkes P., Lines, E. R. (under review)
 
 ## Version Information
 
