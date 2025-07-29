@@ -4,8 +4,28 @@
 ![Probability of wood predicted by our model from blue to red (Data from Wang et al., 2021](images/our_tropical.png)
 <sub>Figure is displaying probability of wood predicted by our model from blue (low probability) to red (high probability). (Data sourced from Wang et al., 2021)</sub>
 
-### This model is fully described in the paper:
-PointsToWood: A deep learning framework for complete canopy leaf-wood segmentation of TLS data across diverse European forests. Owen, H. J. F.,  Allen, M. J. A., Grieve S.W.D., Wilkes P., Lines, E. R. (in review)
+### This model is described in the preprint:
+PointsToWood: A deep learning framework for complete canopy leaf-wood segmentation of TLS data across diverse European forests. Owen, H. J. F.,  Allen, M. J. A., Grieve S.W.D., Wilkes P., Lines, E. R. (preprint, under review)
+
+## Version Information
+
+### Current Version (version2.0) - Advanced Features
+This branch contains the latest version with significant architectural improvements that will be described in the forthcoming paper:
+
+**New Features:**
+- **Directional Anisotropic Convolution** with reflectance-based attention mechanisms
+- **Inverted Residual Blocks** for improved feature extraction and regularization
+- **Squeeze-Excitation (SE) Channel Attention** for adaptive feature recalibration
+- **Adaptive Receptive Field Scaling** with learnable ρ parameters
+- **Cyclical Focal Loss** for better training stability and convergence
+- **Enhanced Data Processing** with denoising and efficient batching
+- **Robust Multimodal Learning** handling both geometric and reflectance data
+
+### arXiv Version (version1.0)
+For the exact implementation described in the arXiv preprint, please switch to the `version1.0` branch:
+```bash
+git checkout version1.0
+```
 
 #
 
