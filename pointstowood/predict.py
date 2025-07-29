@@ -27,8 +27,11 @@ def get_path(location_in_pointstowood: str = "") -> str:
 
 def preprocess_point_cloud_data(df, zero_reflectance=False):
 
+    # Canonical column mapping – keep 'truth' as-is. Only map aliases that
+    # actually refer to *label*; if both 'truth' and 'label' exist we favour
+    # 'truth' and drop the redundant 'label'.
     canon_map = {
-        'label': ['label'],  
+        'label': ['label'],  # do NOT include 'truth' – we want to preserve it
         'reflectance': ['reflectance', 'refl', 'intensity'],
     }
 
@@ -46,11 +49,15 @@ def preprocess_point_cloud_data(df, zero_reflectance=False):
 
     df = df.rename(columns=new_columns)
 
+    # If both 'truth' and 'label' columns are present, keep 'truth' (assumed
+    # authoritative ground-truth) and drop the redundant 'label'.
     if 'truth' in df.columns and 'label' in df.columns:
         df = df.drop(columns=['label'])
 
+    # Remove any duplicated column names that may result from the mapping (keep first occurrence)
     df = df.loc[:, ~df.columns.duplicated()]
 
+    # Drop any prior prediction columns but retain ground-truth 'label' if present
     drop_tokens = ["pred", "pwood"]
     cols_to_drop = [c for c in df.columns if any(tok in c for tok in drop_tokens)]
     if len(cols_to_drop):
@@ -62,6 +69,7 @@ def preprocess_point_cloud_data(df, zero_reflectance=False):
     else:
         print('Reflectance detected')
     
+    # Set reflectance to zeros if requested
     if zero_reflectance:
         df['reflectance'] = np.zeros(len(df))
         print('Reflectance set to zeros as requested.')
@@ -158,6 +166,12 @@ if __name__ == '__main__':
         path = OP.dirname(point_cloud_file)
         file = OP.splitext(OP.basename(point_cloud_file))[0] + "_p2w.ply"
         args.odir = OP.join(path, file)
+
+        # ------------------------------------------------------------------
+        # Ensure we start with a clean slate – if an old output file with the
+        # same *_p2w.ply name exists, remove it so that downstream save_file
+        # writes a fresh file without confusion.
+        # ------------------------------------------------------------------
 
         if os.path.exists(args.odir):
             try:

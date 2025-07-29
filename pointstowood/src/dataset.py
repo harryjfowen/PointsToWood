@@ -150,7 +150,6 @@ class TestingDataset(Dataset, ABC):
         data = Data(pos=pos, reflectance=reflectance, local_shift=local_shift, sf=scaling_factor)
         return data
 
-#Credit to catalyst sampler where we got the code from: https://github.com/catalyst-team/catalyst/blob/master/catalyst/data/sampler.py
 class BalanceClassSampler(Sampler):
     def __init__(self, labels, mode="downsampling"):
         super().__init__(labels)

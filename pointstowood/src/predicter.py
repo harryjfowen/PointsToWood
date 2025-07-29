@@ -120,7 +120,7 @@ def SemanticSegmentation(args):
     '''
     Setup data loader. 
     '''
-    test_loader, _ = create_inference_loader(args, device)
+    test_loader, test_dataset = create_inference_loader(args, device)
 
 
     '''

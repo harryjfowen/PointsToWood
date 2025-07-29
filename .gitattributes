@@ -1,1 +1,2 @@
+*.pth filter=lfs diff=lfs merge=lfs -text
 pointstowood/model/fbeta-eu.pth filter=lfs diff=lfs merge=lfs -text
