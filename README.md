@@ -63,42 +63,42 @@ git checkout version1.0
 
 📎 [Pytorch Geometric](https://pytorch-geometric.readthedocs.io/en/latest/notes/installation.html) instructions for each OS can be found here.
 
-5. Download model weights using Git LFS (Large File Storage):
+### 5. Download Model Weights Using Git LFS
 
-   **Install Git LFS:**
-   ```bash
-   # Ubuntu/Debian
-   sudo apt-get install git-lfs
-   ```
+**Install Git LFS:**
+```bash
+# Ubuntu/Debian
+sudo apt-get install git-lfs
+# macOS
+brew install git-lfs
+# Windows: https://git-lfs.github.com/
+git lfs install
+```
 
-   **Clone the repository:**
-   ```bash
-   git clone https://github.com/harryjfowen/PointsToWood.git
-   cd PointsToWood
-   ```
+**After cloning the repository, download model weights (choose one):**
 
-   **Download model weights (choose one option):**
-   - **A. Download all models (~500MB):**
-     ```bash
-     git lfs pull
-     ```
-   - **B. Download only EU models (~200MB):**
-     ```bash
-     git lfs pull --include="pointstowood/model/fbeta-eu.pth"
-     git lfs pull --include="pointstowood/model/ba-eu.pth"
-     ```
-   - **C. Download only biome models (~100MB):**
-     ```bash
-     git lfs pull --include="pointstowood/model/ba-spain.pth"
-     git lfs pull --include="pointstowood/model/ba-poland.pth"
-     git lfs pull --include="pointstowood/model/ba-finland.pth"
-     ```
-   - **D. Download a specific model:**
-     ```bash
-     git lfs pull --include="pointstowood/model/fbeta-eu.pth"  # Replace with desired model
-     ```
+#### Download Options
+- **All models (~500MB):**
+  ```bash
+  git lfs pull
+  ```
+- **Only EU models (~200MB):**
+  ```bash
+  git lfs pull --include="pointstowood/model/fbeta-eu.pth"
+  git lfs pull --include="pointstowood/model/ba-eu.pth"
+  ```
+- **Only biome models (~100MB):**
+  ```bash
+  git lfs pull --include="pointstowood/model/ba-spain.pth"
+  git lfs pull --include="pointstowood/model/ba-poland.pth"
+  git lfs pull --include="pointstowood/model/ba-finland.pth"
+  ```
+- **A specific model:**
+  ```bash
+  git lfs pull --include="pointstowood/model/fbeta-eu.pth"  # Replace as needed
+  ```
 
-   **Tip:** You can always run `git lfs pull` later to fetch any missing models.
+*Tip: You can always run `git lfs pull` later to fetch any missing models.*
 
 
 #
