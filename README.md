@@ -63,15 +63,43 @@ git checkout version1.0
 
 📎 [Pytorch Geometric](https://pytorch-geometric.readthedocs.io/en/latest/notes/installation.html) instructions for each OS can be found here.
 
-5. Install git lfs to enable the model file to be downloaded.
-'''
-sudo apt-get install git-lfs
-'''
+5. Download model weights using Git LFS (Large File Storage):
 
-6. Install opt_einsum which is a requirement for KAN module 
-'''
-pip install opt_einsum
-'''
+   **Install Git LFS:**
+   ```bash
+   # Ubuntu/Debian
+   sudo apt-get install git-lfs
+   ```
+
+   **Clone the repository:**
+   ```bash
+   git clone https://github.com/harryjfowen/PointsToWood.git
+   cd PointsToWood
+   ```
+
+   **Download model weights (choose one option):**
+   - **A. Download all models (~500MB):**
+     ```bash
+     git lfs pull
+     ```
+   - **B. Download only EU models (~200MB):**
+     ```bash
+     git lfs pull --include="pointstowood/model/fbeta-eu.pth"
+     git lfs pull --include="pointstowood/model/ba-eu.pth"
+     ```
+   - **C. Download only biome models (~100MB):**
+     ```bash
+     git lfs pull --include="pointstowood/model/ba-spain.pth"
+     git lfs pull --include="pointstowood/model/ba-poland.pth"
+     git lfs pull --include="pointstowood/model/ba-finland.pth"
+     ```
+   - **D. Download a specific model:**
+     ```bash
+     git lfs pull --include="pointstowood/model/fbeta-eu.pth"  # Replace with desired model
+     ```
+
+   **Tip:** You can always run `git lfs pull` later to fetch any missing models.
+
 
 #
 
