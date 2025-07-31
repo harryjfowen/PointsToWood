@@ -148,7 +148,8 @@ python3 predict.py --point-cloud your_data.ply --model ba-finland.pth --batch-si
 ## Data Requirements
 
 ### Input Format
-- **Point Cloud Format**: TLS (Terrestrial Laser Scanner) data
+- **File Format**: Point cloud must be in `.ply` format
+- **Point Cloud Type**: TLS (Terrestrial Laser Scanner) data
 - **Required Columns**: `x y z` (coordinates)
 - **Optional Columns**: `reflectance` or `intensity` (recommended for best performance)
 - **Point Spacing**: Sub 2 cm optimal, but can function beyond that (not ideal for larger spacing)
