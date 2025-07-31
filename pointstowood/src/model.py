@@ -91,7 +91,7 @@ class InvertedResidualBlock(torch.nn.Module):
         else:
             self.shortcut = torch.nn.Sequential()
 
-        self.survival_prob = round(0.1 + (layer_idx / (total_layers-1)) * (0.5 - 0.1), 2)
+        self.survival_prob = round(0.1 + (layer_idx / (total_layers-1)) * (0.3 - 0.1), 2)
 
         self.leaky_relu = torch.nn.LeakyReLU()
 
@@ -202,9 +202,9 @@ class STEM(torch.nn.Module):
         return x, pos[:, :3], batch, reflectance, sf
 
     
-class Net(torch.nn.Module):
+class NetFull(torch.nn.Module):
     def __init__(self, num_classes, C=32, num_kernel_points=16):
-        super(Net, self).__init__()
+        super(NetFull, self).__init__()
 
         vx_1 = 0.02 * 1.618 # 0.03236
         vx_2 = vx_1 * 1.618 # 0.05242
@@ -287,5 +287,93 @@ class Net(torch.nn.Module):
         if return_feats:
             return logits, feat32
         return logits
+    
+class NetLight(torch.nn.Module):
+    def __init__(self, num_classes, C=16, num_kernel_points=16):
+        super(NetLight, self).__init__()
+
+        vx_1 = 0.02 * 1.618 # 0.03236
+        vx_2 = vx_1 * 1.618 # 0.05242
+        vx_3 = vx_2 * 1.618 # 0.08466
+        vx_4 = vx_3 * 1.618 # 0.13684
+
+        sqrt2 = 1.414
+        def round_to_power_of_2(x):
+            return 2 ** round(math.log2(x))
+
+        C0h = int(C * sqrt2)                  
+        C0 = round_to_power_of_2(C0h * sqrt2)
+
+        C1h = int(C0 * sqrt2)                
+        C1 = round_to_power_of_2(C1h * sqrt2) 
+
+        C2h = int(C1 * sqrt2)                
+        C2 = round_to_power_of_2(C2h * sqrt2)
+
+        C3h = int(C2 * sqrt2)              
+        C3 = round_to_power_of_2(C3h * sqrt2) 
+        C4h = int(C3 * sqrt2)                
+
+        C4 = round_to_power_of_2(C4h * sqrt2)
+        
+        total_blocks = 5        
+        current_layer_idx = 0
+
+        self.stem = STEM(8, [4, C0h, C0])
+
+        self.sa1_module = SAModule(vx_1, 16, [(C0 + 5) * num_kernel_points, C1h, C1], num_blocks=1, 
+                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points)
+        current_layer_idx += 1
+        
+        self.sa2_module = SAModule(vx_2, 16, [(C1 + 5) * num_kernel_points, C2h, C2], num_blocks=2, 
+                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points)
+        current_layer_idx += 2  
+        
+        self.sa3_module = SAModule(vx_3, 16, [(C2 + 5) * num_kernel_points, C3h, C3], num_blocks=1, 
+                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points)
+        current_layer_idx += 1  
+        
+        self.sa4_module = SAModule(vx_4, 16, [(C3 + 5) * num_kernel_points, C4h, C4], num_blocks=1, 
+                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points)
+        
+        self.fp4_module = FPModule(1, [C4 + C3, C4, C4])
+        self.fp3_module = FPModule(1, [C4 + C2, C4, C4])
+        self.fp2_module = FPModule(1, [C4 + C1, C4, C4])
+        self.fp1_module = FPModule(1, [C4 + C0, C4, C4])
+
+        self.conv1 = torch.nn.Conv1d(C4, C4, 1)
+        self.feat_head = torch.nn.Conv1d(C4, 32, 1)
+        self.conv2 = torch.nn.Conv1d(C4, num_classes, 1)
+        self.norm = torch.nn.BatchNorm1d(C4)
+
+        initialize_weights(self)
+
+    def forward(self, data, return_feats: bool = False):
+        
+        sa0_out = (data.x, data.pos, data.batch, data.reflectance, data.sf)
+
+        sa0_out = self.stem(*sa0_out)
+
+        sa1_out = self.sa1_module(*sa0_out)
+        sa2_out = self.sa2_module(*sa1_out)
+        sa3_out = self.sa3_module(*sa2_out)
+        sa4_out = self.sa4_module(*sa3_out)
+
+        fp4_out = self.fp4_module(*sa4_out[:-2], *sa3_out[:-2])
+        fp3_out = self.fp3_module(*fp4_out, *sa2_out[:-2])
+        fp2_out = self.fp2_module(*fp3_out, *sa1_out[:-2])
+        x, _, _ = self.fp1_module(*fp2_out, *sa0_out[:-2])
+
+        x = self.conv1(x.unsqueeze(dim=0).permute(0, 2, 1))
+        x = F.leaky_relu(self.norm(x))                       
+
+        feat32 = torch.squeeze(self.feat_head(x)).to(torch.float)  
+        logits = torch.squeeze(self.conv2(x)).to(torch.float)     
+
+        if return_feats:
+            return logits, feat32
+        return logits
+
+
 
 

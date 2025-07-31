@@ -1,4 +1,3 @@
-from src.model import Net
 from src.dataset import create_train_loader, create_test_loader
 from src.logger import MetricsTracker, ModelManager, HistoryLogger, WandbLogger
 from tqdm import tqdm
@@ -21,8 +20,20 @@ def SemanticTraining(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')    
     torch.autograd.set_detect_anomaly(True)
 
-    model = Net(num_classes=1).to(device)
-    print('Model contains', sum(p.numel() for p in model.parameters()), ' parameters')
+    # Auto-detect model type based on model name
+    if 'eu' in args.model.lower():
+        from src.model import NetFull as Net
+        model = Net(num_classes=1, C=32).to(device)  # Full EU model
+        lr = 5e-5
+        weight_decay = 1e-2
+    else:
+        from src.model import NetLight as Net
+        model = Net(num_classes=1, C=8).to(device)  # Lightweight biome model
+        lr = 5e-3  # Lower LR for stability
+        weight_decay = 1e-3  # Higher regularization
+    
+    print(f'Model contains {sum(p.numel() for p in model.parameters()):,} parameters')
+    print(f'Using {"EU" if "eu" in args.model.lower() else "Biome"} model')
 
     train_loader, _ = create_train_loader(args, device)
 
@@ -52,13 +63,13 @@ def SemanticTraining(args):
             decay_params.append(param)
 
     optimizer = AdamW([
-        {'params': decay_params, 'weight_decay': 1e-2},
+        {'params': decay_params, 'weight_decay': weight_decay},
         {'params': no_decay_params, 'weight_decay': 0.0}
-    ], lr=5e-5) 
+    ], lr=lr) 
 
     lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer, 
-        max_lr=5e-5,  
+        max_lr=lr,  
         total_steps=args.num_epochs, 
         pct_start=0.10,
         anneal_strategy='cos', 

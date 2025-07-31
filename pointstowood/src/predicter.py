@@ -1,4 +1,3 @@
-from src.model import Net
 from src.dataset import create_inference_loader
 import os
 import sys
@@ -78,7 +77,7 @@ class PointCloudClassifier:
         return labels
 
     def collect_predictions(self, classification, original):
-        original = original.drop(columns=[c for c in original.columns if c in ['pred', 'pwood', 'pleaf']])
+        original = original.drop(columns=[c for c in original.columns if c in ['prediction', 'pwood', 'pleaf']])
         
         indices_file = os.path.join('nbrs.npy')
         
@@ -97,19 +96,21 @@ class PointCloudClassifier:
         else:
             labels = self._labels_median_threshold(classification[indices], labels, self.is_wood)
             
-        original.loc[:, ['pred', 'pwood']] = labels
+        original.loc[:, ['prediction', 'pwood']] = labels
         return original
 
 def SemanticSegmentation(args):
-    '''
-    Setup Multi GPU processing. 
-    '''
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    '''
-    Setup model. 
-    '''
-    model = Net(num_classes=1).to(device)
+    # Auto-detect model type
+    if 'eu' in args.model.lower():
+        from src.model import NetFull as Net
+        model = Net(num_classes=1, C=32).to(device)
+    else:
+        from src.model import NetLight as Net
+        model = Net(num_classes=1, C=16).to(device)
+    
+    print(f'Loading {"EU" if "eu" in args.model.lower() else "Biome"} model')
 
     try:
         load_model(os.path.join(args.wdir,'model',args.model), model, device)
@@ -172,7 +173,7 @@ def SemanticSegmentation(args):
     '''
     Save final classified point cloud. 
     '''
-    headers = list(dict.fromkeys(args.headers + ['pred', 'pwood']))
+    headers = list(dict.fromkeys(args.headers + ['prediction', 'pwood']))
     save_file(args.odir, args.pc.copy(), additional_fields=headers, verbose=False)    
     
     return args

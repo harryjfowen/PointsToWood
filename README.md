@@ -17,7 +17,7 @@ This branch contains the latest version with significant architectural improveme
 - **Inverted Residual Blocks** for improved feature extraction and regularization
 - **Squeeze-Excitation (SE) Channel Attention** for adaptive feature recalibration
 - **Adaptive Receptive Field Scaling** with learnable ρ parameters
-- **Cyclical Focal Loss** for better training stability and convergence
+- **Cyclical Edge Weighted Focal Loss** for better training stability and convergence
 - **Enhanced Data Processing** with denoising and efficient batching
 - **Robust Multimodal Learning** handling both geometric and reflectance data
 
@@ -91,17 +91,31 @@ cd ~/PointsToWood/pointstowood/
 
 3. Run PointsToWood.
 
-**Aggressive Wood Detection (Recommended):**
+**EU Models (Recommended for General Use):**
 ```bash
+# Precision-focused model
 python3 predict.py --point-cloud ~/PointsToWood/pointstowood/data/eu_eval/uk01_lw_pl_3.ply --model fbeta-eu.pth --batch-size 4 --any-wood 0.50 --grid-size 2.0 3.0 --resolution 0.02 --min-pts 512 --max-pts 16384
-```
-Use `--any-wood` parameter to apply a more aggressive wood labeling strategy. With this option, a point is classified as wood if ANY neighboring point within its local neighborhood exceeds the wood probability threshold. This approach increases wood detection sensitivity, capturing more potential wood structures that might otherwise be missed but may increase false positives.
 
-**Conservative Wood Detection:**
-```bash
-python3 predict.py --point-cloud ~/PointsToWood/pointstowood/data/eu_eval/uk01_lw_pl_3.ply --model fbeta-eu.pth --batch-size 4 --is-wood 0.5 --grid-size 2.0 3.0 --resolution 0.02 --min-pts 512 --max-pts 16384 --max-probabilities
+# Balanced accuracy model
+python3 predict.py --point-cloud ~/PointsToWood/pointstowood/data/eu_eval/uk01_lw_pl_3.ply --model ba-eu.pth --batch-size 4 --any-wood 0.50 --grid-size 2.0 3.0 --resolution 0.02 --min-pts 512 --max-pts 16384
 ```
-Use `--is-wood` parameter to apply a more conservative wood labeling strategy. With this option, a point is classified as wood if ALL neighboring points within its local neighborhood exceed the wood probability threshold. This approach increases wood detection specificity, reducing false positives but may miss potential wood structures that might otherwise be detected. The `--max-probabilities` flag selects the most confident prediction in each neighborhood.
+
+**Biome-Specific Models (Faster Inference):**
+```bash
+# Spanish forests
+python3 predict.py --point-cloud your_data.ply --model ba-spain.pth --batch-size 8 --any-wood 0.50 --grid-size 2.0 --resolution 0.02 --min-pts 512 --max-pts 16384
+
+# Polish forests
+python3 predict.py --point-cloud your_data.ply --model ba-poland.pth --batch-size 8 --any-wood 0.50 --grid-size 2.0 --resolution 0.02 --min-pts 512 --max-pts 16384
+
+# Finnish forests
+python3 predict.py --point-cloud your_data.ply --model ba-finland.pth --batch-size 8 --any-wood 0.50 --grid-size 2.0 --resolution 0.02 --min-pts 512 --max-pts 16384
+```
+
+**Detection Strategies:**
+- **`--any-wood`**: Aggressive wood detection - classifies as wood if ANY neighbor exceeds threshold
+- **`--is-wood`**: Conservative wood detection - classifies as wood if ALL neighbors exceed threshold
+- **`--max-probabilities`**: Uses most confident prediction in each neighborhood
 
 ## Data Requirements
 
@@ -114,18 +128,34 @@ Use `--is-wood` parameter to apply a more conservative wood labeling strategy. W
 
 ### Output Format
 The model will append two new columns to your point cloud:
-- **`pred`**: Binary classification (0 = leaf, 1 = wood)
+- **`prediction`**: Binary classification (0 = leaf, 1 = wood)
 - **`pwood`**: Probability of wood classification (0.0 to 1.0)
 
 ## Model Information
 
 ### Available Models
+
+#### **EU Models (67M parameters)**
 - **`fbeta-eu.pth`**: F1-optimized model with slight preference for precision (β = 0.9)
   - Best for applications where precision is slightly more important than recall
   - Trained on European forest data
   - Recommended for most use cases
+- **`ba-eu.pth`**: Balanced accuracy optimized model
+  - Optimized for balanced accuracy across all classes
+  - Good general-purpose model for European forests
+  - Equal emphasis on precision and recall
 
-Within the model folder, we have biome specific as well as more general ecosystem agnostic models. 
+#### **Biome-Specific Models (3.5M parameters)**
+Lightweight models optimized for specific biomes:
+- **`ba-spain.pth`**: Balanced accuracy model for Spanish forests
+- **`ba-poland.pth`**: Balanced accuracy model for Polish forests  
+- **`ba-finland.pth`**: Balanced accuracy model for Finnish forests
+
+**Model Selection Guide:**
+- **Use EU models** for general European forest applications
+- **Use biome-specific models** for targeted regions (faster inference, smaller memory footprint)
+- **Use `fbeta-eu.pth`** when precision is slightly more important
+- **Use `ba-*` models** when balanced performance is desired 
 
 
 ### References 

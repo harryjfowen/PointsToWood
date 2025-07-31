@@ -58,7 +58,7 @@ def preprocess_point_cloud_data(df, zero_reflectance=False):
     df = df.loc[:, ~df.columns.duplicated()]
 
     # Drop any prior prediction columns but retain ground-truth 'label' if present
-    drop_tokens = ["pred", "pwood"]
+    drop_tokens = ["prediction", "pwood"]
     cols_to_drop = [c for c in df.columns if any(tok in c for tok in drop_tokens)]
     if len(cols_to_drop):
         df = df.drop(columns=cols_to_drop, errors='ignore')

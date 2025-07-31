@@ -151,29 +151,29 @@ def clean_point_cloud(df):
     
     # ------------------------------------------------------------------
     # Harmonise prediction column – ensure every DataFrame ends up with
-    # a binary 0/1 column called 'pred'. Source columns may be:
-    #   • 'pred'   (our files)
+    # a binary 0/1 column called 'prediction'. Source columns may be:
+    #   • 'prediction'   (our files)
     #   • 'label'  (fsct)
     #   • 'preds'  (kpconv)
     # ------------------------------------------------------------------
 
-    if 'pred' not in df.columns:
+    if 'prediction' not in df.columns:
         if 'preds' in df.columns:
-            df.rename(columns={'preds': 'pred'}, inplace=True)
-            print("Renamed 'preds' column to 'pred'")
+            df.rename(columns={'preds': 'prediction'}, inplace=True)
+            print("Renamed 'preds' column to 'prediction'")
         elif 'label' in df.columns:
-            df.rename(columns={'label': 'pred'}, inplace=True)
-            print("Renamed 'label' column to 'pred'")
+            df.rename(columns={'label': 'prediction'}, inplace=True)
+            print("Renamed 'label' column to 'prediction'")
 
     if df.columns.duplicated().any():
         df = df.loc[:, ~df.columns.duplicated()]
 
-    if 'pred' in df.columns:
-        df = df[df['pred'] != 2]
-        if df['pred'].nunique() > 2:
-            df.loc[:, 'pred'] = (df['pred'] == 3).astype(int)
+    if 'prediction' in df.columns:
+        df = df[df['prediction'] != 2]
+        if df['prediction'].nunique() > 2:
+            df.loc[:, 'prediction'] = (df['prediction'] == 3).astype(int)
     else:
-        print(f"Warning: No 'pred' column found. Available columns: {list(df.columns)}")
+        print(f"Warning: No 'prediction' column found. Available columns: {list(df.columns)}")
     
     if 'pathlength' not in df.columns:
         df.loc[:, 'pathlength'] = 1
@@ -250,23 +250,23 @@ for file_name in tqdm(file_names, desc='Processing files', unit='file'):
         mixed_weights_ours = ours['pathlength'].values
         mixed_weights_fsct = fsct['pathlength'].values  
         mixed_weights_kpconv = kpconv['pathlength'].values
-    iou_fsct = jaccard_score(fsct[['truth']].astype(int), fsct[['pred']].astype(int), average='binary', zero_division=0)
-    f1_fsct = f1_score(fsct[['truth']].astype(int), fsct[['pred']].astype(int), average='binary', zero_division=0)
-    accuracy_fsct = balanced_accuracy_score(fsct[['truth']].astype(int), fsct[['pred']].astype(int))
-    weighted_accuracy_fsct = balanced_accuracy_score(fsct[['truth']].astype(int), fsct[['pred']].astype(int), sample_weight=fsct['pathlength'])
-    mixed_weighted_accuracy_fsct = balanced_accuracy_score(fsct[['truth']].astype(int), fsct[['pred']].astype(int), sample_weight=mixed_weights_fsct)
-    
-    iou_ours = jaccard_score(ours[['truth']].astype(int), ours[['pred']].astype(int), average='binary', zero_division=0)
-    f1_ours = f1_score(ours[['truth']].astype(int), ours[['pred']].astype(int), average='binary', zero_division=0)
-    accuracy_ours = balanced_accuracy_score(ours[['truth']].astype(int), ours[['pred']].astype(int))
-    weighted_accuracy_ours = balanced_accuracy_score(ours[['truth']].astype(int), ours[['pred']].astype(int), sample_weight=ours['pathlength'])
-    mixed_weighted_accuracy_ours = balanced_accuracy_score(ours[['truth']].astype(int), ours[['pred']].astype(int), sample_weight=mixed_weights_ours)
-    
-    iou_kpconv = jaccard_score(kpconv[['truth']].astype(int), kpconv[['pred']].astype(int), average='binary', zero_division=0)
-    f1_kpconv = f1_score(kpconv[['truth']].astype(int), kpconv[['pred']].astype(int), average='binary', zero_division=0)
-    accuracy_kpconv = balanced_accuracy_score(kpconv[['truth']].astype(int), kpconv[['pred']].astype(int))
-    weighted_accuracy_kpconv = balanced_accuracy_score(kpconv[['truth']].astype(int), kpconv[['pred']].astype(int), sample_weight=kpconv['pathlength'])
-    mixed_weighted_accuracy_kpconv = balanced_accuracy_score(kpconv[['truth']].astype(int), kpconv[['pred']].astype(int), sample_weight=mixed_weights_kpconv)
+        iou_fsct = jaccard_score(fsct[['truth']].astype(int), fsct[['prediction']].astype(int), average='binary', zero_division=0)
+    f1_fsct = f1_score(fsct[['truth']].astype(int), fsct[['prediction']].astype(int), average='binary', zero_division=0)
+    accuracy_fsct = balanced_accuracy_score(fsct[['truth']].astype(int), fsct[['prediction']].astype(int))
+    weighted_accuracy_fsct = balanced_accuracy_score(fsct[['truth']].astype(int), fsct[['prediction']].astype(int), sample_weight=fsct['pathlength'])
+    mixed_weighted_accuracy_fsct = balanced_accuracy_score(fsct[['truth']].astype(int), fsct[['prediction']].astype(int), sample_weight=mixed_weights_fsct)
+
+    iou_ours = jaccard_score(ours[['truth']].astype(int), ours[['prediction']].astype(int), average='binary', zero_division=0)
+    f1_ours = f1_score(ours[['truth']].astype(int), ours[['prediction']].astype(int), average='binary', zero_division=0)
+    accuracy_ours = balanced_accuracy_score(ours[['truth']].astype(int), ours[['prediction']].astype(int))
+    weighted_accuracy_ours = balanced_accuracy_score(ours[['truth']].astype(int), ours[['prediction']].astype(int), sample_weight=ours['pathlength'])
+    mixed_weighted_accuracy_ours = balanced_accuracy_score(ours[['truth']].astype(int), ours[['prediction']].astype(int), sample_weight=mixed_weights_ours)
+
+    iou_kpconv = jaccard_score(kpconv[['truth']].astype(int), kpconv[['prediction']].astype(int), average='binary', zero_division=0)
+    f1_kpconv = f1_score(kpconv[['truth']].astype(int), kpconv[['prediction']].astype(int), average='binary', zero_division=0)
+    accuracy_kpconv = balanced_accuracy_score(kpconv[['truth']].astype(int), kpconv[['prediction']].astype(int))
+    weighted_accuracy_kpconv = balanced_accuracy_score(kpconv[['truth']].astype(int), kpconv[['prediction']].astype(int), sample_weight=kpconv['pathlength'])
+    mixed_weighted_accuracy_kpconv = balanced_accuracy_score(kpconv[['truth']].astype(int), kpconv[['prediction']].astype(int), sample_weight=mixed_weights_kpconv)
     
     print(f'Accuracy - FSCT: {accuracy_fsct:.4f}, Ours: {accuracy_ours:.4f}, KPConv: {accuracy_kpconv:.4f}')
     print(f'Weighted Accuracy - FSCT: {weighted_accuracy_fsct:.4f}, Ours: {weighted_accuracy_ours:.4f}, KPConv: {weighted_accuracy_kpconv:.4f}')
