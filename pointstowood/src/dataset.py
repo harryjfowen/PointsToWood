@@ -129,7 +129,7 @@ class TestingDataset(Dataset, ABC):
         reflectance = torch.as_tensor(point_cloud[:, self.reflectance_index], dtype=torch.float)
 
         if self.denoise:
-            pos, reflectance = sor_filter(pos, reflectance, k=self.denoise_k, std_threshold=self.denoise_std)
+            pos, reflectance, _ = sor_filter(pos, reflectance, k=self.denoise_k, std_threshold=self.denoise_std)
         
         if len(pos) > self.max_pts:
             indices = torch.randperm(len(pos))[:self.max_pts]

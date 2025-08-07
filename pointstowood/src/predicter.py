@@ -105,10 +105,10 @@ def SemanticSegmentation(args):
     # Auto-detect model type
     if 'eu' in args.model.lower():
         from src.model import NetFull as Net
-        model = Net(num_classes=1, C=32).to(device)
+        model = Net(num_classes=1, C=64).to(device)
     else:
         from src.model import NetLight as Net
-        model = Net(num_classes=1, C=16).to(device)
+        model = Net(num_classes=1, C=8).to(device)
     
     print(f'Loading {"EU" if "eu" in args.model.lower() else "Biome"} model')
 

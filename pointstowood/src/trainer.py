@@ -8,12 +8,58 @@ from time import sleep
 from src.loss import *
 from torch.optim import AdamW
 import warnings
+import copy
 
 seed = 141190
 torch.manual_seed(seed)
 torch.backends.cudnn.benchmark = False
 warnings.filterwarnings("ignore", category=UserWarning)
 torch.autograd.set_detect_anomaly(True)
+
+
+class EMAModel:
+    """Exponential Moving Average for model weights with fixed decay."""
+    
+    def __init__(self, model, decay=0.9):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+    
+    def get_current_decay(self):
+        """Get current decay (fixed)."""
+        return self.decay
+    
+    def set_epoch(self, epoch):
+        """Update current epoch (kept for compatibility)."""
+        pass
+        
+    def register(self):
+        """Register model parameters for EMA tracking."""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+    
+    def update(self):
+        """Update EMA weights with current decay."""
+        current_decay = self.get_current_decay()
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.shadow[name] = current_decay * self.shadow[name] + (1 - current_decay) * param.data
+    
+    def apply_shadow(self):
+        """Apply EMA weights to model for evaluation."""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+    
+    def restore(self):
+        """Restore original weights after evaluation."""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.backup:
+                param.data.copy_(self.backup[name])
+        self.backup = {}
 
 
 def SemanticTraining(args):
@@ -24,13 +70,13 @@ def SemanticTraining(args):
     if 'eu' in args.model.lower():
         from src.model import NetFull as Net
         model = Net(num_classes=1, C=32).to(device)  # Full EU model
-        lr = 5e-5
+        lr = 1e-4
         weight_decay = 1e-2
     else:
         from src.model import NetLight as Net
         model = Net(num_classes=1, C=8).to(device)  # Lightweight biome model
-        lr = 5e-3  # Lower LR for stability
-        weight_decay = 1e-3  # Higher regularization
+        lr = 1e-3  # Lower LR for stability
+        weight_decay = 1e-2  # Higher regularization
     
     print(f'Model contains {sum(p.numel() for p in model.parameters()):,} parameters')
     print(f'Using {"EU" if "eu" in args.model.lower() else "Biome"} model')
@@ -40,16 +86,14 @@ def SemanticTraining(args):
     if args.test:
         test_loader, _ = create_test_loader(args, device)
 
-    criterion = CyclicalFocalLoss(
-        reduction="mean", 
-        gamma_lc=2.0,  
-        gamma_hc=0.5,  
-        fc=4.0,          
-        num_epochs=args.num_epochs,
-        alpha=None,  
-        pos_smoothing=0.20,
-        neg_smoothing=0.05,
-        epsilon=0.1 
+    criterion = DifficultyAwareFocalLoss(
+        min_gamma=1.0,
+        max_gamma=3.0,
+        sharpness=2.0,
+        alpha=0.5,
+        beta=1.0,
+        use_weight_scaling=True,
+        reduction="mean"
     )
 
     decay_params = []
@@ -101,14 +145,23 @@ def SemanticTraining(args):
         enabled=True
     )
 
+    # EMA Loss tracking
+    ema_loss = None
+    ema_alpha = 0.9
+    
+    # EMA Model tracking with fixed decay
+    ema_model = EMAModel(model, decay=0.9)
+    ema_model.register()
+
     accumulation_steps = 6 
     optimizer.zero_grad(set_to_none=True)  
+    accumulated_batches = 0  # Track actual accumulated batches
 
     for epoch in range(1, args.num_epochs + 1):
         model.train()
         print(f"\n{'='*100}\nEPOCH {epoch}\n{'='*100}")
         
-        criterion.set_epoch(epoch)
+        ema_model.set_epoch(epoch)  # Update EMA epoch for decay scheduling
         train_tracker = MetricsTracker()
 
         with tqdm(total=len(train_loader), colour='white', ascii="░▒", bar_format='{l_bar}{bar:20}{r_bar}{bar:-20b}') as tepoch:
@@ -120,19 +173,36 @@ def SemanticTraining(args):
 
                     if torch.isnan(outputs).any():
                         print(f"[Warning] NaN in model outputs at step {i}, skipping batch")
+                        # Force gradient update if we've accumulated enough
+                        if accumulated_batches >= accumulation_steps:
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                            scaler.step(optimizer)
+                            scaler.update()
+                            optimizer.zero_grad(set_to_none=True)
+                            accumulated_batches = 0
                         continue
                     
-                    loss, gamma = criterion(outputs, data.y, data.edge_scores)
+                    loss = criterion(outputs, data.y, data.edge_scores)
+                    
+                    # Less aggressive clamping
+                    loss = torch.clamp(loss, min=0.0, max=10.0)  # Allow zero loss, lower max
                     loss = loss / accumulation_steps
+                    
                     scaler.scale(loss).backward()
+                    accumulated_batches += 1
 
-                if (i + 1) % accumulation_steps == 0:
+                # Check for gradient update
+                if accumulated_batches >= accumulation_steps:
                     scaler.unscale_(optimizer)
 
-                    if any(torch.isnan(p.grad).any() for p in model.parameters() if p.grad is not None):
+                    # Check for NaN gradients
+                    nan_grads = any(torch.isnan(p.grad).any() for p in model.parameters() if p.grad is not None)
+                    if nan_grads:
                         print(f"[Warning] NaN in gradients at step {i}, skipping update")
                         scaler.update()
                         optimizer.zero_grad(set_to_none=True)
+                        accumulated_batches = 0
                         continue
 
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -140,35 +210,71 @@ def SemanticTraining(args):
                     try:
                         scaler.step(optimizer)
                         scaler.update()
+                        
+                        # Update EMA weights after successful optimizer step
+                        ema_model.update()
+                        
                         optimizer.zero_grad(set_to_none=True)
+                        accumulated_batches = 0
                     except RuntimeError as e:
                         if "overflow" in str(e).lower():
                             print(f"[Overflow] AMP overflow at step {i}. Reducing scale.")
-                            scaler.update(new_scale=128) 
+                            scaler.update()  # Let scaler handle scale reduction automatically
+                            optimizer.zero_grad(set_to_none=True)
+                            accumulated_batches = 0
                         else:
                             raise e
 
-                train_tracker.update(loss * accumulation_steps, outputs, data.y, data.edge_scores)
+                # Update EMA loss
+                current_loss = loss * accumulation_steps
+                if ema_loss is None:
+                    ema_loss = current_loss.item()
+                else:
+                    ema_loss = ema_alpha * ema_loss + (1 - ema_alpha) * current_loss.item()
 
-                tepoch.update()
-                train_metrics = train_tracker.get_averages()
+                train_tracker.update(current_loss, outputs, data.y, data.edge_scores)
+
+                # Update progress bar with current batch metrics
+                current_metrics = train_tracker.get_averages()
                 tepoch.set_postfix({
                     'Lr': optimizer.param_groups[0]["lr"],
-                    'Lo': round(train_metrics['loss'], 5),
-                    'Ac': round(train_metrics['accuracy'], 3),
-                    'Pr': round(train_metrics['precision'], 3),
-                    'Re': round(train_metrics['recall'], 3),
-                    'F1': round(train_metrics['f1'], 3),
-                    'mIoU': round(train_metrics['miou'], 3),
-                    'Ga': round(gamma, 3)
+                    'Lo': round(current_metrics['loss'], 5),
+                    'EMA': round(ema_loss, 5),
+                    'EDecay': f'{ema_model.get_current_decay():.3f}',
+                    'Scale': f'{scaler.get_scale():.0f}',
+                    'Ac': round(current_metrics['accuracy'], 3),
+                    'Pr': round(current_metrics['precision'], 3),
+                    'Re': round(current_metrics['recall'], 3),
+                    'F1': round(current_metrics['f1'], 3),
+                    'mIoU': round(current_metrics['miou'], 3),
                 })
+                tepoch.update(1)
             tepoch.close()
-            lr_scheduler.step()
+            
+        # Handle any remaining gradients at epoch end
+        if accumulated_batches > 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            
+            # Update EMA weights for final step
+            ema_model.update()
+            
+            optimizer.zero_grad(set_to_none=True)
+            accumulated_batches = 0
+
+        # Step the scheduler
+        lr_scheduler.step()
 
         train_metrics = train_tracker.get_averages()
 
         if args.test:
             model.eval()
+            
+            # Apply EMA weights for testing
+            ema_model.apply_shadow()
+            
             sleep(0.1)
             test_tracker = MetricsTracker()
 
@@ -181,7 +287,7 @@ def SemanticTraining(args):
                         test_tracker.update_with_smoothing(torch.tensor(0.0), outputs, data.y, data.pos, data.batch, data.edge_scores)
                         
                         curr_metrics = test_tracker.get_averages()
-                        tepoch.set_description(f"Test")
+                        tepoch.set_description(f"Test (EMA)")
                         tepoch.update()
                         tepoch.set_postfix({
                             'Ac': np.around(curr_metrics['accuracy'], 3),
@@ -194,6 +300,9 @@ def SemanticTraining(args):
                     tepoch.close()
             
             test_metrics = test_tracker.get_averages()
+            
+            # Restore original weights for training
+            ema_model.restore()
         else:
             test_metrics = None
 
@@ -204,18 +313,21 @@ def SemanticTraining(args):
             manager.save_checkpoints(args, epoch)
         
         if args.stop_early:
-            consec_decreases = 0  
             if epoch > 10: 
-                current_acc = history_logger.history[-1, 3] 
-                prev_acc = history_logger.history[-2, 3]     
-                
-                if current_acc < prev_acc:
-                    consec_decreases += 1
+                # Use EMA loss for more stable early stopping
+                current_ema = ema_loss
+                if not hasattr(SemanticTraining, 'prev_ema_loss'):
+                    SemanticTraining.prev_ema_loss = current_ema
+                    SemanticTraining.consec_decreases = 0
                 else:
-                    consec_decreases = 0  
+                    if current_ema > SemanticTraining.prev_ema_loss:
+                        SemanticTraining.consec_decreases += 1
+                    else:
+                        SemanticTraining.consec_decreases = 0
+                SemanticTraining.prev_ema_loss = current_ema
                     
-                if consec_decreases >= 10: 
-                    print(f"\nStopping early at epoch {epoch} - training accuracy decreased for {consec_decreases} consecutive epochs")
+                if SemanticTraining.consec_decreases >= 10: 
+                    print(f"\nStopping early at epoch {epoch} - EMA loss increased for {SemanticTraining.consec_decreases} consecutive epochs")
                     best_epoch, best_acc = history_logger.get_best_epoch()
                     print(f"Best accuracy was {best_acc:.4f} at epoch {best_epoch}")
                     break

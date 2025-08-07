@@ -70,6 +70,7 @@ class AnisotropicConv(MessagePassing):
         
         self.abs_refl_weight = nn.Parameter(torch.tensor(0.5))
         self.rel_refl_weight = nn.Parameter(torch.tensor(0.5))
+        self.kernel_reflectance_importance = nn.Parameter(torch.ones(num_kernel_points))  # Per-kernel reflectance importance
         
         self.kernel_bias = nn.Parameter(torch.zeros(num_kernel_points))
         self.reset_parameters()
@@ -144,7 +145,14 @@ class AnisotropicConv(MessagePassing):
         if x_j is not None:
             feat_list.append(x_j)
         
-        feat_list.append(pos_j[:, 3].unsqueeze(-1))
+        #feat_list.append(pos_j[:, 3].unsqueeze(-1))
+
+        reflectance_weight = torch.sum(weights * self.kernel_reflectance_importance.unsqueeze(0), dim=1)  # Kernel-weighted reflectance importance
+        weighted_reflectance = (pos_j[:, 3] * reflectance_weight).unsqueeze(-1)
+        feat_list.append(weighted_reflectance)
+
+        #
+
         feat_list.append(rel_pos)
         feat_list.append(dists)
         feat = torch.cat(feat_list, dim=-1).unsqueeze(-1)

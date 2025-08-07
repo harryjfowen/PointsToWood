@@ -153,12 +153,18 @@ def clean_point_cloud(df):
     # Harmonise prediction column – ensure every DataFrame ends up with
     # a binary 0/1 column called 'prediction'. Source columns may be:
     #   • 'prediction'   (our files)
-    #   • 'label'  (fsct)
-    #   • 'preds'  (kpconv)
+    #   • 'pred'        (our files - renamed from 'pred')
+    #   • 'label'       (fsct)
+    #   • 'preds'       (kpconv)
+    # 
+    # NOTE: 'truth' columns are kept as ground truth labels
     # ------------------------------------------------------------------
 
     if 'prediction' not in df.columns:
-        if 'preds' in df.columns:
+        if 'pred' in df.columns:
+            df.rename(columns={'pred': 'prediction'}, inplace=True)
+            print("Renamed 'pred' column to 'prediction'")
+        elif 'preds' in df.columns:
             df.rename(columns={'preds': 'prediction'}, inplace=True)
             print("Renamed 'preds' column to 'prediction'")
         elif 'label' in df.columns:
@@ -214,16 +220,18 @@ for file_name in tqdm(file_names, desc='Processing files', unit='file'):
         print(f"Skipping {base_name} - no 'truth' column found in any of the three files")
         continue
 
+    # Use the first available truth column as ground truth for all models
+    truth_source_name = list(models_with_truth.keys())[0]
+    truth_source_df = models_with_truth[truth_source_name]
+    print(f"Using 'truth' column from {truth_source_name} as ground truth")
+
+    # Copy truth to all models that don't have it
     for name, df in models.items():
         if 'truth' not in df.columns:
-            copied = False
-            for src_name, src_df in models_with_truth.items():
-                if len(df) == len(src_df):
-                    df['truth'] = src_df['truth'].values
-                    print(f"Copied 'truth' column from {src_name} to {name} (point count match)")
-                    copied = True
-                    break
-            if not copied:
+            if len(df) == len(truth_source_df):
+                df['truth'] = truth_source_df['truth'].values
+                print(f"Copied 'truth' column from {truth_source_name} to {name} (point count match)")
+            else:
                 print(f"Skipping {base_name} - cannot copy 'truth' to {name}; point counts differ")
                 continue
 

@@ -111,6 +111,9 @@ def augmentations(pos, reflectance, label, mode: str = "train"):
         elif p_refl > 0.20 and p_refl < 0.30:
             reflectance = perturb_reflectance(reflectance)
 
+        elif p_refl > 0.30 and p_refl < 0.40:
+            reflectance = match_leaf_to_wood_reflectance(reflectance, label)
+
     elif mode == "test":
 
         if p_refl < 0.20:
