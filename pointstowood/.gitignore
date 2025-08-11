@@ -219,6 +219,8 @@ cython_debug/
 *.tflite
 *.pt
 *.pytorch
+!model/
+!model/*.pth
 
 # Data files
 *.csv
