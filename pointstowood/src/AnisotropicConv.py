@@ -61,15 +61,13 @@ class AnisotropicConv(MessagePassing):
         if learnable_rho:
             self.raw_rho = nn.Parameter(torch.zeros(1))
 
-        self.rho_min = 0.2
+        self.rho_min = 0.1
         self.rho_max = 1.0
 
         base_kernels = fibonacci_sphere(num_kernel_points, dim=3)
         base_kernels[0, :] = 0.0
         self.kernel_points = nn.Parameter(base_kernels, requires_grad=learnable_kernels)
         
-        self.abs_refl_weight = nn.Parameter(torch.tensor(0.5))
-        self.rel_refl_weight = nn.Parameter(torch.tensor(0.5))
         self.kernel_reflectance_importance = nn.Parameter(torch.ones(num_kernel_points))  # Per-kernel reflectance importance
         
         self.kernel_bias = nn.Parameter(torch.zeros(num_kernel_points))
@@ -122,8 +120,8 @@ class AnisotropicConv(MessagePassing):
             
         attention_features = torch.cat([
             rel_pos_norm,
-            self.abs_refl_weight * refl_j,
-            self.rel_refl_weight * rel_refl
+            refl_j,
+            rel_refl
         ], dim=-1)
             
         kernel_dirs = F.normalize(self.kernel_points, dim=1).unsqueeze(0)

@@ -21,12 +21,15 @@ def initialize_weights(model):
                 torch.nn.init.kaiming_uniform_(m.weight, mode='fan_in', nonlinearity='relu')
 
 class SqueezeExcite(nn.Module):
-    def __init__(self, channels: int, reduction: int = 4):
+    def __init__(self, channels: int, reduction: int = 8, dropout: float = 0.1):
         super().__init__()
         hidden = max(channels // reduction, 1)
         self.fc = nn.Sequential(
-            nn.Linear(channels, hidden, bias=False), nn.ReLU(inplace=True),
-            nn.Linear(hidden, channels, bias=False), nn.Sigmoid()
+            nn.Linear(channels, hidden, bias=False), 
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, channels, bias=False), 
+            nn.Sigmoid()
         )
 
     def forward(self, x, batch):
@@ -62,96 +65,50 @@ class DepthwiseSeparableConv1d(torch.nn.Module):
         out = self.pointwise_gn(out)
         out = self.leaky_relu(out)
         return out
-    
 
-class PointCloudStochasticDepth(nn.Module):
-    """Stochastic depth implementation optimized for point cloud data."""
-    
-    def __init__(self, drop_rate: float = 0.0):
+class PointCloudDropPath(nn.Module):
+    def __init__(self, drop_prob: float = 0.0):
         super().__init__()
-        self.drop_rate = drop_rate
-    
+        self.drop_prob = drop_prob
+        
     def forward(self, x):
-        if not self.training or self.drop_rate == 0.0:
+        if not self.training or self.drop_prob == 0.0:
             return x
-        
-        # Bernoulli sampling for survival
-        survival_rate = 1.0 - self.drop_rate
-        if torch.rand(1, device=x.device).item() < survival_rate:
-            return x / survival_rate  # Scale to maintain expected value
-        else:
-            return torch.zeros_like(x)
-
-
-class DepthwiseSeparableConv1d(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=1, stride=1, padding=0):
-        super().__init__()
-        self.depthwise_conv = nn.Conv1d(
-            in_channels, in_channels, kernel_size=kernel_size,
-            stride=stride, padding=padding, groups=in_channels
-        )
-        self.depthwise_gn = nn.GroupNorm(min(32, in_channels), in_channels)
-        self.pointwise_conv = nn.Conv1d(in_channels, out_channels, kernel_size=1)
-        self.pointwise_gn = nn.GroupNorm(min(32, out_channels), out_channels)
-        self.activation = nn.LeakyReLU(inplace=True)
-        
-    def forward(self, x):
-        x = self.depthwise_conv(x)
-        x = self.depthwise_gn(x)
-        x = self.activation(x)
-        x = self.pointwise_conv(x)
-        x = self.pointwise_gn(x)
-        x = self.activation(x)
-        return x
-
+        keep_prob = 1.0 - self.drop_prob
+        random_tensor = keep_prob + torch.rand(1, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        return x.div(keep_prob) * random_tensor
 
 class InvertedResidualBlock(nn.Module):
-    """
-    Inverted residual block with expansion for point cloud data.
-    Compatible with PyTorch Geometric tensor format [num_points, channels].
-    
-    Args:
-        in_channels: Input feature dimension
-        out_channels: Output feature dimension  
-        expansion_factor: Channel expansion ratio (default: 2)
-        layer_idx: Current layer index for drop rate scheduling
-        total_layers: Total number of layers for drop rate scheduling
-        max_drop_rate: Maximum stochastic depth drop rate (default: 0.1)
-    """
-    
     def __init__(
         self, 
         in_channels: int, 
         out_channels: int, 
-        expansion_factor: int = 2,
+        expansion_factor: int = 4,  
         layer_idx: int = 0, 
         total_layers: int = 9,
-        max_drop_rate: float = 0.1,
-        reverse_drop_schedule: bool = False
+        max_drop_rate: float = 0.2,  
+        min_drop_rate: float = 0.0   
     ):
         super().__init__()
         
         expanded_channels = in_channels * expansion_factor
         
-        # Expansion phase
         self.expand = nn.Sequential(
             nn.Conv1d(in_channels, expanded_channels, kernel_size=1, bias=False),
             nn.GroupNorm(min(32, expanded_channels), expanded_channels),
             nn.LeakyReLU(inplace=True)
         )
         
-        # Depthwise convolution phase
         self.depthwise = DepthwiseSeparableConv1d(
             expanded_channels, expanded_channels, kernel_size=1
         )
         
-        # Projection phase
         self.project = nn.Sequential(
             nn.Conv1d(expanded_channels, out_channels, kernel_size=1, bias=False),
             nn.GroupNorm(min(32, out_channels), out_channels)
         )
         
-        # Skip connection
         self.use_skip = in_channels == out_channels
         if not self.use_skip:
             self.shortcut = nn.Sequential(
@@ -159,57 +116,40 @@ class InvertedResidualBlock(nn.Module):
                 nn.GroupNorm(min(32, out_channels), out_channels)
             )
         
-        # Stochastic depth with linear scheduling
-        if reverse_drop_schedule:
-            # Reverse schedule: early layers get more dropout, later layers get less
-            drop_rate = (total_layers - 1 - layer_idx) / max(total_layers - 1, 1) * max_drop_rate
-        else:
-            # Standard schedule: early layers get less dropout, later layers get more
-            drop_rate = layer_idx / max(total_layers - 1, 1) * max_drop_rate
-        self.stochastic_depth = PointCloudStochasticDepth(drop_rate)
+        drop_rate = min_drop_rate + ((total_layers - 1 - layer_idx) / max(total_layers - 1, 1)) * (max_drop_rate - min_drop_rate)
+        self.drop_path = PointCloudDropPath(drop_rate)
+        
         
         self.final_activation = nn.LeakyReLU(inplace=True)
 
     def forward(self, x):
-        """
-        Forward pass for point cloud tensor.
-        
-        Args:
-            x: Input tensor of shape [num_points, in_channels]
-            
-        Returns:
-            Output tensor of shape [num_points, out_channels]
-        """
-        # Convert to Conv1d format: [num_points, channels] -> [1, channels, num_points]
         x_conv = x.unsqueeze(0).transpose(1, 2)
         
-        # Skip connection
         if self.use_skip:
             residual = x
         else:
             residual_conv = self.shortcut(x_conv)
             residual = residual_conv.transpose(1, 2).squeeze(0)
         
-        # Main branch
         out = self.expand(x_conv)
         out = self.depthwise(out) 
         out = self.project(out)
         
-        # Convert back to point cloud format: [1, channels, num_points] -> [num_points, channels]
         out = out.transpose(1, 2).squeeze(0)
         
-        # Apply stochastic depth to main branch
-        out = self.stochastic_depth(out)
-        
-        # Residual connection and final activation
-        out = out + residual
+        if self.use_skip:
+            out = self.drop_path(out)
+            out = out + residual
+        else:
+            out = out + residual
+            
         out = self.final_activation(out)
         
         return out
 
 
 class SAModule(torch.nn.Module):
-    def __init__(self, resolution, k, NN, num_blocks=1, start_layer_idx=0, total_layers=5, num_kernel_points=16, reverse_drop_schedule=False):
+    def __init__(self, resolution, k, NN, num_blocks=1, start_layer_idx=0, total_layers=5, num_kernel_points=16, learnable_kernels=False, expansion_factor=4, reverse_drop_schedule=False):
         super(SAModule, self).__init__()
         self.resolution = resolution
         self.k = k
@@ -218,24 +158,24 @@ class SAModule(torch.nn.Module):
             local_nn=MLP(NN),
             global_nn=None,
             add_self_loops=False,
-            num_kernel_points=num_kernel_points
+            num_kernel_points=num_kernel_points,
+            learnable_kernels=learnable_kernels
         )
         
         self.residual_blocks = nn.ModuleList([
             InvertedResidualBlock(
                 NN[-1], 
                 NN[-1],
-                expansion_factor=4,  # Reduced from 4x to 2x
+                expansion_factor=expansion_factor,
                 layer_idx=start_layer_idx + i,
                 total_layers=total_layers, 
                 max_drop_rate=0.5,
-                reverse_drop_schedule=True
+                min_drop_rate=0.1
             ) 
             for i in range(num_blocks)
         ])
 
-        self.se = SqueezeExcite(NN[-1], reduction=4)
-
+        self.se = SqueezeExcite(NN[-1], reduction=8, dropout=0.1)
         
     def voxelsample(self, pos, batch, resolution):
         voxel_indices = voxel_grid(pos, resolution, batch)
@@ -299,26 +239,15 @@ class STEM(torch.nn.Module):
         x = self.conv(x, (pos_scaled, pos_scaled), edge_index)
         return x, pos[:, :3], batch, reflectance, sf
 
-    
 class NetFull(torch.nn.Module):
-    def __init__(self, num_classes, C=32, num_kernel_points=16):
+    def __init__(self, num_classes, C=32, num_kernel_points=16, learnable_kernels=False):
         super(NetFull, self).__init__()
 
-        vx_1 = 0.02 * 1.618 # 0.03236
-        vx_2 = vx_1 * 1.618 # 0.05242
-        vx_3 = vx_2 * 1.618 # 0.08466
-        vx_4 = vx_3 * 1.618 # 0.13684
+        vx_1 = 0.02 * 1.618
+        vx_2 = vx_1 * 1.618
+        vx_3 = vx_2 * 1.618
+        vx_4 = vx_3 * 1.618
 
-        # KPConv-X progression function
-        def square_progression(base_C):
-            """Generate KPConv-X style progression: C → 1.5C → 1.33*1.5C → 1.5*1.33*1.5C → 1.33*1.5*1.33*1.5C"""
-            C0 = base_C
-            C1 = int(C0 * 1.5)  # 1.5x
-            C2 = int(C1 * 1.33)  # 1.33x
-            C3 = int(C2 * 1.5)   # 1.5x
-            C4 = int(C3 * 1.33)  # 1.33x
-            return C0, C1, C2, C3, C4
-        
         def double_progression(base_C):
             C0 = base_C
             C1 = int(C0 * 2)
@@ -327,28 +256,27 @@ class NetFull(torch.nn.Module):
             C4 = int(C3 * 2)
             return C0, C1, C2, C3, C4
         
-        # Generate progression
-        C0, C1, C2, C3, C4 = double_progression(C) # 64, 128, 256, 512, 1024
+        C0, C1, C2, C3, C4 = double_progression(C)
 
-        total_blocks = 9        
+        total_blocks = 10        
         current_layer_idx = 0
 
-        self.stem = STEM(8, [4, C0 //2, C0])  # 4 channels: 3D relative pos + 1D distance
+        self.stem = STEM(8, [4, C0 //2, C0])
 
-        self.sa1_module = SAModule(vx_1, 16, [(C0 + 5) * num_kernel_points, (C0 + 5) * num_kernel_points // 2, C1], num_blocks=2, 
-                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points)
+        self.sa1_module = SAModule(vx_1, 16, [(C0 + 5) * num_kernel_points, (C0 + 5) * num_kernel_points // 2, C1], num_blocks=2, learnable_kernels=learnable_kernels,
+                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points, expansion_factor=4)
         current_layer_idx += 2
         
-        self.sa2_module = SAModule(vx_2, 16, [(C1 + 5) * num_kernel_points, (C1 + 5) * num_kernel_points // 2, C2], num_blocks=4, 
-                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points)
+        self.sa2_module = SAModule(vx_2, 16, [(C1 + 5) * num_kernel_points, (C1 + 5) * num_kernel_points // 2, C2], num_blocks=6, learnable_kernels=learnable_kernels,
+                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points, expansion_factor=4)
         current_layer_idx += 4    
         
-        self.sa3_module = SAModule(vx_3, 16, [(C2 + 5) * num_kernel_points, (C2 + 5) * num_kernel_points // 2, C3], num_blocks=2, 
-                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points)
+        self.sa3_module = SAModule(vx_3, 16, [(C2 + 5) * num_kernel_points, (C2 + 5) * num_kernel_points // 2, C3], num_blocks=1, learnable_kernels=learnable_kernels,
+                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points, expansion_factor=4)
         current_layer_idx += 2
         
-        self.sa4_module = SAModule(vx_4, 16, [(C3 + 5) * num_kernel_points, (C3 + 5) * num_kernel_points // 2, C4], num_blocks=1, 
-                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points)
+        self.sa4_module = SAModule(vx_4, 16, [(C3 + 5) * num_kernel_points, (C3 + 5) * num_kernel_points // 2, C4], num_blocks=1, learnable_kernels=learnable_kernels,
+                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points, expansion_factor=4)
         
         self.fp4_module = FPModule(1, [C4 + C3, C4, C4])
         self.fp3_module = FPModule(1, [C4 + C2, C4, C4])
@@ -359,13 +287,12 @@ class NetFull(torch.nn.Module):
         self.feat_head = torch.nn.Conv1d(C4, 32, 1)
         self.conv2 = torch.nn.Conv1d(C4, num_classes, 1)
         self.norm = nn.GroupNorm(min(32, C4), C4)
+        
 
         initialize_weights(self)
 
     def forward(self, data, return_feats: bool = False):
-        
         sa0_out = (data.x, data.pos, data.batch, data.reflectance, data.sf)
-
         sa0_out = self.stem(*sa0_out)
 
         sa1_out = self.sa1_module(*sa0_out)
@@ -382,20 +309,21 @@ class NetFull(torch.nn.Module):
         x = F.leaky_relu(self.norm(x))                       
 
         feat32 = torch.squeeze(self.feat_head(x)).to(torch.float)  
-        logits = torch.squeeze(self.conv2(x)).to(torch.float)     
+        logits = torch.squeeze(self.conv2(x)).to(torch.float)
+        
 
         if return_feats:
             return logits, feat32
         return logits
     
 class NetLight(torch.nn.Module):
-    def __init__(self, num_classes, C=8, num_kernel_points=16):
+    def __init__(self, num_classes, C=8, num_kernel_points=16, learnable_kernels=False):
         super(NetLight, self).__init__()
 
-        vx_1 = 0.02 * 1.618 # 0.03236
-        vx_2 = vx_1 * 1.618 # 0.05242
-        vx_3 = vx_2 * 1.618 # 0.08466
-        vx_4 = vx_3 * 1.618 # 0.13684
+        vx_1 = 0.02 * 1.618
+        vx_2 = vx_1 * 1.618
+        vx_3 = vx_2 * 1.618
+        vx_4 = vx_3 * 1.618
 
         sqrt2 = 1.414
         def round_to_power_of_2(x):
@@ -403,18 +331,14 @@ class NetLight(torch.nn.Module):
 
         C0h = int(C * sqrt2)                  
         C0 = round_to_power_of_2(C0h * sqrt2)
-
         C1h = int(C0 * sqrt2)                
         C1 = round_to_power_of_2(C1h * sqrt2) 
-
         C2h = int(C1 * sqrt2)                
         C2 = round_to_power_of_2(C2h * sqrt2)
-
         C3h = int(C2 * sqrt2)              
         C3 = round_to_power_of_2(C3h * sqrt2) 
         C4h = int(C3 * sqrt2)                
-
-        C4 = round_to_power_of_2(C4h * sqrt2) #
+        C4 = round_to_power_of_2(C4h * sqrt2)
         
         total_blocks = 5        
         current_layer_idx = 0
@@ -422,19 +346,19 @@ class NetLight(torch.nn.Module):
         self.stem = STEM(8, [4, C0h, C0])
 
         self.sa1_module = SAModule(vx_1, 16, [(C0 + 5) * num_kernel_points, C1h, C1], num_blocks=1, 
-                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points)
+                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points, learnable_kernels=learnable_kernels, expansion_factor=2)
         current_layer_idx += 1
         
         self.sa2_module = SAModule(vx_2, 16, [(C1 + 5) * num_kernel_points, C2h, C2], num_blocks=2, 
-                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points)
+                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points, learnable_kernels=learnable_kernels, expansion_factor=2)
         current_layer_idx += 2  
         
         self.sa3_module = SAModule(vx_3, 16, [(C2 + 5) * num_kernel_points, C3h, C3], num_blocks=1, 
-                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points)
+                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points, learnable_kernels=learnable_kernels, expansion_factor=2)
         current_layer_idx += 1  
         
         self.sa4_module = SAModule(vx_4, 16, [(C3 + 5) * num_kernel_points, C4h, C4], num_blocks=1, 
-                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points)
+                                  start_layer_idx=current_layer_idx, total_layers=total_blocks, num_kernel_points=num_kernel_points, learnable_kernels=learnable_kernels, expansion_factor=2)
         
         self.fp4_module = FPModule(1, [C4 + C3, C4, C4])
         self.fp3_module = FPModule(1, [C4 + C2, C4, C4])
@@ -445,13 +369,12 @@ class NetLight(torch.nn.Module):
         self.feat_head = torch.nn.Conv1d(C4, 32, 1)
         self.conv2 = torch.nn.Conv1d(C4, num_classes, 1)
         self.norm = nn.GroupNorm(min(32, C4), C4)
+        
 
         initialize_weights(self)
 
     def forward(self, data, return_feats: bool = False):
-        
         sa0_out = (data.x, data.pos, data.batch, data.reflectance, data.sf)
-
         sa0_out = self.stem(*sa0_out)
 
         sa1_out = self.sa1_module(*sa0_out)
@@ -468,7 +391,8 @@ class NetLight(torch.nn.Module):
         x = F.leaky_relu(self.norm(x))                       
 
         feat32 = torch.squeeze(self.feat_head(x)).to(torch.float)  
-        logits = torch.squeeze(self.conv2(x)).to(torch.float)     
+        logits = torch.squeeze(self.conv2(x)).to(torch.float)
+        
 
         if return_feats:
             return logits, feat32
