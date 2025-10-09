@@ -179,7 +179,7 @@ The model will append two new columns to your point cloud:
 
 ### Available Models
 
-#### **EU Models (67M parameters)**
+#### **EU Models (18.7M parameters)**
 - **`fbeta-eu.pth`**: F-beta optimized model with slight preference for precision (β = 0.9)
   - Best for applications where precision is slightly more important than recall
   - Trained on European forest data with reflectance integration
@@ -193,26 +193,22 @@ The model will append two new columns to your point cloud:
   - Maintains high performance using spatial features alone
   - Compatible with any TLS data regardless of reflectance availability
 
-#### **Biome-Specific Models (3.5M parameters)**
-Lightweight models optimized for specific biomes:
-- **`fbeta-spain.pth`**: F-beta optimized model for Spanish forests
-- **`fbeta-poland.pth`**: F-beta optimized model for Polish forests
-- **`fbeta-finland.pth`**: F-beta optimized model for Finnish forests
-
-#### **Knowledge Distilled Models (2.0M parameters)**
+#### **Knowledge Distilled Biome-Specific Models (565k parameters)**
 Ultra-lightweight models created through knowledge distillation from the full EU models:
-- **33.2x parameter compression** compared to full EU models (67M → 2.0M parameters)
+- **`fbeta-spain.pth`**: F-beta optimized distilled model for Spanish forests
+- **`fbeta-poland.pth`**: F-beta optimized distilled model for Polish forests
+- **`fbeta-finland.pth`**: F-beta optimized distilled model for Finnish forests
+
+**Compression Achievements:**
+- **33.2x parameter compression** compared to full EU models (18.7M → 565k parameters)
 - **10x faster inference** while maintaining competitive accuracy
 - **Minimal memory footprint** ideal for edge deployment and resource-constrained environments
 - Uses **semantic distillation** with edge-aware label smoothing for knowledge transfer
 - **PointCutMix augmentation** for robust training on mixed wood/leaf boundaries
 
-*Distilled models coming soon - optimized for production deployment scenarios.*
-
 **Model Selection Guide:**
 - **Use EU models** for general European forest applications requiring highest accuracy
-- **Use biome-specific models** for targeted regions (faster inference, smaller memory footprint)
-- **Use distilled models** for production deployment, edge computing, or real-time applications
+- **Use biome-specific distilled models** for targeted regions with fast inference and minimal memory footprint
 - **Use `fbeta-eu.pth`** for best overall performance with reflectance
 - **Use `fbeta-harmonic-eu.pth`** for enhanced boundary detection
 - **Use `fbeta-xyz-eu.pth`** when reflectance data is unavailable 
