@@ -72,7 +72,8 @@ class PointNetConv(MessagePassing):
     def message(self, x_j: Optional[Tensor], pos_i: Tensor,
                     pos_j: Tensor, edge_index_i: Tensor) -> Tensor:
             
-            msg = torch.zeros((pos_j.size(0), 4), device=pos_j.device)  # 3D relative pos + 1D distance
+            # XYZ-only: 3D relative pos + 1D distance 
+            msg = torch.zeros((pos_j.size(0), 4), device=pos_j.device)  
             
             relative_pos = (pos_j[:, :3] - pos_i[:, :3]) 
             distances = torch.norm(relative_pos, dim=1, keepdim=True)
@@ -87,13 +88,8 @@ class PointNetConv(MessagePassing):
             
             msg[:, :3] = relative_pos
             msg[:, 3] = distances.squeeze(-1)
-            
-            # Only use geometric features, no reflectance in STEM
-            # msg[:, 3] = pos_j[:, 3]  # Removed reflectance access
         
-            # Ignore input features x_j, only use geometric features
-            # if x_j is not None:
-            #     msg = torch.cat([x_j, msg], dim=1)
+            # Apply local MLP with dropout for regularization
             if self.local_nn is not None:
                 msg = self.local_nn(msg)
             return msg

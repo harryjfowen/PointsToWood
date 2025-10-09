@@ -52,12 +52,13 @@ class MetricsTracker:
         with torch.no_grad():
             probs = torch.sigmoid(outputs)
             preds = (probs >= 0.50).int()
-            y_true = targets.cpu().numpy().astype(int)
+            # Handle soft labels by thresholding back to hard targets for metrics
+            y_true = (targets >= 0.5).cpu().numpy().astype(int)
             y_pred = preds.cpu().numpy().astype(int)
             
             acc, prec, rec, f1, miou, prw, rew, fbeta = calculate_metrics(y_true, y_pred)
             
-            self.loss += loss.item()
+            self.loss += loss.item() if hasattr(loss, 'item') else loss
             self.accuracy += acc
             self.precision += prec
             self.recall += rec
@@ -83,12 +84,13 @@ class MetricsTracker:
             smoothed = (w_sum / w_cnt).clamp(0, 1) 
             
             preds = (smoothed >= 0.50).type(torch.int64).detach()
-            y_true = targets.cpu().numpy().astype(int)
+            # Handle soft labels by thresholding back to hard targets for metrics
+            y_true = (targets >= 0.5).cpu().numpy().astype(int)
             y_pred = preds.cpu().numpy().astype(int)
             
             acc, prec, rec, f1, miou, prw, rew, fbeta = calculate_metrics(y_true, y_pred)
             
-            self.loss += loss.item()
+            self.loss += loss.item() if hasattr(loss, 'item') else loss
             self.accuracy += acc
             self.precision += prec
             self.recall += rec
@@ -245,15 +247,12 @@ class WandbLogger:
         }
         
         if test_metrics:
-            log_dict.update({
-                "Test Accuracy": np.around(test_metrics['accuracy'], 4),
-                "Test Precision": np.around(test_metrics['precision'], 4),
-                "Test Recall": np.around(test_metrics['recall'], 4),
-                "Test F1": np.around(test_metrics['f1'], 4),
-                "Test Fbeta": np.around(test_metrics['fbeta'], 4),
-                "Test mIoU": np.around(test_metrics['miou'], 4),
-                "Test Precision_wood": np.around(test_metrics['precision_wood'], 4),
-                "Test Recall_wood": np.around(test_metrics['recall_wood'], 4)
-            })
+            # Focus on fbeta metrics since they work best for deployment
+            if 'fbeta_no_refl' in test_metrics:
+                log_dict.update({
+                    "Fbeta With Refl": np.around(test_metrics.get('fbeta_with_refl', 0), 4),
+                    "Fbeta No Refl (XYZ)": np.around(test_metrics['fbeta_no_refl'], 4),
+                    "Fbeta Harmonic": np.around(test_metrics.get('harmonic_fbeta', 0), 4)
+                })
         
         self.wandb.log(log_dict) 

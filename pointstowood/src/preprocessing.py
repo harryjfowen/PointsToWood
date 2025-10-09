@@ -8,11 +8,12 @@ from src.utils import (
     quantile_normalize_reflectance,
     minmax_normalize_reflectance,
     downsample_points,
+    downsample_points_max,
     create_point_grid
 )
 
 class Voxelise:
-    def __init__(self, pos, vxpath, minpoints=512, maxpoints=9999999, gridsize=[2.0, 4.0], pointspacing=None, overlap: float = 0.0):
+    def __init__(self, pos, vxpath, minpoints=512, maxpoints=9999999, gridsize=[2.0, 4.0], pointspacing=None, overlap: float = 0.0, grid_method: str = 'mean'):
         """
         Initialize the voxelization process.
         
@@ -31,9 +32,12 @@ class Voxelise:
         self.gridsize = gridsize
         self.overlap = overlap
         self.pointspacing = pointspacing
+        self.grid_method = grid_method
     
     def downsample(self):
         """Downsample point cloud to specified spacing."""
+        if self.grid_method == 'max':
+            return downsample_points_max(self.pos, self.pointspacing)
         return downsample_points(self.pos, self.pointspacing)
     
     def grid(self):
@@ -43,7 +47,6 @@ class Voxelise:
             self.gridsize,
             min_points=self.minpoints,
             max_points=self.maxpoints,
-            overlap=self.overlap,
         )
     
     def write_voxels(self):
@@ -51,48 +54,69 @@ class Voxelise:
         if not isinstance(self.pos, torch.Tensor):
             self.pos = torch.tensor(self.pos.values, dtype=torch.float).to(device='cuda')
 
-        if self.pointspacing:
-            self.pos = self.downsample()
-
-        reflectance_not_zero = self.pos.shape[1] > 3 and not torch.all(self.pos[:, 3] == 0)
-        
-        if reflectance_not_zero:
-            self.pos[:, 3] = minmax_normalize_reflectance(self.pos[:, 3])
-
-        voxels = self.grid()
-
-        if reflectance_not_zero:
-            weight = self.pos[:, 3] - self.pos[:, 3].min()
-            mask = ~(torch.isnan(weight) | torch.isinf(weight))
-            self.pos, weight = self.pos[mask], weight[mask]
-            if weight.sum() == 0:
-                raise ValueError("All weights are invalid. Check the reflectance values.")
-            weight = weight + 1e-8
-            weight = weight.detach().to('cpu')
-        else:
-            weight = None
-
-        self.pos = self.pos.detach().clone().to('cpu')
-        
+        original_pos = self.pos.clone()
         file_counter = len(glob.glob(os.path.join(self.vxpath, 'voxel_*.pt')))
 
-        for _, voxel_indices in enumerate(tqdm(voxels, desc='Writing voxels')):
-            if voxel_indices.size(0) == 0:
-                continue  
+        for grid_size in self.gridsize:
+            # Reset to original before per-grid processing
+            self.pos = original_pos.clone()
 
-            if voxel_indices.size(0) > self.maxpoints:
-                if reflectance_not_zero:
-                    voxel_indices = voxel_indices[torch.multinomial(weight[voxel_indices], self.maxpoints)]
-                else:
-                    voxel_indices = voxel_indices[torch.randint(0, voxel_indices.size(0), (self.maxpoints,))]
-            
-            voxel = self.pos[voxel_indices]
-            voxel = voxel[~torch.isnan(voxel).any(dim=1)]
-            
-            torch.save(voxel, os.path.join(self.vxpath, f'voxel_{file_counter}.pt'))
-            file_counter += 1
-        
-        del voxel, voxel_indices, weight, self.pos
+            # Decide spacing: fixed if provided (>0), else adaptive per grid
+            spacing = self.pointspacing if (self.pointspacing is not None and self.pointspacing > 0) else (grid_size / 100.0)
+            self.pointspacing = spacing
+            self.pos = self.downsample()
+
+            reflectance_not_zero = self.pos.shape[1] > 3 and not torch.all(self.pos[:, 3] == 0)
+            if reflectance_not_zero:
+                self.pos[:, 3] = minmax_normalize_reflectance(self.pos[:, 3])
+
+            # Build voxels for this grid size only
+            voxels = create_point_grid(self.pos, [grid_size], min_points=self.minpoints, max_points=self.maxpoints)
+
+            pos_cpu = self.pos.detach().clone().to('cpu')
+
+            for _, voxel_indices in enumerate(tqdm(voxels, desc=f'Writing {grid_size}m voxels')):
+                if voxel_indices.size(0) == 0:
+                    continue
+
+                # Subsample if too many points (reflectance-weighted if available)
+                if voxel_indices.size(0) > self.maxpoints:
+                    if reflectance_not_zero:
+                        try:
+                            voxel_weights = pos_cpu[voxel_indices, 3]
+                            voxel_weights = torch.nan_to_num(voxel_weights, nan=0.0, posinf=0.0, neginf=0.0)
+                            # Shift to positive range
+                            voxel_weights = voxel_weights - voxel_weights.min()
+                            voxel_weights = voxel_weights + 1e-8
+                            if torch.all(voxel_weights == 0) or torch.any(~torch.isfinite(voxel_weights)):
+                                sample_idx = torch.randint(0, voxel_indices.size(0), (self.maxpoints,))
+                            else:
+                                sample_idx = torch.multinomial(voxel_weights, num_samples=self.maxpoints, replacement=False)
+                            voxel_indices = voxel_indices[sample_idx]
+                        except Exception:
+                            voxel_indices = voxel_indices[torch.randint(0, voxel_indices.size(0), (self.maxpoints,))]
+                    else:
+                        voxel_indices = voxel_indices[torch.randint(0, voxel_indices.size(0), (self.maxpoints,))]
+
+                voxel = pos_cpu[voxel_indices]
+                if voxel.numel() == 0:
+                    continue
+
+                # Drop NaN rows
+                voxel = voxel[~torch.isnan(voxel).any(dim=1)]
+                if voxel.size(0) == 0:
+                    continue
+
+                # Ensure voxel still meets minimum points requirement after NaN removal
+                if voxel.size(0) < self.minpoints:
+                    continue
+
+                torch.save(voxel, os.path.join(self.vxpath, f'voxel_{file_counter}.pt'))
+                file_counter += 1
+
+            del voxels, pos_cpu
+
+        del original_pos, self.pos
         clear_gpu_memory()
         return -1
 
@@ -105,5 +129,6 @@ def preprocess(args):
         maxpoints=args.max_pts, 
         pointspacing=args.resolution, 
         gridsize=args.grid_size,
-        overlap=args.overlap
+        overlap=getattr(args, 'overlap', 0.0),
+        grid_method=getattr(args, 'grid_method', 'mean')
     ).write_voxels()

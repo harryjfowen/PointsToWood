@@ -219,8 +219,6 @@ cython_debug/
 *.tflite
 *.pt
 *.pytorch
-!model/
-!model/*.pth
 
 # Data files
 *.csv
@@ -231,6 +229,7 @@ cython_debug/
 *.parquet
 *.feather
 *.arrow
+*.bin
 
 # IDE files
 .vscode/
@@ -274,3 +273,6 @@ checkpoints/
 saves/
 *.ckpt
 *.safetensors
+
+# Archive folder
+archive/

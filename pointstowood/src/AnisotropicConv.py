@@ -149,8 +149,6 @@ class AnisotropicConv(MessagePassing):
         weighted_reflectance = (pos_j[:, 3] * reflectance_weight).unsqueeze(-1)
         feat_list.append(weighted_reflectance)
 
-        #
-
         feat_list.append(rel_pos)
         feat_list.append(dists)
         feat = torch.cat(feat_list, dim=-1).unsqueeze(-1)
