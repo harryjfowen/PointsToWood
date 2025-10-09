@@ -18,6 +18,8 @@ This branch contains the latest version with significant architectural improveme
 - **Squeeze-Excitation (SE) Channel Attention** for adaptive feature recalibration
 - **Adaptive Receptive Field Scaling** with learnable ρ parameters
 - **Cyclical Edge Weighted Focal Loss** for better training stability and convergence
+- **PointCutMix Augmentation** for realistic wood/leaf boundary mixing
+- **Knowledge Distillation** with semantic distillation and edge-aware label smoothing
 - **Enhanced Data Processing** with denoising and efficient batching
 - **Robust Multimodal Learning** handling both geometric and reflectance data
 
@@ -82,16 +84,17 @@ git lfs install
   ```bash
   git lfs pull
   ```
-- **Only EU models (~200MB):**
+- **Only EU models (~230MB):**
   ```bash
   git lfs pull --include="pointstowood/model/fbeta-eu.pth"
-  git lfs pull --include="pointstowood/model/ba-eu.pth"
+  git lfs pull --include="pointstowood/model/fbeta-harmonic-eu.pth"
+  git lfs pull --include="pointstowood/model/fbeta-xyz-eu.pth"
   ```
-- **Only biome models (~100MB):**
+- **Only biome models (~7MB):**
   ```bash
-  git lfs pull --include="pointstowood/model/ba-spain.pth"
-  git lfs pull --include="pointstowood/model/ba-poland.pth"
-  git lfs pull --include="pointstowood/model/ba-finland.pth"
+  git lfs pull --include="pointstowood/model/fbeta-spain.pth"
+  git lfs pull --include="pointstowood/model/fbeta-poland.pth"
+  git lfs pull --include="pointstowood/model/fbeta-finland.pth"
   ```
 - **A specific model:**
   ```bash
@@ -121,29 +124,41 @@ cd ~/PointsToWood/pointstowood/
 
 **EU Models (Recommended for General Use):**
 ```bash
-# Precision-focused model
-python3 predict.py --point-cloud ~/PointsToWood/pointstowood/data/eu_eval/uk01_lw_pl_3.ply --model fbeta-eu.pth --batch-size 4 --any-wood 0.50 --grid-size 2.0 3.0 --resolution 0.02 --min-pts 512 --max-pts 16384
+# F-beta optimized model with reflectance (recommended)
+python3 predict.py --file your_data.ply --model fbeta-eu.pth
 
-# Balanced accuracy model
-python3 predict.py --point-cloud ~/PointsToWood/pointstowood/data/eu_eval/uk01_lw_pl_3.ply --model ba-eu.pth --batch-size 4 --any-wood 0.50 --grid-size 2.0 3.0 --resolution 0.02 --min-pts 512 --max-pts 16384
+# Harmonic mean optimized model
+python3 predict.py --file your_data.ply --model fbeta-harmonic-eu.pth
+
+# XYZ-only model (no reflectance required)
+python3 predict.py --file your_data.ply --model fbeta-xyz-eu.pth
 ```
 
 **Biome-Specific Models (Faster Inference):**
 ```bash
 # Spanish forests
-python3 predict.py --point-cloud your_data.ply --model ba-spain.pth --batch-size 8 --any-wood 0.50 --grid-size 2.0 --resolution 0.02 --min-pts 512 --max-pts 16384
+python3 predict.py --file your_data.ply --model fbeta-spain.pth
 
 # Polish forests
-python3 predict.py --point-cloud your_data.ply --model ba-poland.pth --batch-size 8 --any-wood 0.50 --grid-size 2.0 --resolution 0.02 --min-pts 512 --max-pts 16384
+python3 predict.py --file your_data.ply --model fbeta-poland.pth
 
 # Finnish forests
-python3 predict.py --point-cloud your_data.ply --model ba-finland.pth --batch-size 8 --any-wood 0.50 --grid-size 2.0 --resolution 0.02 --min-pts 512 --max-pts 16384
+python3 predict.py --file your_data.ply --model fbeta-finland.pth
 ```
 
 **Detection Strategies:**
 - **`--any-wood`**: Aggressive wood detection - classifies as wood if ANY neighbor exceeds threshold
 - **`--is-wood`**: Conservative wood detection - classifies as wood if ALL neighbors exceed threshold
 - **`--max-probabilities`**: Uses most confident prediction in each neighborhood
+
+## Knowledge Distillation Training
+
+To train your own distilled models using knowledge distillation:
+
+```bash
+# Train a lightweight distilled model from EU teacher
+python3 distill.py --teacher-model model/fbeta-eu.pth --data-path your_training_data/
+```
 
 ## Data Requirements
 
@@ -165,26 +180,42 @@ The model will append two new columns to your point cloud:
 ### Available Models
 
 #### **EU Models (67M parameters)**
-- **`fbeta-eu.pth`**: F1-optimized model with slight preference for precision (β = 0.9)
+- **`fbeta-eu.pth`**: F-beta optimized model with slight preference for precision (β = 0.9)
   - Best for applications where precision is slightly more important than recall
-  - Trained on European forest data
+  - Trained on European forest data with reflectance integration
   - Recommended for most use cases
-- **`ba-eu.pth`**: Balanced accuracy optimized model
-  - Optimized for balanced accuracy across all classes
-  - Good general-purpose model for European forests
-  - Equal emphasis on precision and recall
+- **`fbeta-harmonic-eu.pth`**: F-beta model with harmonic mean optimization
+  - Optimized using harmonic mean of precision and recall
+  - Enhanced performance on challenging mixed boundaries
+  - Advanced reflectance attention weighting
+- **`fbeta-xyz-eu.pth`**: F-beta model using only XYZ coordinates
+  - Geometry-only model for data without reflectance information
+  - Maintains high performance using spatial features alone
+  - Compatible with any TLS data regardless of reflectance availability
 
 #### **Biome-Specific Models (3.5M parameters)**
 Lightweight models optimized for specific biomes:
-- **`ba-spain.pth`**: Balanced accuracy model for Spanish forests
-- **`ba-poland.pth`**: Balanced accuracy model for Polish forests  
-- **`ba-finland.pth`**: Balanced accuracy model for Finnish forests
+- **`fbeta-spain.pth`**: F-beta optimized model for Spanish forests
+- **`fbeta-poland.pth`**: F-beta optimized model for Polish forests
+- **`fbeta-finland.pth`**: F-beta optimized model for Finnish forests
+
+#### **Knowledge Distilled Models (2.0M parameters)**
+Ultra-lightweight models created through knowledge distillation from the full EU models:
+- **33.2x parameter compression** compared to full EU models (67M → 2.0M parameters)
+- **10x faster inference** while maintaining competitive accuracy
+- **Minimal memory footprint** ideal for edge deployment and resource-constrained environments
+- Uses **semantic distillation** with edge-aware label smoothing for knowledge transfer
+- **PointCutMix augmentation** for robust training on mixed wood/leaf boundaries
+
+*Distilled models coming soon - optimized for production deployment scenarios.*
 
 **Model Selection Guide:**
-- **Use EU models** for general European forest applications
+- **Use EU models** for general European forest applications requiring highest accuracy
 - **Use biome-specific models** for targeted regions (faster inference, smaller memory footprint)
-- **Use `fbeta-eu.pth`** when precision is slightly more important
-- **Use `ba-*` models** when balanced performance is desired 
+- **Use distilled models** for production deployment, edge computing, or real-time applications
+- **Use `fbeta-eu.pth`** for best overall performance with reflectance
+- **Use `fbeta-harmonic-eu.pth`** for enhanced boundary detection
+- **Use `fbeta-xyz-eu.pth`** when reflectance data is unavailable 
 
 
 ### References 
