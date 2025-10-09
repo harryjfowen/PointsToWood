@@ -148,7 +148,7 @@ python3 predict.py --file your_data.ply --model fbeta-finland.pth
 
 **Detection Strategies:**
 - **`--any-wood`**: Aggressive wood detection - classifies as wood if ANY neighbor exceeds threshold
-- **`--is-wood`**: Conservative wood detection - classifies as wood if ALL neighbors exceed threshold
+- **`--is-wood`**: Conservative wood detection - classifies as wood if the MEAN exceeds threshold
 - **`--max-probabilities`**: Uses most confident prediction in each neighborhood
 
 ## Knowledge Distillation Training
