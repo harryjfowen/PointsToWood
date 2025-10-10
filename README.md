@@ -18,8 +18,9 @@ This branch contains the latest version with significant architectural improveme
 - **Squeeze-Excitation (SE) Channel Attention** for adaptive feature recalibration
 - **Adaptive Receptive Field Scaling** with learnable ρ parameters
 - **Cyclical Edge Weighted Focal Loss** for better training stability and convergence
-- **PointCutMix Augmentation** for realistic wood/leaf boundary mixing
-- **Knowledge Distillation** with semantic distillation and edge-aware label smoothing
+- **PointCutMix Augmentation** on mono-label samples for realistic boundary mixing
+- **Knowledge Distillation** with semantic distillation
+- **Edge-aware Weighted Loss** for challenging boundary regions
 - **Enhanced Data Processing** with denoising and efficient batching
 - **Robust Multimodal Learning** handling both geometric and reflectance data
 
@@ -201,10 +202,12 @@ Ultra-lightweight models created through knowledge distillation from the full EU
 
 **Compression Achievements:**
 - **33.2x parameter compression** compared to full EU models (18.7M → 565k parameters)
+- **Reduced kernel complexity**: 8 learnable kernel fields (vs 32 fixed in EU models)
 - **10x faster inference** while maintaining competitive accuracy
 - **Minimal memory footprint** ideal for edge deployment and resource-constrained environments
-- Uses **semantic distillation** with edge-aware label smoothing for knowledge transfer
-- **PointCutMix augmentation** for robust training on mixed wood/leaf boundaries
+- Uses **semantic distillation** for knowledge transfer
+- **Edge-aware weighted loss** for challenging boundary regions
+- **PointCutMix augmentation** on mono-label samples for robust mixed-boundary training
 
 **Model Selection Guide:**
 - **Use EU models** for general European forest applications requiring highest accuracy
