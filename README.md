@@ -17,7 +17,6 @@ This branch contains the latest version with significant architectural improveme
 - **Inverted Residual Blocks** for improved feature extraction and regularization
 - **Squeeze-Excitation (SE) Channel Attention** for adaptive feature recalibration
 - **Adaptive Receptive Field Scaling** with learnable ρ parameters
-- **Cyclical Edge Weighted Focal Loss** for better training stability and convergence
 - **PointCutMix Augmentation** on mono-label samples for realistic boundary mixing
 - **Knowledge Distillation** with semantic distillation
 - **Edge-aware Weighted Loss** for challenging boundary regions
@@ -203,7 +202,6 @@ Ultra-lightweight models created through knowledge distillation from the full EU
 **Compression Achievements:**
 - **33.2x parameter compression** compared to full EU models (18.7M → 565k parameters)
 - **Reduced kernel complexity**: 8 learnable kernel fields (vs 32 fixed in EU models)
-- **10x faster inference** while maintaining competitive accuracy
 - **Minimal memory footprint** ideal for edge deployment and resource-constrained environments
 - Uses **semantic distillation** for knowledge transfer
 - **Edge-aware weighted loss** for challenging boundary regions
