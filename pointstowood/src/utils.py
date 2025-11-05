@@ -10,7 +10,6 @@ from torch_geometric.nn.pool.consecutive import consecutive_cluster
 from torch_geometric.utils import scatter
 from torch_scatter import scatter_add, scatter_max
 
-from src.point_sampling import VoxelSampling, VoxelSamplingMax, RandomSampling
 
 def configure_threads(num_procs: int) -> int:
     if num_procs is None or num_procs < 1:
