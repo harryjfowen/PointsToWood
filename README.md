@@ -125,25 +125,25 @@ cd ~/PointsToWood/pointstowood/
 **EU Models (Recommended for General Use):**
 ```bash
 # F-beta optimized model with reflectance (recommended)
-python3 predict.py --file your_data.ply --model fbeta-eu.pth
+python3 predict.py --point-cloud your_data.ply --model fbeta-eu.pth
 
 # Harmonic mean optimized model
-python3 predict.py --file your_data.ply --model fbeta-harmonic-eu.pth
+python3 predict.py --point-cloud your_data.ply --model fbeta-harmonic-eu.pth
 
 # XYZ-only model (no reflectance required)
-python3 predict.py --file your_data.ply --model fbeta-xyz-eu.pth
+python3 predict.py --point-cloud your_data.ply --model fbeta-xyz-eu.pth
 ```
 
 **Biome-Specific Models (Faster Inference):**
 ```bash
 # Spanish forests
-python3 predict.py --file your_data.ply --model fbeta-spain.pth
+python3 predict.py --point-cloud your_data.ply --model fbeta-spain.pth
 
 # Polish forests
-python3 predict.py --file your_data.ply --model fbeta-poland.pth
+python3 predict.py --point-cloud your_data.ply --model fbeta-poland.pth
 
 # Finnish forests
-python3 predict.py --file your_data.ply --model fbeta-finland.pth
+python3 predict.py --point-cloud your_data.ply --model fbeta-finland.pth
 ```
 
 **Detection Strategies:**
