@@ -95,3 +95,19 @@ dmypy.json
 # Temporary files
 *.tmp
 *.temp
+
+# Point cloud and large data files
+*.ply
+*.las
+*.laz
+*.pcd
+*.xyz
+*.bin
+
+# Image files outside of images folder
+/*.png
+/*.jpg
+/*.jpeg
+pointstowood/*.png
+pointstowood/*.jpg
+pointstowood/*.jpeg
