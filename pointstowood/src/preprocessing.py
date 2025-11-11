@@ -11,6 +11,7 @@ from src.utils import (
     downsample_points_max,
     create_point_grid
 )
+from src.memory_utils import should_use_cpu_preprocessing
 
 class Voxelise:
     def __init__(self, pos, vxpath, minpoints=512, maxpoints=9999999, gridsize=[2.0, 4.0], pointspacing=None, overlap: float = 0.0, grid_method: str = 'mean'):
@@ -52,7 +53,22 @@ class Voxelise:
     def write_voxels(self):
         """Process and write voxels to disk."""
         if not isinstance(self.pos, torch.Tensor):
-            self.pos = torch.tensor(self.pos.values, dtype=torch.float).to(device='cuda')
+            # Adaptive device selection based on memory requirements
+            point_count = len(self.pos)
+            has_reflectance = self.pos.shape[1] > 3
+
+            use_cpu, estimated_gpu_mem, available_gpu_mem = should_use_cpu_preprocessing(
+                point_count, has_reflectance, self.gridsize
+            )
+
+            if use_cpu:
+                device = 'cpu'
+                print(f"Large point cloud ({point_count:,} points, ~{estimated_gpu_mem:.1f}GB) - using CPU for preprocessing")
+            else:
+                device = 'cuda'
+                print(f"Point cloud fits in GPU memory (~{estimated_gpu_mem:.1f}GB) - using GPU for preprocessing")
+
+            self.pos = torch.tensor(self.pos.values, dtype=torch.float).to(device=device)
 
         original_pos = self.pos.clone()
         file_counter = len(glob.glob(os.path.join(self.vxpath, 'voxel_*.pt')))
@@ -73,7 +89,11 @@ class Voxelise:
             # Build voxels for this grid size only
             voxels = create_point_grid(self.pos, [grid_size], min_points=self.minpoints, max_points=self.maxpoints)
 
-            pos_cpu = self.pos.detach().clone().to('cpu')
+            # Only move to CPU if not already there to avoid unnecessary copying
+            if self.pos.device.type == 'cpu':
+                pos_cpu = self.pos.detach()
+            else:
+                pos_cpu = self.pos.detach().clone().to('cpu')
 
             for _, voxel_indices in enumerate(tqdm(voxels, desc=f'Writing {grid_size}m voxels')):
                 if voxel_indices.size(0) == 0:

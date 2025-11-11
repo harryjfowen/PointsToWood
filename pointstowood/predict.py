@@ -14,11 +14,12 @@ import numpy as np
 import re
 from src.io import load_file
 from src.utils import configure_threads
+from src.memory_utils import format_memory_info
 import psutil
 import gc
 
 class PerformanceTracker:
-    def __init__(self, process_name):
+    def __init__(self, process_name, reset_gpu_stats=True):
         self.process_name = process_name
         self.process = psutil.Process(os.getpid())
         self.start_time = time.perf_counter()
@@ -29,8 +30,11 @@ class PerformanceTracker:
 
         self.start_gpu = 0
         if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
+            # Only reset peak stats for inference, not preprocessing
+            if reset_gpu_stats:
+                torch.cuda.reset_peak_memory_stats()
             self.start_gpu = torch.cuda.memory_allocated() / (1024**3)
+            self.start_gpu_peak = torch.cuda.max_memory_allocated() / (1024**3)
 
     def finish(self):
         # Final measurements
@@ -51,7 +55,7 @@ class PerformanceTracker:
         duration = end_time - self.start_time
         cpu_peak_increase = end_rss_peak - self.start_rss_peak  # Peak memory increase during this stage
         cpu_current_increase = end_rss_current - self.start_rss_current  # Current memory increase
-        gpu_peak_used = gpu_peak - self.start_gpu
+        gpu_peak_used = max(gpu_peak - self.start_gpu_peak, gpu_peak - self.start_gpu)
 
         return {
             'name': self.process_name,
@@ -75,6 +79,7 @@ def get_path(location_in_pointstowood: str = "") -> str:
     if location_in_pointstowood:
         output_path = os.path.join(output_path, location_in_pointstowood)
     return output_path.replace("\\", "/")
+
 
 def preprocess_point_cloud_data(df, zero_reflectance=False):
     canon_map = {
@@ -242,10 +247,15 @@ if __name__ == '__main__':
         
         if args.verbose: print(f'Using model: {args.model} (type: {args.model_type}, reflectance: {args.reflectance})')
         
-        if args.verbose: print(f'Voxelising to {args.grid_size} grid sizes')
+        if args.verbose:
+            print(f'Voxelising to {args.grid_size} grid sizes')
+            # Show memory info for adaptive device selection
+            point_count = len(args.pc)
+            memory_info = format_memory_info(point_count, args.reflectance, args.grid_size, args.resolution)
+            print(memory_info)
 
-        # Track preprocessing performance
-        preprocessing_tracker = PerformanceTracker("Preprocessing")
+        # Track preprocessing performance - don't reset GPU stats to capture true peak
+        preprocessing_tracker = PerformanceTracker("Preprocessing", reset_gpu_stats=False)
         preprocess(args)
         preprocessing_stats = preprocessing_tracker.finish()
         all_preprocessing_stats.append(preprocessing_stats)
