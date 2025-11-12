@@ -30,23 +30,64 @@ def clear_gpu_memory():
     gc.collect()
     torch.cuda.empty_cache()
 
+def _compute_quantiles_chunked(tensor: Tensor, quantiles: List[float], chunk_size: int = 1_000_000) -> Tensor:
+    """Compute quantiles for large tensors by processing in chunks"""
+    device = tensor.device
+    n_samples = min(10_000_000, tensor.numel())  # Sample up to 10M points for quantile estimation
+
+    if tensor.numel() <= n_samples:
+        # Use all data if small enough
+        sample_tensor = tensor
+    else:
+        # Random sampling for very large tensors
+        indices = torch.randint(0, tensor.numel(), (n_samples,), device=device)
+        sample_tensor = tensor[indices]
+
+    # Move to CPU if tensor is large to avoid GPU memory issues
+    if sample_tensor.numel() > 5_000_000 and device.type == 'cuda':
+        sample_tensor = sample_tensor.cpu()
+        quantile_device = torch.device('cpu')
+    else:
+        quantile_device = device
+
+    try:
+        quantile_values = torch.quantile(sample_tensor, torch.tensor(quantiles, device=quantile_device))
+        return quantile_values.to(device)
+    except RuntimeError as e:
+        if "too large" in str(e):
+            # Fall back to CPU computation
+            sample_tensor = sample_tensor.cpu()
+            quantile_values = torch.quantile(sample_tensor, torch.tensor(quantiles, device='cpu'))
+            return quantile_values.to(device)
+        else:
+            raise
+
 def minmax_normalize_reflectance(reflectance_tensor: Tensor) -> Tensor:
     device = reflectance_tensor.device
-    
+
     if torch.isnan(reflectance_tensor).any():
         reflectance_tensor = torch.nan_to_num(reflectance_tensor, nan=0.0)
-    
-    q1, q3 = torch.quantile(reflectance_tensor, torch.tensor([0.01, 0.99], device=device))
+
+    # Use memory-efficient quantile calculation for large tensors
+    try:
+        q1, q3 = torch.quantile(reflectance_tensor, torch.tensor([0.01, 0.99], device=device))
+    except RuntimeError as e:
+        if "too large" in str(e):
+            quantile_values = _compute_quantiles_chunked(reflectance_tensor, [0.01, 0.99])
+            q1, q3 = quantile_values[0], quantile_values[1]
+        else:
+            raise
+
     iqr = q3 - q1
     lower_bound = q1 - 1.5 * iqr
     upper_bound = q3 + 1.5 * iqr
-    
+
     clipped_reflectance = torch.clamp(reflectance_tensor, lower_bound, upper_bound)
-    
+
     min_val = torch.min(clipped_reflectance)
     max_val = torch.max(clipped_reflectance)
     normalized_reflectance = 2 * (clipped_reflectance - min_val) / (max_val - min_val) - 1
-    
+
     return normalized_reflectance
 
 def quantile_normalize_reflectance(reflectance_tensor: Tensor) -> Tensor:
