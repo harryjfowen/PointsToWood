@@ -10,7 +10,7 @@
 
 ### Paper
 
-> **PointsToWood: A deep learning framework for complete canopy leaf-wood segmentation of TLS data across diverse European forests**
+> **PointsToWood: Reflectance-Modulated Anisotropic Convolutions for Leaf-Wood Segmentation Across Diverse Forest TLS Data**
 > Owen, H. J. F., Allen, M. J. A., Grieve, S. W. D., Wilkes, P., Lines, E. R. *(under review)*
 
 For the exact implementation described in the arXiv preprint, see the `version1.0-paper` branch:
@@ -95,10 +95,9 @@ python predict.py --point-cloud your_plot.ply --model h4mcc-eu.pth --no-reflecta
 python predict.py --point-cloud your_plot.ply --model h4mcc-fin.pth
 ```
 
-**Detection strategies:**
-- `--is-wood` — conservative: wood if mean neighbourhood probability exceeds threshold (default)
-- `--any-wood` — aggressive: wood if any neighbour exceeds threshold
-- `--max-probabilities` — uses most confident prediction per neighbourhood
+**Detection strategies (default: most confident prediction per neighbourhood, max |p−0.5|):**
+- `--is-wood 0.5` — wood if mean neighbourhood probability exceeds threshold
+- `--any-wood 0.5` — aggressive: wood if any neighbour exceeds threshold
 
 **Input requirements:**
 - Format: `.ply`
@@ -191,16 +190,15 @@ Same architecture as the teacher, compressed via channel width and block depth r
 
 ---
 
-## Evaluation — H4-MCC
+## Save Criterion — H4-MCC
 
-Models are saved on **H4-MCC**: the harmonic mean of Matthews Correlation Coefficient across four evaluation conditions:
+**H4-MCC** is the harmonic mean of MCC across four evaluation conditions (pure/edge × with/without reflectance). The harmonic mean penalises any weak condition disproportionately — a model that scores well on easy pure samples but degrades at boundaries or without reflectance cannot achieve a high H4-MCC.
 
-| | With reflectance | Without reflectance |
-|---|---|---|
-| All points | MCC | MCC |
-| Boundary points only | MCC | MCC |
+---
 
-This penalises models that degrade without reflectance, perform well on easy interior points but fail at boundaries, or overfit to a single sensor modality.
+## Results
+
+*Coming soon — results from the final trained model across European forest types.*
 
 ---
 

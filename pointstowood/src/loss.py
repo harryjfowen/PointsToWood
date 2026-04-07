@@ -43,7 +43,6 @@ class FocalLoss(nn.Module):
     def set_epoch(self, epoch: int, total_epochs: int):
         """Update gamma: 0 → gamma_max at pct_peak → 0 (front-loaded cycle)."""
         if self.cyclical and total_epochs > 0:
-            import math
             progress = epoch / total_epochs
 
             if progress < self.pct_peak:

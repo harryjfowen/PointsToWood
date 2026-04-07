@@ -9,7 +9,6 @@ import torch
 from src.io import save_file
 from collections import OrderedDict
 from numba import jit, prange
-import resource
 import psutil
 import gc
 from torch_geometric.nn import voxel_grid

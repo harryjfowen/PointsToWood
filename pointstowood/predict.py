@@ -212,8 +212,8 @@ if __name__ == '__main__':
                              'Set to 0 to auto-estimate.')
     parser.add_argument('--memory-fraction', type=float, default=0.7,
                         help='Fraction of GPU memory to use for batching (default: 0.7)')
-    parser.add_argument('--model', type=str, default='fbeta-eu.pth',
-                        help='Model checkpoint name inside pointstowood/model (default: fbeta-eu.pth)')
+    parser.add_argument('--model', type=str, default='h4mcc-eu.pth',
+                        help='Model checkpoint name inside pointstowood/model (default: h4mcc-eu.pth)')
     parser.add_argument('--output-fmt', default='ply', help="file type of output")
     parser.add_argument('--verbose', action='store_true', help="print stuff")
     parser.add_argument('--boost-perspective', action='store_true', default=False,

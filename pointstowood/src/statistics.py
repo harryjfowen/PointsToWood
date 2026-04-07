@@ -1,5 +1,12 @@
-_prev_summary_metrics = {}
-_best_summary_metrics = {}
+_prev_summary_metrics: dict = {}
+_best_summary_metrics: dict = {}
+
+
+def reset_metric_trackers():
+    """Reset epoch-over-epoch metric trackers. Call between training runs."""
+    global _prev_summary_metrics, _best_summary_metrics
+    _prev_summary_metrics = {}
+    _best_summary_metrics = {}
 
 
 def _metric_tag(name, value, higher_is_better=True, eps=1e-6):

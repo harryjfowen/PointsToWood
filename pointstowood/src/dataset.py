@@ -216,7 +216,7 @@ class TrainingDataset(Dataset, ABC):
         scaling_factor = torch.sqrt((pos ** 2).sum(dim=1)).max().clamp(min=1e-8)
 
         if torch.any(torch.isnan(reflectance)):
-            print('nans in relfectance')
+            print('nans in reflectance')
 
         if edge_scores_precomputed is not None:
             edge_scores = edge_scores_precomputed
