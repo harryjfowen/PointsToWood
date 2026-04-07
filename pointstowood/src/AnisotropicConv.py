@@ -1,5 +1,17 @@
+"""
+AnisotropicConv: Wood/leaf point conv — geometry-first, reflectance as flashlight.
+
+Geometry: Directional kernel routing (Fibonacci sphere) + density-normalized aggregation.
+Flashlight: D = M_refl - M_geom, where M_refl weights direction outer-products by local
+  reflectance contrast (absolute deviation from per-neighbourhood median). Sensor-agnostic:
+  a uniformly bright or dark neighbourhood gives r_local≈0 so M_refl≈0 and the gate suppresses.
+  Both bright and dark deviations count so dark twigs in bright canopy are detectable.
+Reflectance reliability gate: per-eigenvalue learned gate — scales eigvals(D) independently.
+Output: agg_feat (F*K) + eigvals_gated (3).
+"""
+
+import math
 from typing import Callable, Optional, Union
-from sparsemax import Sparsemax
 
 import torch
 from torch import Tensor
@@ -17,76 +29,103 @@ from torch_geometric.typing import (
     torch_sparse,
 )
 from torch_geometric.utils import add_self_loops, remove_self_loops
-from torch_scatter import scatter_max, scatter_add, scatter_mean
+from torch_scatter import scatter_max, scatter_add
 
 
-def fibonacci_sphere(n: int, radius: float = 1.0, dim: int = 3) -> Tensor:
+def fibonacci_sphere(n: int, radius: float = 1.0) -> Tensor:
+    """Kernel directions on unit sphere for routing."""
     if n == 1:
-        return torch.zeros(1, dim, dtype=torch.float32)
-    origin = torch.zeros(1, dim, dtype=torch.float32)
+        return torch.zeros(1, 3, dtype=torch.float32)
+    origin = torch.zeros(1, 3, dtype=torch.float32)
     indices = torch.arange(n - 1, dtype=torch.float32)
     phi = (indices + 0.5) * (torch.pi * (3 - torch.sqrt(torch.tensor(5.0))))
     y = 1 - (indices / float(n - 2)) * 2
     r = torch.sqrt(1 - y**2)
     x = r * torch.cos(phi)
     z = r * torch.sin(phi)
-    sphere_points = torch.stack([x, y, z], dim=1) * radius
-    if dim > 3:
-        extra = torch.zeros(sphere_points.size(0), dim - 3, dtype=sphere_points.dtype)
-        sphere_points = torch.cat([sphere_points, extra], dim=1)
-    return torch.cat([origin, sphere_points], dim=0)
+    return torch.cat([origin, torch.stack([x, y, z], dim=1) * radius], dim=0)
+
 
 class AnisotropicConv(MessagePassing):
     def __init__(self,
                  local_nn: Optional[Callable] = None,
                  global_nn: Optional[Callable] = None,
                  num_kernel_points: int = 16,
-                 radius: Optional[float] = None,
                  add_self_loops: bool = True,
                  learnable_kernels: bool = False,
-                 use_sparsemax: bool = True,
-                 learnable_rho: bool = True,
+                 use_softmax: bool = False,
+                 softmax_temperature: float = 1.0,
+                 refl_gate_bias_init: float = 0.0,
+                 refl_gate_cap: float = 1.0,
+                 use_dualnorm_lite: bool = False,
+                 dualnorm_init: float = 0.25,
                  **kwargs):
+        kwargs.pop('refl_alpha_init', None)
+        kwargs.pop('n_ref', None)
+        kwargs.pop('density_scale_clamp', None)
+        kwargs.pop('ema_decay', None)
+        kwargs.pop('density_strength', None)
         kwargs.setdefault('aggr', 'add')
         super().__init__(**kwargs)
 
         self.local_nn = local_nn
         self.global_nn = global_nn
         self.add_self_loops = add_self_loops
-        self.radius = radius
-        self.use_sparsemax = use_sparsemax
+        self.num_kernel_points = num_kernel_points
 
-        self._learnable_rho = learnable_rho
-        
-        if learnable_rho:
-            self.raw_rho = nn.Parameter(torch.zeros(1))
-
-        self.rho_min = 0.1
-        self.rho_max = 1.0
-
-        base_kernels = fibonacci_sphere(num_kernel_points, dim=3)
+        base_kernels = fibonacci_sphere(num_kernel_points)
         base_kernels[0, :] = 0.0
         self.kernel_points = nn.Parameter(base_kernels, requires_grad=learnable_kernels)
-        
-        self.kernel_reflectance_importance = nn.Parameter(torch.ones(num_kernel_points))  # Per-kernel reflectance importance
-        
-        self.kernel_bias = nn.Parameter(torch.zeros(num_kernel_points))
+        if not learnable_kernels:
+            self.register_buffer('kernel_dirs', F.normalize(base_kernels.clone(), dim=1))
+        else:
+            self.register_buffer('kernel_dirs', None)
+
+        self.use_softmax = use_softmax
+        self.softmax_temperature = float(max(1e-3, softmax_temperature))
+        self.refl_gate_bias_init = refl_gate_bias_init
+        self.refl_gate_cap = float(min(1.0, max(0.0, refl_gate_cap)))
+        self.use_dualnorm_lite = bool(use_dualnorm_lite)
+        dualnorm_init = float(min(0.95, max(0.01, dualnorm_init)))
+        self.dualnorm_alpha_logit = nn.Parameter(torch.logit(torch.tensor(dualnorm_init, dtype=torch.float32)))
+        self.dualnorm_beta_logit = nn.Parameter(torch.logit(torch.tensor(dualnorm_init, dtype=torch.float32)))
+        self.last_dualnorm_alpha = 0.0
+        self.last_dualnorm_beta = 0.0
+
+        if not use_softmax:
+            from sparsemax import Sparsemax
+            self.attention_fn = Sparsemax(dim=1)
+        else:
+            self.attention_fn = None
+
+        # Per-point reflectance reliability gate.
+        # Input: geom kernel mass (K) + tensor eigvals (3) + local contrast strength (1)
+        # Output: 3 scalars — one gate per eigenvalue of D = M_refl - M_geom
+        gate_hidden = max(8, num_kernel_points)
+        self.refl_reliability_gate = nn.Sequential(
+            nn.Linear(num_kernel_points + 4, gate_hidden),
+            nn.ReLU(),
+            nn.Linear(gate_hidden, 3),
+            nn.Sigmoid(),
+        )
+
         self.reset_parameters()
 
     def reset_parameters(self):
         reset(self.local_nn)
         reset(self.global_nn)
-        nn.init.zeros_(self.kernel_bias)
+        reset(self.refl_reliability_gate)
+        # Gate bias controls initial reflectance reliance.
+        # 0.0 = neutral, negative = cautious, positive = rely-more.
+        if isinstance(self.refl_reliability_gate[2], nn.Linear):
+            nn.init.constant_(self.refl_reliability_gate[2].bias, self.refl_gate_bias_init)
 
-        if self._learnable_rho:
-            nn.init.zeros_(self.raw_rho)
-
-    def forward(
-        self,
-                x: Union[OptTensor, PairOptTensor],
-                pos: Union[Tensor, PairTensor],
-        edge_index: Adj,
-    ) -> Tensor:
+    def forward(self, x: Union[OptTensor, PairOptTensor],
+                pos: Union[Tensor, PairTensor], edge_index: Adj,
+                sf: Optional[Tensor] = None, voxel_size: Optional[Union[float, Tensor]] = None,
+                batch_idx: Optional[Tensor] = None,
+                neighborhood_radius: Optional[Union[float, Tensor]] = None) -> Tensor:
+        """neighborhood_radius unused; we normalize by max_d for density invariance."""
         if not isinstance(x, tuple):
             x = (x, None)
         if isinstance(pos, Tensor):
@@ -99,76 +138,188 @@ class AnisotropicConv(MessagePassing):
             elif isinstance(edge_index, SparseTensor):
                 edge_index = torch_sparse.set_diag(edge_index)
 
-        out = self.propagate(edge_index, x=x, pos=pos)
+        num_nodes = pos[1].size(0) if isinstance(pos, (list, tuple)) else pos.size(0)
+        return self.propagate(edge_index, x=x, pos=pos, sf=sf, voxel_size=voxel_size,
+                             num_nodes=num_nodes)
 
-        return out
-
-    def message(self, x_j: OptTensor, pos_i: Tensor, pos_j: Tensor, index: Tensor) -> Tensor:
+    def message(self, x_j: OptTensor, pos_i: Tensor, pos_j: Tensor, index: Tensor,
+                sf: Optional[Tensor] = None, voxel_size: Optional[Union[float, Tensor]] = None,
+                num_nodes: Optional[int] = None):
         rel_pos = pos_j[:, :3] - pos_i[:, :3]
+        rel_dir = F.normalize(rel_pos, dim=1, eps=1e-6)
         dists = torch.norm(rel_pos, dim=1, keepdim=True)
-        max_d, _ = scatter_max(dists, index, dim=0)
-        
-        if self._learnable_rho:
-            rho = self.rho_min + (self.rho_max - self.rho_min) * torch.sigmoid(self.raw_rho)
+        max_d, _ = scatter_max(dists, index, dim=0, dim_size=num_nodes if num_nodes is not None else None)
+
+        # Geometry-only kernel routing
+        kernel_dirs = (self.kernel_dirs if self.kernel_dirs is not None else F.normalize(self.kernel_points, dim=1, eps=1e-6)).unsqueeze(0)
+        attn = torch.sum(rel_dir.unsqueeze(1) * kernel_dirs, dim=-1)
+        if self.use_softmax:
+            weights = F.softmax((attn.float() / self.softmax_temperature), dim=1).to(attn.dtype)
         else:
-            rho = 1.0
+            weights = self.attention_fn(attn.float()).to(attn.dtype)
+        weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
 
-        rel_pos_norm = rel_pos / (rho * max_d[index] + 1e-8)
+        self_mask = dists.squeeze(-1) < 1e-8
+        weights = weights.clone()
+        if self_mask.any():
+            weights[self_mask] = 0.0
+            weights[self_mask, 0] = 1.0
 
-        refl_j = pos_j[:, 3:4]
-        rel_refl = refl_j - pos_i[:, 3:4]
-            
-        attention_features = torch.cat([
-            rel_pos_norm,
-            refl_j,
-            rel_refl
-        ], dim=-1)
-            
-        kernel_dirs = F.normalize(self.kernel_points, dim=1).unsqueeze(0)
-        
-        if pos_j.size(1) > 3:
-            kernel_padding = torch.zeros(1, kernel_dirs.size(1), 2, device=kernel_dirs.device)
-            kernel_dirs = torch.cat([kernel_dirs, kernel_padding], dim=-1)
+        # Kernel-0 is reserved for self only.
+        # For non-self edges, force kernel-0 mass to zero and renormalize.
+        non_self = ~self_mask
+        if non_self.any():
+            w_non = weights[non_self]
+            w_non[:, 0] = 0.0
+            w_non = w_non / w_non.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            weights[non_self] = w_non
 
-        attn = torch.sum(attention_features.unsqueeze(1) * kernel_dirs, dim=-1)
-        weights = Sparsemax(dim=1)(attn)
+        # Normalize radial feature by max distance in neighborhood (density-invariant)
+        norm_radius = max_d[index].clamp(min=1e-8)
+        dist_norm = (dists / norm_radius).clamp(0.0, 4.0)
 
-        self_indices = (dists.squeeze(-1) < 1e-8).nonzero(as_tuple=True)[0]
-        if len(self_indices) > 0:
-            weights = weights.clone()
-            weights[self_indices] = 0.0
-            weights[self_indices, 0] = 1.0
+        if self.use_dualnorm_lite and x_j is not None and x_j.numel() > 0:
+            dn_dim = num_nodes if num_nodes is not None else int(index.max().item() + 1)
+            one = torch.ones((index.size(0), 1), device=x_j.device, dtype=x_j.dtype)
+            counts = scatter_add(one, index, dim=0, dim_size=dn_dim).clamp(min=1.0)
+            mean_local = scatter_add(x_j, index, dim=0, dim_size=dn_dim) / counts
+            centered = x_j - mean_local[index]
+            mean_global = x_j.mean(dim=0, keepdim=True)
+            std_global = x_j.std(dim=0, unbiased=False, keepdim=True).clamp(min=1e-4)
 
-        feat_list = []
+            alpha = torch.sigmoid(self.dualnorm_alpha_logit).to(x_j.dtype)
+            beta = torch.sigmoid(self.dualnorm_beta_logit).to(x_j.dtype)
+            x_j = x_j + alpha * (centered / std_global) + beta * ((mean_local[index] - mean_global) / std_global)
+
+            self.last_dualnorm_alpha = float(alpha.detach().cpu().item())
+            self.last_dualnorm_beta = float(beta.detach().cpu().item())
+        else:
+            self.last_dualnorm_alpha = 0.0
+            self.last_dualnorm_beta = 0.0
+
+        feat_list = [rel_dir, dist_norm]
         if x_j is not None:
-            feat_list.append(x_j)
-        
-        #feat_list.append(pos_j[:, 3].unsqueeze(-1))
+            feat_list.insert(0, x_j)
+        feat = torch.cat(feat_list, dim=-1)
+        weighted_feat = feat.unsqueeze(-1) * weights.unsqueeze(1)
 
-        reflectance_weight = torch.sum(weights * self.kernel_reflectance_importance.unsqueeze(0), dim=1)  # Kernel-weighted reflectance importance
-        weighted_reflectance = (pos_j[:, 3] * reflectance_weight).unsqueeze(-1)
-        feat_list.append(weighted_reflectance)
-
-        feat_list.append(rel_pos)
-        feat_list.append(dists)
-        feat = torch.cat(feat_list, dim=-1).unsqueeze(-1)
-
-        weighted = feat * weights.unsqueeze(1)
+        # Raw neighbor reflectance for within-direction consistency in aggregate
+        if pos_j.size(1) >= 4:
+            refl_j = pos_j[:, 3].to(feat.dtype)
+        else:
+            refl_j = torch.zeros(feat.size(0), device=feat.device, dtype=feat.dtype)
 
         if self.training:
-            active_kernels = (weights > 0).float().mean(dim=0)
-            entropy = -torch.sum(weights * torch.log(weights + 1e-8), dim=1)
-            self.kernel_entropy = entropy.mean()
-            self.active_kernels = active_kernels.mean()
+            # Normalized to [0,1] — max entropy = log(K). Do not compare to old eigenvalue-based support.
+            ent = (-(weights * (weights + 1e-8).log()).sum(dim=1)).mean()
+            max_ent = math.log(max(weights.size(1), 2))
+            self.kernel_entropy = (ent / max_ent).clamp(0.0, 1.0)
 
-        return weighted
+        return (weighted_feat, weights, refl_j, rel_dir)
 
-    def aggregate(self, inputs: Tensor, index: Tensor, ptr: Optional[Tensor] = None, dim_size: Optional[int] = None) -> Tensor:
-        agg = scatter_add(inputs, index, dim=0, dim_size=dim_size)
-        agg = agg.transpose(1, 2).contiguous().view(dim_size, -1)
+    def aggregate(self, inputs, index: Tensor, ptr: Optional[Tensor] = None, dim_size: Optional[int] = None) -> Tensor:
+        weighted_feat, weights, refl_j, rel_dir = inputs
+
+        agg_feat = scatter_add(weighted_feat, index, dim=0, dim_size=dim_size)   # [N, F, K]
+        kernel_mass_geom = scatter_add(weights, index, dim=0, dim_size=dim_size)  # [N, K]
+
+        neighbor_count = kernel_mass_geom.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        agg_feat = agg_feat / neighbor_count.unsqueeze(1)
+
+        # --- Tensor flashlight: reflectance illuminating geometry ---
+        # Local contrast: absolute deviation from per-neighbourhood median.
+        # Median is robust to specular spikes; a uniformly bright neighbourhood
+        # yields r_local ≈ 0 for all points so M_refl ≈ 0 and the gate suppresses.
+        # Both bright AND dark deviations count (abs) so a dark twig in a bright
+        # leaf canopy is just as detectable as a bright twig in a dark one.
+
+        # Per-neighbourhood median via sort (k=16 so this is cheap)
+        n_pts = dim_size
+        # Scatter refl values into a padded [N, E_max] tensor then take median per row
+        # Simpler: use index to group, sort within groups
+        # We sort all edges by (index, refl_j) and pick the middle element per group.
+        # Two-level stable sort: secondary key first (refl), then primary key (index).
+        # Avoids float32 precision loss from index*1e9 + refl encoding.
+        idx_by_refl = torch.argsort(refl_j, stable=True)
+        idx_by_index = torch.argsort(index[idx_by_refl], stable=True)
+        sorted_idx = idx_by_refl[idx_by_index]
+        sorted_refl = refl_j[sorted_idx]
+
+        # Counts per point (already have neighbor_count)
+        counts_int = kernel_mass_geom.sum(dim=1).round().long().clamp(min=1)  # [N]
+        # Cumulative start positions
+        cum_counts = torch.zeros(n_pts + 1, dtype=torch.long, device=refl_j.device)
+        cum_counts[1:] = counts_int.cumsum(0)
+        # Median index within each group = start + count//2
+        median_pos = cum_counts[:-1] + counts_int // 2  # [N]
+        median_pos = median_pos.clamp(0, sorted_refl.size(0) - 1)
+        refl_median = sorted_refl[median_pos]  # [N]
+
+        r_local = (refl_j - refl_median[index]).abs()  # [E] absolute contrast from median
+
+        # Structure tensors: outer products of unit direction vectors
+        # M_geom = (1/k) Σ d̂⊗d̂           — geometric neighbourhood shape
+        # M_refl = (1/k) Σ r_local·d̂⊗d̂   — brightness-weighted shape
+        # D = M_refl - M_geom: where does brightness deviate from pure geometry?
+        outer_flat = (rel_dir.unsqueeze(-1) * rel_dir.unsqueeze(-2)).view(-1, 9)  # [E, 9]
+        nc = neighbor_count.unsqueeze(-1)  # [N, 1, 1] after second unsqueeze below
+
+        M_geom = scatter_add(outer_flat, index, dim=0, dim_size=dim_size).view(n_pts, 3, 3) / nc  # nc [N,1,1] broadcasts to [N,3,3]
+        M_refl = scatter_add(r_local.unsqueeze(1) * outer_flat, index, dim=0, dim_size=dim_size).view(n_pts, 3, 3) / nc
+
+        D_sym = (M_refl - M_geom)
+        D_sym = (D_sym + D_sym.transpose(-1, -2)) * 0.5  # enforce symmetry for eigvalsh
+        eigvals = torch.linalg.eigvalsh(D_sym)  # [N, 3] ascending: e0 ≤ e1 ≤ e2
+        eigvals = torch.nan_to_num(eigvals, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Contrast strength: mean absolute deviation from median — tells gate how
+        # much local reflectance variation exists in this neighbourhood.
+        contrast_strength = scatter_add(r_local, index, dim=0, dim_size=dim_size).unsqueeze(1) / neighbor_count  # [N, 1]
+
+        # Gate: independently scale each eigenvalue.
+        # Input gives the model: geometric routing summary (K), the tensor signal (3),
+        # and how strong the local contrast is (1).
+        kernel_mass_geom_norm = kernel_mass_geom / kernel_mass_geom.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        gate_input = torch.cat([kernel_mass_geom_norm, eigvals, contrast_strength], dim=1)  # [N, K+4]
+        refl_gate = self.refl_reliability_gate(gate_input)  # [N, 3]
+        refl_gate = torch.nan_to_num(refl_gate, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        if self.refl_gate_cap < 1.0:
+            refl_gate = refl_gate * self.refl_gate_cap
+        eigvals_gated = eigvals * refl_gate  # [N, 3]
+
+        agg_feat = agg_feat.transpose(1, 2).contiguous().view(dim_size, -1)
+        combined = torch.cat([agg_feat, eigvals_gated], dim=-1)
+        combined = torch.nan_to_num(combined, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if self.training:
+            with torch.no_grad():
+                has_nan = torch.isnan(eigvals).any()
+                self.diagnostics = {
+                    'eigvals_mean': eigvals.mean().item(),
+                    'eigvals_dominant_mean': eigvals[:, 2].mean().item(),
+                    'eigvals_dominant_std': eigvals[:, 2].std().item(),
+                    'contrast_strength_mean': contrast_strength.mean().item(),
+                    'refl_gate_mean': refl_gate.mean().item(),
+                    'refl_gate_min': refl_gate.min().item(),
+                    'refl_gate_max': refl_gate.max().item(),
+                    'eigvals_gated_mean': eigvals_gated.mean().item(),
+                    'dualnorm_alpha': self.last_dualnorm_alpha,
+                    'dualnorm_beta': self.last_dualnorm_beta,
+                    'has_nan': has_nan,
+                }
+                if has_nan:
+                    self.diagnostics['warning'] = 'NaN detected in eigvals'
+
+        # Trainer logging — dominant eigenvalue as flashlight signal proxy
+        self.last_similarity = float(eigvals[:, 2].mean().detach().cpu().item())
+        self.last_similarity_per_point = eigvals[:, 2].detach()
+        self.last_refl_gate = float(refl_gate.mean().detach().cpu().item())
+        self.last_refl_gate_per_point = refl_gate.mean(dim=1).detach()
+        self.last_contrast_strength_per_point = contrast_strength.squeeze(1).detach()
+
         if self.local_nn is not None:
-            agg = self.local_nn(agg)
-        return agg
+            combined = self.local_nn(combined)
+        return combined
 
     def update(self, aggr_out: Tensor) -> Tensor:
         if self.global_nn is not None:

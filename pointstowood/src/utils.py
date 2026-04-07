@@ -1,14 +1,77 @@
 import torch
 from torch import Tensor
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 import gc
 import os
+import numpy as np
 
 import torch_geometric
 from torch_geometric.nn import voxel_grid, knn
 from torch_geometric.nn.pool.consecutive import consecutive_cluster
 from torch_geometric.utils import scatter
 from torch_scatter import scatter_add, scatter_max
+
+
+def preprocess_point_cloud_data(df, zero_reflectance: bool = False, drop_predictions: bool = True):
+    """Unified preprocessing for train and predict. Canonical column names, ordering, optional zero reflectance.
+
+    Returns:
+        df: DataFrame with columns [x,y,z,reflectance] and optionally label
+        headers: list of non-xyz column names (for predict output)
+        has_reflectance: bool
+    """
+    canon_map = {
+        'label': ['label'],
+        'reflectance': ['reflectance', 'refl', 'intensity'],
+    }
+    new_columns = {}
+    for col in df.columns:
+        clean = col.lower().replace('scalar_', '')
+        mapped = None
+        for target, aliases in canon_map.items():
+            if any(alias in clean for alias in aliases):
+                mapped = target
+                break
+        new_columns[col] = mapped if mapped is not None else clean
+
+    df = df.rename(columns=new_columns)
+
+    if 'truth' in df.columns and 'label' in df.columns:
+        df = df.drop(columns=['label'])
+    if 'label' not in df.columns and 'truth' in df.columns:
+        df = df.rename(columns={'truth': 'label'})
+
+    df = df.loc[:, ~df.columns.duplicated()]
+
+    if drop_predictions:
+        drop_tokens = ["prediction", "pwood"]
+        cols_to_drop = [c for c in df.columns if any(tok in c for tok in drop_tokens)]
+        if len(cols_to_drop):
+            df = df.drop(columns=cols_to_drop, errors='ignore')
+
+    if 'reflectance' not in df.columns:
+        df['reflectance'] = np.zeros(len(df))
+        if hasattr(np, 'getLogger'):
+            pass  # suppress print in lib
+        # print('No reflectance detected, column added with zeros.')
+    else:
+        pass  # print('Reflectance detected')
+
+    if zero_reflectance:
+        df['reflectance'] = np.zeros(len(df))
+        # print('Reflectance set to zeros as requested.')
+
+    xyz_cols = ['x', 'y', 'z']
+    required_order = xyz_cols + ['reflectance']
+    if 'label' in df.columns:
+        required_order = required_order + ['label']
+    other_cols = [col for col in df.columns if col not in required_order]
+    final_cols = required_order + other_cols
+    df = df[[c for c in final_cols if c in df.columns]]
+
+    headers = [c for c in df.columns if c not in xyz_cols]
+    has_reflectance = (df['reflectance'] != 0).any() if 'reflectance' in df.columns else False
+    return df, headers, has_reflectance
 
 
 def configure_threads(num_procs: int) -> int:
@@ -63,32 +126,16 @@ def _compute_quantiles_chunked(tensor: Tensor, quantiles: List[float], chunk_siz
             raise
 
 def minmax_normalize_reflectance(reflectance_tensor: Tensor) -> Tensor:
-    device = reflectance_tensor.device
-
+    """Min-max to [-1, 1]. No clipping — preserves relative differences (model uses relative contrast only)."""
     if torch.isnan(reflectance_tensor).any():
         reflectance_tensor = torch.nan_to_num(reflectance_tensor, nan=0.0)
 
-    # Use memory-efficient quantile calculation for large tensors
-    try:
-        q1, q3 = torch.quantile(reflectance_tensor, torch.tensor([0.01, 0.99], device=device))
-    except RuntimeError as e:
-        if "too large" in str(e):
-            quantile_values = _compute_quantiles_chunked(reflectance_tensor, [0.01, 0.99])
-            q1, q3 = quantile_values[0], quantile_values[1]
-        else:
-            raise
-
-    iqr = q3 - q1
-    lower_bound = q1 - 1.5 * iqr
-    upper_bound = q3 + 1.5 * iqr
-
-    clipped_reflectance = torch.clamp(reflectance_tensor, lower_bound, upper_bound)
-
-    min_val = torch.min(clipped_reflectance)
-    max_val = torch.max(clipped_reflectance)
-    normalized_reflectance = 2 * (clipped_reflectance - min_val) / (max_val - min_val) - 1
-
-    return normalized_reflectance
+    min_val = torch.min(reflectance_tensor)
+    max_val = torch.max(reflectance_tensor)
+    span = max_val - min_val
+    if span < 1e-8:
+        return torch.zeros_like(reflectance_tensor)
+    return 2 * (reflectance_tensor - min_val) / span - 1
 
 def quantile_normalize_reflectance(reflectance_tensor: Tensor) -> Tensor:
     if torch.isnan(reflectance_tensor).any():
@@ -171,24 +218,139 @@ def downsample_points_max(pos: Tensor, spacing: float) -> Tensor:
         else:
             return torch.cat([selected_xyz, selected_reflectance], dim=1)
 
-def create_point_grid(pos: Tensor, grid_sizes: List[float], min_points: int = 512, max_points: int = 9999999) -> List[Tensor]:
-    def _collect_voxels(voxelised):
-        local = []
-        for vx in torch.unique(voxelised):
-            voxel = (voxelised == vx).nonzero(as_tuple=True)[0]
-            if voxel.size(0) < min_points:
-                continue
-            if voxel.size(0) > max_points:
-                voxel = voxel[torch.randint(0, voxel.size(0), (max_points,))]
-            local.append(voxel.to('cpu'))
-        return local
+def _extract_valid_voxels(
+    sorted_order: Tensor,
+    counts: Tensor,
+    boundaries: Tensor,
+    min_points: int,
+    max_points: int
+) -> List[Tensor]:
+    """Extract indices for valid voxels (optimized with batched GPU ops)."""
+    # Find valid voxel IDs upfront
+    valid_mask = counts >= min_points
+    valid_ids = valid_mask.nonzero(as_tuple=True)[0]
+
+    if len(valid_ids) == 0:
+        return []
+
+    # Batch fetch boundaries to avoid per-voxel .item() calls
+    starts = boundaries[valid_ids]
+    ends = boundaries[valid_ids + 1]
+    voxel_counts = ends - starts
+
+    # Move to CPU once for iteration (unavoidable for variable-length slicing)
+    starts_cpu = starts.cpu().numpy()
+    ends_cpu = ends.cpu().numpy()
+    counts_cpu = voxel_counts.cpu().numpy()
+    sorted_order_cpu = sorted_order.cpu()
+
+    results = []
+    for i in range(len(valid_ids)):
+        start_idx, end_idx, count = starts_cpu[i], ends_cpu[i], counts_cpu[i]
+        voxel_indices = sorted_order_cpu[start_idx:end_idx]
+
+        # Subsample if needed
+        if count > max_points:
+            subsample = torch.randperm(count)[:max_points]
+            voxel_indices = voxel_indices[subsample]
+
+        results.append(voxel_indices)
+
+    return results
+
+
+def create_point_grid_with_overlap(
+    pos: Tensor,
+    grid_size: float,
+    min_points: int = 512,
+    max_points: int = 9999999,
+    num_offsets: int = 4
+) -> List[Tensor]:
+    """Create overlapping voxel grids by shifting grid origin in XY.
+
+    Args:
+        pos: Point cloud tensor [N, 3+]
+        grid_size: Voxel size in meters
+        min_points: Minimum points per voxel
+        max_points: Maximum points per voxel
+        num_offsets: Number of XY offset directions (4 or 8)
+            4 = 50% overlap (2x2 grid of origins)
+            8 = 4 + cardinal edges for denser coverage
+
+    Returns:
+        List of index tensors, one per valid voxel across all offsets
+    """
+    # Define XY offsets as fractions of grid_size
+    if num_offsets == 2:
+        xy_offsets = torch.tensor([
+            [0.0, 0.0], [0.5, 0.5]
+        ])
+    elif num_offsets == 4:
+        xy_offsets = torch.tensor([
+            [0.0, 0.0], [0.5, 0.0], [0.0, 0.5], [0.5, 0.5]
+        ])
+    elif num_offsets == 8:
+        xy_offsets = torch.tensor([
+            [0.0, 0.0], [0.5, 0.0], [0.0, 0.5], [0.5, 0.5],
+            [0.25, 0.0], [0.75, 0.0], [0.0, 0.25], [0.0, 0.75]
+        ])
+    else:
+        xy_offsets = torch.tensor([[0.0, 0.0]])
+
+    # Pre-compute bounds once
+    pos_xyz = pos[:, :3]
+    pos_min = pos_xyz.min(dim=0).values
+    device = pos.device
+
+    # Pre-allocate start tensor (reuse across offsets)
+    start = torch.zeros(3, device=device)
+    start[2] = pos_min[2]  # Z never changes
 
     indices_list: List[Tensor] = []
 
+    for offset in xy_offsets:
+        # Update only XY components
+        start[0] = pos_min[0] - offset[0].item() * grid_size
+        start[1] = pos_min[1] - offset[1].item() * grid_size
+
+        # Voxelize with shifted origin
+        voxelised = voxel_grid(pos_xyz, grid_size, start=start)
+        voxelised, _ = consecutive_cluster(voxelised)
+
+        # Sort once, compute boundaries
+        sorted_order = torch.argsort(voxelised)
+        counts = torch.bincount(voxelised[sorted_order])
+        boundaries = torch.zeros(len(counts) + 1, dtype=torch.long, device=device)
+        boundaries[1:] = torch.cumsum(counts, dim=0)
+
+        # Extract valid voxels (only iterates over valid ones)
+        indices_list.extend(_extract_valid_voxels(
+            sorted_order, counts, boundaries, min_points, max_points
+        ))
+
+    return indices_list
+
+
+def create_point_grid(pos: Tensor, grid_sizes: List[float], min_points: int = 512, max_points: int = 9999999) -> List[Tensor]:
+    """Efficiently partition points into voxels using sorted indices."""
+    indices_list: List[Tensor] = []
+    device = pos.device
+
     for size in grid_sizes:
         voxelised = voxel_grid(pos[:, :3], size)
-        indices_list += _collect_voxels(voxelised)
-            
+        voxelised, _ = consecutive_cluster(voxelised)
+
+        # Sort and compute boundaries
+        sorted_order = torch.argsort(voxelised)
+        counts = torch.bincount(voxelised[sorted_order])
+        boundaries = torch.zeros(len(counts) + 1, dtype=torch.long, device=device)
+        boundaries[1:] = torch.cumsum(counts, dim=0)
+
+        # Extract valid voxels (reuses optimized helper)
+        indices_list.extend(_extract_valid_voxels(
+            sorted_order, counts, boundaries, min_points, max_points
+        ))
+
     return indices_list
 
 

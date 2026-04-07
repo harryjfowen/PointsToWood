@@ -1,520 +1,424 @@
 #!/usr/bin/env python3
 """
 Biome Transfer Learning Evaluation Matrix
-Creates 4x3 performance matrix: (Poland/Spain/Finland/EU models) × (Poland/Spain/Finland test sets)
+Evaluates EU, scratch-{biome}, and paced-{biome} models across all biomes.
+Uses full predicter.py inference: overlapping voxels, point-level aggregation.
+Reports HMCC = harmonic mean of MCC(with-refl) and MCC(no-refl).
+
+Usage:
+    python evaluation/biome_matrix_eval.py --eval_root data --output_dir reports/biome_matrix
+
+Expects directories: data/spain_eval/, data/poland_eval/, data/finland_eval/
 """
 
 import os
+import gc
 import glob
+import datetime
+import argparse
+import warnings
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
+import matplotlib.patheffects as pe
+from matplotlib.colors import Normalize
+from sklearn.metrics import matthews_corrcoef
+from sklearn.exceptions import UndefinedMetricWarning
+import torch
 from tqdm import tqdm
+
 from src.io import load_file
 from src.predicter import SemanticSegmentation
-from sklearn.metrics import balanced_accuracy_score
-import argparse
-import warnings
-import torch
-from sklearn.exceptions import UndefinedMetricWarning
-from matplotlib.colors import Normalize
-import matplotlib.patheffects as pe
+from src.utils import preprocess_point_cloud_data
 
 warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 
-class BiomeMatrixEvaluator:
-    def __init__(self, eval_data_dir, models_dir):
-        """
-        Initialize evaluator
-        
-        Args:
-            eval_data_dir: Directory containing PLY files with prefixes (pol*, spa*, fin*)
-            models_dir: Directory containing trained models
-        """
-        self.eval_data_dir = eval_data_dir
-        self.models_dir = models_dir
-        
-        # Define biomes and their prefixes
-        self.biomes = {
-            'poland': 'pol',
-            'spain': 'spa', 
-            'finland': 'fin'
-        }
-        
-        # Model mapping using fbeta models
-        self.models = {
-            'poland': 'fbeta-poland.pth',
-            'spain': 'fbeta-spain.pth', 
-            'finland': 'fbeta-finland.pth',
-            'eu': 'fbeta-eu.pth'
-        }
-        
-        self.results_matrix = {}
-        
-    def get_test_files_by_biome(self, biome):
-        """Get all test files for a specific biome"""
-        prefix = self.biomes[biome]
-        pattern = os.path.join(self.eval_data_dir, f"{prefix}*.ply")
-        files = glob.glob(pattern)
-        # Ignore existing P2W prediction files in the directory
-        files = [f for f in files if not os.path.basename(f).lower().endswith('_p2w.ply')]
-        print(f"Looking for {biome} files with pattern: {pattern}")
-        print(f"Found {len(files)} files: {files}")
-        
-        
-        return files
-        
-    def load_predictions(self, model_name, test_files):
-        """
-        Run model predictions for test files using your SemanticSegmentation pipeline
-        """
-        import gc
-        import torch
+# ── model / biome config ────────────────────────────────────────────────────
 
-        model_path = os.path.join(self.models_dir, self.models[model_name])
+MODEL_ROWS = [
+    'eu',
+    'scratch-spain', 'paced-spain',
+    'scratch-poland', 'paced-poland',
+    'scratch-finland', 'paced-finland',
+]
 
-        if not os.path.exists(model_path):
-            print(f"Warning: Model {model_path} not found, returning zeros")
-            return {file_path: None for file_path in test_files}
-        
-        predictions = {}
-        
-        print(f"Running {model_name} model on {len(test_files)} files...")
-        for file_path in tqdm(test_files, desc=f"Predicting with {model_name}"):
-            print(f"Processing file: {file_path}")
-            if not os.path.exists(file_path):
-                print(f"ERROR: File does not exist: {file_path}")
-                predictions[file_path] = None
-                continue
-            try:
-                # Create temporary output directory
-                base_name = os.path.splitext(os.path.basename(file_path))[0]  # Remove .ply extension
-                temp_output = f"temp_pred_{model_name}_{base_name}"
-                
-                # Create args object similar to your predict.py
-                class Args:
-                    def __init__(self):
-                        self.point_cloud = [file_path]
-                        self.file = file_path
-                        self.odir = temp_output
-                        self.model = os.path.basename(model_path)  # Just the filename
-                        self.wdir = os.path.dirname(os.path.dirname(model_path))  # Parent of model directory
-                        self.vxfile = os.path.join(temp_output, "voxels")
-                        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-                        self.batch_size = 0  # Enable adaptive batching
-                        self.is_wood = 0.5
-                        self.any_wood = 0.5
-                        self.max_probability = False
-                        self.verbose = False
-                        self.resolution = 0.00
-                        self.grid_size = [1.0, 2.0, 4.0]
-                        self.overlap = 0.0
-                        self.min_pts = 512
-                        self.max_pts = 16384
-                        self.zero_reflectance = False
-                        self.boost_perspective = False
-                        self.denoise = False
-                        self.denoise_k = 16
-                        self.denoise_std = 1.0
-                        self.model_type = 'optimised'
-                        self.mode = 'predict'
-                        self.reflectance = False
-                        self.num_procs = -1
-                        self.grid_method = 'max'
-                        self.collect_grid_size = 0.05
-                        self.memory_fraction = 0.7
-                        
-                args = Args()
-                
-                # Load and preprocess the point cloud data (like predict.py does)
-                from src.io import load_file
-                from predict import preprocess_point_cloud_data
-                
-                os.makedirs(args.vxfile, exist_ok=True)
-                args.pc, args.headers = load_file(filename=file_path, additional_headers=True, verbose=False)
-                args.pc, args.headers, args.reflectance = preprocess_point_cloud_data(args.pc, args.zero_reflectance)
-                
-                # Adjust model path based on reflectance (like predict.py does)
-                def get_model_suffix(has_reflectance, model_type):
-                    if model_type == 'optimised':
-                        return '' if has_reflectance else '-xyz'
-                    elif model_type == 'harmonic':
-                        return '-harmonic'
-                    elif model_type == 'reflectance':
-                        return ''
-                
-                base_model = args.model.replace('.pth', '')
-                model_suffix = get_model_suffix(args.reflectance, args.model_type)
-                args.model = f"{base_model}{model_suffix}.pth"
-                
-                # Run voxelization preprocessing (this is what was missing!)
-                from src.preprocessing import preprocess
-                preprocess(args)
-                
-                # Run semantic segmentation
-                try:
-                    result_args = SemanticSegmentation(args)
-                    
-                    # Extract predictions directly from the result (no need for file I/O)
-                    if hasattr(result_args, 'pc'):
-                        print(f"Available columns in result: {list(result_args.pc.columns)}")
-                        if 'prediction' in result_args.pc.columns:
-                            predictions[file_path] = result_args.pc['prediction'].values
-                            print(f"Successfully extracted {len(predictions[file_path])} predictions from {os.path.basename(file_path)}")
-                            print(f"Prediction range: {predictions[file_path].min()} to {predictions[file_path].max()}")
-                        else:
-                            predictions[file_path] = None
-                            print(f"Warning: No prediction column found in result for {file_path}")
-                    else:
-                        predictions[file_path] = None
-                        print(f"Warning: No 'pc' attribute found in result for {file_path}")
-                        
-                except Exception as inner_e:
-                    # If preprocessing results in empty dataset, skip this file
-                    if "empty" in str(inner_e).lower() or "min()" in str(inner_e):
-                        print(f"Warning: Skipping {file_path} - preprocessing resulted in empty dataset")
-                        predictions[file_path] = None
-                        continue
-                    else:
-                        raise inner_e
-                
-                # Cleanup temp directory
-                if os.path.exists(temp_output):
-                    import shutil
-                    shutil.rmtree(temp_output)
+MODEL_FILES = {
+    'eu':              'mcc-eu.pth',
+    'scratch-spain':   'scratch-spain.pth',
+    'paced-spain':     'paced-spain.pth',
+    'scratch-poland':  'scratch-poland.pth',
+    'paced-poland':    'paced-poland.pth',
+    'scratch-finland': 'scratch-finland.pth',
+    'paced-finland':   'paced-finland.pth',
+}
 
-                # Force cleanup to prevent file handle buildup
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                gc.collect()
+TEST_BIOMES = ['spain', 'poland', 'finland', 'eu']
 
-            except Exception as e:
-                print(f"Error predicting {file_path} with {model_name}: {e}")
-                predictions[file_path] = None
+# ── helpers ─────────────────────────────────────────────────────────────────
 
-                # Cleanup even on error
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                gc.collect()
-                
-        return predictions
-        
-    def load_ground_truth(self, file_path):
-        """Load ground truth labels from PLY file"""
+def _fmt(v):
+    return f"{v:.4f}" if np.isfinite(v) else "N/A"
+
+def _delta(a, b):
+    return f"{a - b:+.4f}" if (np.isfinite(a) and np.isfinite(b)) else "N/A"
+
+def _harmonic_mean(a, b):
+    if a > 0 and b > 0:
+        return 2 * a * b / (a + b)
+    return float('nan')
+
+def _get_test_files(eval_root, biome):
+    biome_dir = os.path.join(eval_root, f"{biome}_eval")
+    files     = glob.glob(os.path.join(biome_dir, "*.ply"))
+    return sorted(f for f in files if not f.lower().endswith('_p2w.ply'))
+
+def _load_ground_truth(file_path):
+    data = load_file(file_path)
+    for col in ['truth', 'label'] + [c for c in data.columns
+                if any(k in c.lower() for k in ('truth', 'label', 'class'))]:
+        if col in data.columns:
+            return (data[col].values > 0).astype(int)
+    raise ValueError(f"No ground truth column in {file_path}. Columns: {list(data.columns)}")
+
+# ── inference ────────────────────────────────────────────────────────────────
+
+def _run_inference(file_path, model_name, models_dir, zero_reflectance=False):
+    """Full predicter.py pipeline on one file. Returns binary prediction array or None."""
+    model_file = MODEL_FILES[model_name]
+    model_path = os.path.join(models_dir, model_file)
+    if not os.path.exists(model_path):
+        print(f"  [skip] model not found: {model_path}")
+        return None
+
+    tag      = 'norefl' if zero_reflectance else 'refl'
+    base     = os.path.splitext(os.path.basename(file_path))[0]
+    temp_dir = f"_bme_{model_name}_{base}_{tag}"
+
+    try:
+        class Args:
+            def __init__(self):
+                self.point_cloud     = [file_path]
+                self.file            = file_path
+                self.odir            = temp_dir
+                self.model           = model_file
+                self.wdir            = os.path.dirname(os.path.dirname(model_path))
+                self.vxfile          = os.path.join(temp_dir, "voxels")
+                self.device          = 'cuda' if torch.cuda.is_available() else 'cpu'
+                self.batch_size      = 0
+                self.is_wood         = 0.5
+                self.any_wood        = 0.5
+                self.max_probability = False
+                self.verbose         = False
+                self.resolution      = 0.0
+                self.grid_size       = [1.0, 2.0, 4.0]
+                self.overlap         = 0.0
+                self.min_pts         = 512
+                self.max_pts         = 16384
+                self.zero_reflectance = zero_reflectance
+                self.boost_perspective = False
+                self.denoise         = False
+                self.denoise_k       = 16
+                self.denoise_std     = 1.0
+                self.mode            = 'predict'
+                self.num_procs       = -1
+                self.grid_method     = 'max'
+                self.collect_grid_size = 0.05
+                self.memory_fraction = 0.7
+
+        args = Args()
+        os.makedirs(args.vxfile, exist_ok=True)
+
+        args.pc, args.headers = load_file(filename=file_path, additional_headers=True, verbose=False)
+        args.pc, args.headers, args.reflectance = preprocess_point_cloud_data(args.pc, args.zero_reflectance)
+
+        from src.preprocessing import preprocess
+        preprocess(args)
+
+        result = SemanticSegmentation(args)
+
+        if hasattr(result, 'pc') and 'prediction' in result.pc.columns:
+            return (result.pc['prediction'].values > 0).astype(int)
+        print(f"  [warn] no prediction column for {model_name} on {base} ({tag})")
+        return None
+
+    except Exception as e:
+        print(f"  [error] {model_name} | {base} | {tag}: {e}")
+        return None
+    finally:
+        if os.path.exists(temp_dir):
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+# ── per-model-biome evaluation ───────────────────────────────────────────────
+
+def _evaluate(model_name, biome, eval_root, models_dir):
+    """Returns dict: mcc_refl, mcc_norefl, hmcc — aggregated over all files in biome."""
+    files = _get_test_files(eval_root, biome)
+    if not files:
+        print(f"  No test files found for {biome}")
+        return dict(mcc_refl=float('nan'), mcc_norefl=float('nan'), hmcc=float('nan'))
+
+    all_true, all_refl, all_norefl = [], [], []
+
+    for f in tqdm(files, desc=f"{model_name}→{biome}"):
         try:
-            data = load_file(file_path)  # Using your existing PLY loader
-            
-            # Look for both 'truth' and 'label' columns as requested
-            if 'truth' in data.columns:
-                labels = data['truth'].values
-                print(f"Using 'truth' column from {os.path.basename(file_path)}")
-            elif 'label' in data.columns:
-                labels = data['label'].values
-                print(f"Using 'label' column from {os.path.basename(file_path)}")
-            else:
-                # Try to infer label column
-                label_cols = [col for col in data.columns if 'truth' in col.lower() or 'label' in col.lower() or 'class' in col.lower()]
-                if label_cols:
-                    labels = data[label_cols[0]].values
-                    print(f"Using '{label_cols[0]}' column from {os.path.basename(file_path)}")
-                else:
-                    print(f"Available columns in {os.path.basename(file_path)}: {list(data.columns)}")
-                    raise ValueError(f"No truth/label column found in {file_path}")
-                    
-            return labels
-            
+            y_true = _load_ground_truth(f)
         except Exception as e:
-            print(f"Error loading {file_path}: {e}")
-            return None
-            
-    def compute_metrics(self, y_true, y_pred):
-        """Compute balanced accuracy metric only"""
-        if y_true is None or y_pred is None:
-            return {'balanced_accuracy': 0.0}
-            
-        # Convert to binary if needed (assuming 0=leaf, 1=wood)
-        y_true_binary = (y_true > 0).astype(int)
-        y_pred_binary = (y_pred > 0).astype(int)
-        
-        metrics = {
-            'balanced_accuracy': balanced_accuracy_score(y_true_binary, y_pred_binary)
-        }
-        
-        return metrics
-        
-    def evaluate_model_on_biome(self, model_name, test_biome):
-        """Evaluate a specific model on a specific biome's test set"""
-        print(f"Evaluating {model_name} model on {test_biome} test set...")
-        
-        test_files = self.get_test_files_by_biome(test_biome)
-        if not test_files:
-            print(f"No test files found for {test_biome}")
-            return {'accuracy': 0.0, 'f1': 0.0, 'iou': 0.0}
-            
-        predictions = self.load_predictions(model_name, test_files)
-        
-        all_metrics = []
-        for file_path in tqdm(test_files, desc=f"{model_name} on {test_biome}"):
-            # Load ground truth
-            y_true = self.load_ground_truth(file_path)
-            y_pred = predictions.get(file_path)
-            
-            # Compute metrics for this file
-            metrics = self.compute_metrics(y_true, y_pred)
-            all_metrics.append(metrics)
-            
-        # Average metrics across all files
-        if all_metrics:
-            avg_metrics = {
-                'balanced_accuracy': np.mean([m['balanced_accuracy'] for m in all_metrics])
-            }
-        else:
-            avg_metrics = {'balanced_accuracy': 0.0}
-            
-        return avg_metrics
-        
+            print(f"  [skip GT] {e}")
+            continue
+
+        p_refl   = _run_inference(f, model_name, models_dir, zero_reflectance=False)
+        p_norefl = _run_inference(f, model_name, models_dir, zero_reflectance=True)
+
+        if p_refl is None or p_norefl is None:
+            continue
+
+        n = min(len(y_true), len(p_refl), len(p_norefl))
+        all_true.append(y_true[:n])
+        all_refl.append(p_refl[:n])
+        all_norefl.append(p_norefl[:n])
+
+    if not all_true:
+        return dict(mcc_refl=float('nan'), mcc_norefl=float('nan'), hmcc=float('nan'))
+
+    y  = np.concatenate(all_true)
+    pr = np.concatenate(all_refl)
+    pn = np.concatenate(all_norefl)
+
+    mcc_r = matthews_corrcoef(y, pr)
+    mcc_n = matthews_corrcoef(y, pn)
+    return dict(mcc_refl=mcc_r, mcc_norefl=mcc_n, hmcc=_harmonic_mean(mcc_r, mcc_n))
+
+# ── main evaluator class ─────────────────────────────────────────────────────
+
+class BiomeMatrixEvaluator:
+    def __init__(self, eval_root, models_dir):
+        self.eval_root = eval_root
+        self.models_dir    = models_dir
+        self.results       = {}   # (model, biome) → dict
+
     def run_full_evaluation(self):
-        """Run complete 4x3 evaluation matrix"""
-        print("Running biome transfer learning evaluation...")
-        
-        model_names = ['poland', 'spain', 'finland', 'eu']
-        test_biomes = ['poland', 'spain', 'finland']
-        
-        # Initialize results matrix for balanced accuracy only
-        self.results_matrix['balanced_accuracy'] = pd.DataFrame(
-            index=model_names,
-            columns=test_biomes,
-            dtype=float
-        )
-            
-        # Run all combinations
-        for model_name in model_names:
-            for test_biome in test_biomes:
-                metrics = self.evaluate_model_on_biome(model_name, test_biome)
-                
-                # Store results
-                self.results_matrix['balanced_accuracy'].loc[model_name, test_biome] = metrics['balanced_accuracy']
-                    
-        return self.results_matrix
-        
-    def plot_heatmap(self, metric='balanced_accuracy', save_path=None):
-        """Create heatmap visualization of results"""
-        if metric not in self.results_matrix:
-            print(f"Metric {metric} not found in results")
-            return
-            
-        # Create figure
-        plt.figure(figsize=(8, 6))
-        
-        # Create heatmap
-        matrix = self.results_matrix[metric]
-        ax = sns.heatmap(
-            matrix,
-            annot=True,
-            fmt='.3f',
-            cmap='RdYlGn',
-            cbar_kws={'label': ''},
-            square=True
-        )
-        # Remove colorbar label (legend title)
-        cbar = None
-        try:
-            # seaborn attaches colorbar to the first QuadMesh in collections
-            if ax.collections and hasattr(ax.collections[0], 'colorbar'):
-                cbar = ax.collections[0].colorbar
-        except Exception:
-            cbar = None
-        if cbar is not None:
-            cbar.set_label('')
-            try:
-                cbar.ax.set_ylabel('')
-                cbar.ax.set_title('')
-            except Exception:
-                pass
-        # Single bold title on axes
-        ax.set_title('Balanced Accuracy', fontweight='bold')
-        plt.xlabel('Test Dataset')
-        plt.ylabel('Model')
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"Heatmap saved to {save_path}")
-        
-        plt.show()
+        for model in MODEL_ROWS:
+            for biome in TEST_BIOMES:
+                print(f"\n{'='*60}\n{model}  →  {biome}\n{'='*60}")
+                r = _evaluate(model, biome, self.eval_root, self.models_dir)
+                self.results[(model, biome)] = r
+                print(f"  MCC refl={_fmt(r['mcc_refl'])}  norefl={_fmt(r['mcc_norefl'])}  HMCC={_fmt(r['hmcc'])}")
 
-    def plot_viridis_table(self, metric='balanced_accuracy', save_path=None):
-        """Create a publication-ready viridis-colored table highlighting strengths/weaknesses and best performers."""
-        if metric not in self.results_matrix:
-            print(f"Metric {metric} not found in results")
+    def _df(self, metric):
+        df = pd.DataFrame(index=MODEL_ROWS, columns=TEST_BIOMES, dtype=float)
+        for m in MODEL_ROWS:
+            for b in TEST_BIOMES:
+                df.loc[m, b] = self.results.get((m, b), {}).get(metric, float('nan'))
+        return df
+
+    # ── text report ────────────────────────────────────────────────────────
+
+    def write_paper_report(self, output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, 'biome_matrix_report.txt')
+
+        hmcc_df   = self._df('hmcc')
+        refl_df   = self._df('mcc_refl')
+        norefl_df = self._df('mcc_norefl')
+
+        L = []
+        L.append("=" * 70)
+        L.append("BIOME TRANSFER LEARNING — FULL EVALUATION REPORT")
+        L.append(f"Generated : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        L.append("Primary metric : HMCC = harmonic_mean(MCC_refl, MCC_norefl)")
+        L.append("Inference : predicter.py overlapping voxels, point-level aggregation")
+        L.append("Compression : 82x  (teacher 23.5M params → student 287K params)")
+        L.append("=" * 70)
+
+        # ── matrices ──
+        for label, df in [("HMCC", hmcc_df), ("MCC with reflectance", refl_df), ("MCC no reflectance", norefl_df)]:
+            L.append(f"\n{'─'*70}\n{label}\n{'─'*70}")
+            L.append(f"{'Model':<22}" + "".join(f"{b.capitalize():>12}" for b in TEST_BIOMES))
+            L.append("-" * 58)
+            prev_grp = None
+            for m in MODEL_ROWS:
+                grp = m.split('-')[0] if '-' in m else m
+                if prev_grp and grp != prev_grp:
+                    L.append("")
+                prev_grp = grp
+                L.append(f"{m:<22}" + "".join(f"{_fmt(df.loc[m, b]):>12}" for b in TEST_BIOMES))
+
+        # ── analysis ──
+        L.append(f"\n{'='*70}\nANALYSIS\n{'='*70}")
+
+        L.append("\n── In-domain vs Transfer (HMCC) ──")
+        for biome in TEST_BIOMES:
+            sc = f"scratch-{biome}"
+            pa = f"paced-{biome}"
+            others = [b for b in TEST_BIOMES if b != biome]
+
+            sc_in  = hmcc_df.loc[sc, biome]
+            pa_in  = hmcc_df.loc[pa, biome]
+            eu_in  = hmcc_df.loc['eu', biome]
+            sc_out = float(np.nanmean([hmcc_df.loc[sc, b] for b in others]))
+            pa_out = float(np.nanmean([hmcc_df.loc[pa, b] for b in others]))
+            eu_out = float(np.nanmean([hmcc_df.loc['eu', b] for b in others]))
+
+            L.append(f"\n  {biome.upper()}")
+            L.append(f"    Scratch  in-domain={_fmt(sc_in)}  transfer={_fmt(sc_out)}  drop={_delta(sc_out, sc_in)}")
+            L.append(f"    PACED    in-domain={_fmt(pa_in)}  transfer={_fmt(pa_out)}  drop={_delta(pa_out, pa_in)}")
+            L.append(f"    EU       on {biome:<8}={_fmt(eu_in)}  transfer avg={_fmt(eu_out)}")
+            L.append(f"    PACED transfer advantage over scratch: {_delta(pa_out, sc_out)}")
+
+        L.append("\n── EU Generalisation ──")
+        eu_vals = [hmcc_df.loc['eu', b] for b in TEST_BIOMES]
+        L.append("  " + "  ".join(f"{b}={_fmt(v)}" for b, v in zip(TEST_BIOMES, eu_vals)))
+        L.append(f"  EU avg HMCC across all biomes: {_fmt(float(np.nanmean(eu_vals)))}")
+
+        L.append("\n── Cross-biome Transfer: PACED vs Scratch ──")
+        for src in TEST_BIOMES:
+            sc = f"scratch-{src}"
+            pa = f"paced-{src}"
+            for tgt in TEST_BIOMES:
+                if tgt == src:
+                    continue
+                L.append(f"  {pa} on {tgt}: {_fmt(hmcc_df.loc[pa, tgt])}  "
+                         f"vs  {sc} on {tgt}: {_fmt(hmcc_df.loc[sc, tgt])}  "
+                         f"Δ={_delta(hmcc_df.loc[pa, tgt], hmcc_df.loc[sc, tgt])}")
+
+        # ── key numbers for paper ──
+        L.append("\n── Key Numbers for Paper ──")
+        pa_in_all  = [hmcc_df.loc[f"paced-{b}", b] for b in TEST_BIOMES]
+        sc_in_all  = [hmcc_df.loc[f"scratch-{b}", b] for b in TEST_BIOMES]
+        sc_out_all = [hmcc_df.loc[f"scratch-{s}", t] for s in TEST_BIOMES for t in TEST_BIOMES if t != s]
+        pa_out_all = [hmcc_df.loc[f"paced-{s}", t] for s in TEST_BIOMES for t in TEST_BIOMES if t != s]
+
+        L.append(f"  PACED avg in-domain HMCC       : {_fmt(float(np.nanmean(pa_in_all)))}")
+        L.append(f"  Scratch avg in-domain HMCC      : {_fmt(float(np.nanmean(sc_in_all)))}")
+        L.append(f"  PACED avg transfer HMCC         : {_fmt(float(np.nanmean(pa_out_all)))}")
+        L.append(f"  Scratch avg transfer HMCC       : {_fmt(float(np.nanmean(sc_out_all)))}")
+        L.append(f"  PACED transfer advantage        : {_delta(float(np.nanmean(pa_out_all)), float(np.nanmean(sc_out_all)))}")
+        L.append(f"  EU avg HMCC (all biomes)        : {_fmt(float(np.nanmean(eu_vals)))}")
+
+        with open(path, 'w') as f:
+            f.write('\n'.join(L))
+        print(f"\nReport written: {path}")
+        return path
+
+    # ── viridis matrix figure ───────────────────────────────────────────────
+
+    def plot_viridis_matrix(self, output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+        df     = self._df('hmcc')
+        values = df.values.astype(float)
+
+        finite = values[np.isfinite(values)]
+        if not finite.size:
+            print("No finite values — skipping figure")
             return
 
-        matrix = self.results_matrix[metric]
-        values = matrix.values.astype(float)
-        # Handle NaNs gracefully by treating them as min
-        finite_vals = values[np.isfinite(values)]
-        if finite_vals.size == 0:
-            print("No finite values to plot")
-            return
-        vmin, vmax = finite_vals.min(), finite_vals.max()
+        vmin, vmax = finite.min(), finite.max()
         norm = Normalize(vmin=vmin, vmax=vmax)
         cmap = plt.cm.viridis
 
-        fig, ax = plt.subplots(figsize=(8, 6), dpi=300)
-        im = ax.imshow(values, cmap=cmap, norm=norm)
+        n_rows, n_cols = values.shape
+        fig, ax = plt.subplots(figsize=(7, 9), dpi=300)
+        ax.imshow(values, cmap=cmap, norm=norm, aspect='auto')
 
-        # Set ticks and labels
-        ax.set_xticks(np.arange(matrix.shape[1]))
-        ax.set_yticks(np.arange(matrix.shape[0]))
-        ax.set_xticklabels(matrix.columns, fontsize=10)
-        ax.set_yticklabels(matrix.index, fontsize=10)
-        plt.setp(ax.get_xticklabels(), rotation=0, ha='center')
+        ax.set_xticks(np.arange(n_cols))
+        ax.set_yticks(np.arange(n_rows))
+        ax.set_xticklabels([b.capitalize() for b in TEST_BIOMES], fontsize=11)
+        ax.set_yticklabels(MODEL_ROWS, fontsize=9)
 
-        # Add colorbar
-        cbar = fig.colorbar(im, ax=ax)
-        # Remove legend title on viridis table
-        try:
-            cbar.set_label('')
-            cbar.ax.set_ylabel('')
-            cbar.ax.set_title('')
-        except Exception:
-            pass
+        # Group separator lines (between EU / Spain pair / Poland pair / Finland pair)
+        prev_grp = None
+        for i, m in enumerate(MODEL_ROWS):
+            grp = m.split('-')[0] if '-' in m else m
+            if prev_grp and grp != prev_grp:
+                ax.axhline(i - 0.5, color='white', linewidth=2.0)
+            prev_grp = grp
 
-        # Determine per-column bests (model that performs best per test)
+        # Cell annotations
         col_max = np.nanargmax(values, axis=0)
-        row_names = list(matrix.index)
-        col_names = list(matrix.columns)
+        mid     = vmin + (vmax - vmin) * 0.55
 
-        # Overlay text with contrast-aware coloring
-        mid = (vmin + vmax) / 2.0
-        for i in range(values.shape[0]):
-            for j in range(values.shape[1]):
-                val = values[i, j]
-                disp = 'NA' if not np.isfinite(val) else f"{val:.3f}"
+        for i in range(n_rows):
+            for j in range(n_cols):
+                val   = values[i, j]
+                label = 'N/A' if not np.isfinite(val) else f"{val:.3f}"
 
-                is_eu_row = (row_names[i].lower() == 'eu')
-                is_eu_col_best = is_eu_row and (i == col_max[j])
-                is_biome_diagonal = (row_names[i] == col_names[j]) and (not is_eu_row)
+                m    = MODEL_ROWS[i]
+                b    = TEST_BIOMES[j]
+                grp  = m.split('-')[1] if '-' in m else None
+                is_diagonal  = (grp == b)
+                is_col_best  = (i == col_max[j])
+                is_eu        = (m == 'eu')
 
-                # Choose base text color: white if value < 0.86, else black
-                base_color = 'white' if (np.isfinite(val) and val < 0.86) else 'black'
+                txt_color = 'white' if (np.isfinite(val) and val < mid) else 'black'
+                weight    = 'bold' if (is_diagonal or (is_eu and is_col_best)) else 'normal'
+                size      = 10 if (is_diagonal or (is_eu and is_col_best)) else 8
 
-                if is_eu_col_best:
-                    # Bold dark red for EU when it is best on a test dataset
-                    txt = ax.text(j, i, disp, ha='center', va='center', color='#8B0000', fontsize=10, fontweight='bold')
-                    txt.set_path_effects([pe.withStroke(linewidth=1.5, foreground='white')])
-                elif is_biome_diagonal:
-                    # Bold black on biome diagonals for emphasis
-                    ax.text(j, i, disp, ha='center', va='center', color='black', fontsize=10, fontweight='bold')
+                if is_eu and is_col_best:
+                    t = ax.text(j, i, label, ha='center', va='center',
+                                color='#FFD700', fontsize=size, fontweight='bold')
+                    t.set_path_effects([pe.withStroke(linewidth=1.5, foreground='black')])
                 else:
-                    # Other cells: threshold-based color
-                    ax.text(j, i, disp, ha='center', va='center', color=base_color, fontsize=9, fontweight='normal')
+                    ax.text(j, i, label, ha='center', va='center',
+                            color=txt_color, fontsize=size, fontweight=weight)
 
-        # Gridlines to create a clean table look
-        ax.set_xticks(np.arange(-.5, values.shape[1], 1), minor=True)
-        ax.set_yticks(np.arange(-.5, values.shape[0], 1), minor=True)
-        ax.grid(which='minor', color='white', linestyle='-', linewidth=1.0)
+        # Minor grid
+        ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, n_rows, 1), minor=True)
+        ax.grid(which='minor', color='white', linewidth=0.8)
         ax.tick_params(which='minor', bottom=False, left=False)
 
-        # Labels and single bold title
-        ax.set_title('Balanced Accuracy', fontweight='bold')
-        ax.set_xlabel('Test Dataset')
-        ax.set_ylabel('Model')
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=ax, shrink=0.75, pad=0.02)
+        cbar.set_label('HMCC', fontsize=10)
+
+        ax.set_title('Biome Transfer Matrix — HMCC\n'
+                     'harmonic mean of MCC(with-refl) and MCC(no-refl)',
+                     fontweight='bold', fontsize=10, pad=10)
+        ax.set_xlabel('Test Biome', fontsize=10)
+        ax.set_ylabel('Model', fontsize=10)
         fig.tight_layout()
 
-        if save_path:
-            fig.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"Viridis table saved to {save_path}")
+        path = os.path.join(output_dir, 'biome_matrix_hmcc.png')
+        fig.savefig(path, dpi=300, bbox_inches='tight')
         plt.close(fig)
-        
-    def save_results(self, output_dir):
-        """Save results to CSV files"""
+        print(f"Figure saved: {path}")
+        return path
+
+    # ── csv export ─────────────────────────────────────────────────────────
+
+    def save_csvs(self, output_dir):
         os.makedirs(output_dir, exist_ok=True)
-        
-        for metric, matrix in self.results_matrix.items():
-            output_path = os.path.join(output_dir, f"biome_matrix_{metric}.csv")
-            matrix.to_csv(output_path)
-            print(f"Saved {metric} results to {output_path}")
-            
-    def print_summary(self):
-        """Print summary of results"""
-        print("\n" + "="*60)
-        print("BIOME TRANSFER LEARNING EVALUATION SUMMARY")
-        print("="*60)
-        
-        print(f"\nBALANCED ACCURACY Results:")
-        print(self.results_matrix['balanced_accuracy'].round(3))
-        
-        # Highlight diagonal vs off-diagonal performance (if full matrix available)
-        matrix = self.results_matrix['balanced_accuracy']
-        
-        # Check if we have the full matrix or just test mode
-        available_models = matrix.index.tolist()
-        available_tests = matrix.columns.tolist()
-        
-        if len(available_models) == 4 and len(available_tests) == 3:
-            # Full evaluation mode
-            diagonal_avg = np.mean([matrix.loc['poland', 'poland'], 
-                                  matrix.loc['spain', 'spain'], 
-                                  matrix.loc['finland', 'finland']])
-            
-            # Off-diagonal for biome models only (exclude EU)
-            off_diagonal = []
-            for model in ['poland', 'spain', 'finland']:
-                for test in ['poland', 'spain', 'finland']:
-                    if model != test:
-                        off_diagonal.append(matrix.loc[model, test])
-            off_diagonal_avg = np.mean(off_diagonal)
-            
-            # EU model average
-            eu_avg = np.mean([matrix.loc['eu', test] for test in ['poland', 'spain', 'finland']])
-            
-            print(f"  Diagonal avg (specialized): {diagonal_avg:.3f}")
-            print(f"  Off-diagonal avg (transfer): {off_diagonal_avg:.3f}")
-            print(f"  EU model avg (generalist): {eu_avg:.3f}")
-            print(f"  Specialization advantage: {diagonal_avg - off_diagonal_avg:.3f}")
-            print(f"  EU vs Transfer gap: {eu_avg - off_diagonal_avg:.3f}")
-        else:
-            # Test mode or partial results
-            print(f"  Test mode results - Models: {available_models}, Tests: {available_tests}")
-            for model in available_models:
-                for test in available_tests:
-                    score = matrix.loc[model, test]
-                    print(f"  {model} on {test}: {score:.3f}")
+        for metric in ('hmcc', 'mcc_refl', 'mcc_norefl'):
+            p = os.path.join(output_dir, f'biome_matrix_{metric}.csv')
+            self._df(metric).to_csv(p)
+            print(f"Saved: {p}")
+
+
+# ── entry point ──────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description='Evaluate biome model transfer learning')
-    parser.add_argument('--eval_data_dir', required=True, 
-                       help='Directory with PLY files (pol*, spa*, fin* prefixes)')
+    parser = argparse.ArgumentParser(description='Biome transfer matrix evaluation')
+    parser.add_argument('--eval_root', required=True,
+                        help='Root data directory containing spain_eval/, poland_eval/, finland_eval/ subdirs')
     parser.add_argument('--models_dir', default='./model',
-                       help='Directory with trained models')
-    parser.add_argument('--output_dir', default='./biome_eval_results',
-                       help='Output directory for results')
-    parser.add_argument('--metric', default='balanced_accuracy', choices=['balanced_accuracy'],
-                       help='Metric for heatmap visualization')
-    
+                        help='Directory containing trained .pth files')
+    parser.add_argument('--output_dir', default='./reports/biome_matrix',
+                        help='Output directory for report, CSVs, and figure')
     args = parser.parse_args()
-    
-    # Initialize evaluator
-    evaluator = BiomeMatrixEvaluator(args.eval_data_dir, args.models_dir)
-    
-    # Run evaluation
-    results = evaluator.run_full_evaluation()
-    
-    # Print summary
-    evaluator.print_summary()
-    
-    # Save results
-    evaluator.save_results(args.output_dir)
-    
-    # Create heatmap
-    heatmap_path = os.path.join(args.output_dir, f'biome_matrix_{args.metric}.png')
-    evaluator.plot_heatmap(metric=args.metric, save_path=heatmap_path)
 
-    # Create publication-ready viridis PNG table
-    viridis_path = os.path.join(args.output_dir, f'biome_matrix_viridis_{args.metric}.png')
-    evaluator.plot_viridis_table(metric=args.metric, save_path=viridis_path)
+    evaluator = BiomeMatrixEvaluator(args.eval_root, args.models_dir)
+    evaluator.run_full_evaluation()
+    evaluator.write_paper_report(args.output_dir)
+    evaluator.save_csvs(args.output_dir)
+    evaluator.plot_viridis_matrix(args.output_dir)
+    print("\nDone.")
+
 
 if __name__ == "__main__":
     main()

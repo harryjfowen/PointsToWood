@@ -1,229 +1,229 @@
 
-# Semantic classification of wood and leaf in TLS forest point clouds
+# PointsToWood
 
-![Probability of wood predicted by our model from blue to red (Data from Wang et al., 2021](images/our_tropical.png)
-<sub>Figure is displaying probability of wood predicted by our model from blue (low probability) to red (high probability). (Data sourced from Wang et al., 2021)</sub>
+**Deep learning framework for wood-leaf segmentation of TLS forest point clouds**
 
-### This model is described in the paper:
-PointsToWood: A deep learning framework for complete canopy leaf-wood segmentation of TLS data across diverse European forests. Owen, H. J. F.,  Allen, M. J. A., Grieve S.W.D., Wilkes P., Lines, E. R. (under review)
+![Probability of wood predicted by our model from blue to red](images/our_tropical.png)
+<sub>Probability of wood (blue = low, red = high). Data: Wang et al., 2021.</sub>
 
-## Version Information
+---
 
-### Current Version (version2.0) - Advanced Features
-This branch contains the latest version with significant architectural improvements that will be described in the forthcoming paper:
+### Paper
 
-**New Features:**
-- **Directional Anisotropic Convolution** with reflectance-based attention mechanisms
-- **Inverted Residual Blocks** for improved feature extraction and regularization
-- **Squeeze-Excitation (SE) Channel Attention** for adaptive feature recalibration
-- **Adaptive Receptive Field Scaling** with learnable ρ parameters
-- **PointCutMix Augmentation** on mono-label samples for realistic boundary mixing
-- **Knowledge Distillation** with semantic distillation
-- **Edge-aware Weighted Loss** for challenging boundary regions
-- **Enhanced Data Processing** with denoising and efficient batching
-- **Robust Multimodal Learning** handling both geometric and reflectance data
+> **PointsToWood: A deep learning framework for complete canopy leaf-wood segmentation of TLS data across diverse European forests**
+> Owen, H. J. F., Allen, M. J. A., Grieve, S. W. D., Wilkes, P., Lines, E. R. *(under review)*
 
-### arXiv Version (version1.0)
-For the exact implementation described in the arXiv preprint, please switch to the `version1.0` branch:
+For the exact implementation described in the arXiv preprint, see the `version1.0-paper` branch:
 ```bash
-git checkout version1.0
+git checkout version1.0-paper
 ```
 
-#
+---
 
-### Development Environment
+## Overview
 
-- **Operating System:** Ubuntu LTS 22.04
-- **GPU:** NVIDIA Quadro RTX 6000 24GB
-- **NVIDIA Driver:** 535.183.06
-- **CUDA Version:** 12.2
+PointsToWood classifies every point in a TLS forest point cloud as either **wood** or **leaf**. It is designed for the practical difficulty of the problem: high-resolution point clouds where the target class shifts in scale from individual needles to large trunks, where noise, occlusion, point density, and scanner calibration vary across sites, and where the geometric signal at wood-leaf boundaries is inherently ambiguous.
 
-### Setup Instructions
+The model uses a 3-stage encoder-decoder with a custom anisotropic convolution operator that treats LiDAR reflectance not as a flat input feature but as a spatial modulator — shaping which geometric neighbourhoods the network attends to based on material properties. This allows the model to exploit the physical distinction between wood and leaf surface returns while remaining robust when reflectance is unreliable or absent.
 
-1. Install the Ubuntu NVIDIA driver (535.183.06 recommended).
-   '''bash
-   sudo ubuntu-drivers install nvidia:535
+A knowledge distillation pipeline produces lightweight biome-specific student models from the full European teacher for fast, low-memory deployment.
 
-2. Install NVIDIA toolkit (https://developer.nvidia.com/cuda-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=22.04&target_type=deb_local)
+---
 
-3. Set up a Conda environment:
-   ```bash
-   conda create --name myenv python=3.10 mamba -c conda-forge
-   conda activate myenv
+## Quick Start
 
-4. install packages within your Conda environment
-   ```bash
-   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-   pip install torch-scatter -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
-   pip install torch-sparse -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
-   pip install torch-cluster -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
-   pip install torch-spline-conv -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
-   pip install torch-geometric
-   pip install pandas pykdtree numba 
-
-📎 [Pytorch](https://pytorch.org/get-started/locally/) instructions for each OS can be found here.
-
-📎 [Pytorch Geometric](https://pytorch-geometric.readthedocs.io/en/latest/notes/installation.html) instructions for each OS can be found here.
-
-### 5. Download Model Weights Using Git LFS
-
-**Install Git LFS:**
 ```bash
-# Ubuntu/Debian
-sudo apt-get install git-lfs
-# macOS
-brew install git-lfs
-# Windows: https://git-lfs.github.com/
+python predict.py --point-cloud your_plot.ply --model h4mcc-eu.pth
+```
+
+Output columns appended to the point cloud:
+- `prediction` — binary label (0 = leaf, 1 = wood)
+- `pwood` — probability of wood (0.0–1.0)
+
+---
+
+## Installation
+
+**Requirements:** Ubuntu 22.04, CUDA 12.2, NVIDIA driver 535+
+
+```bash
+# 1. Create environment
+conda create --name ptw python=3.10 mamba -c conda-forge
+conda activate ptw
+
+# 2. PyTorch + PyG (CUDA 12.1 wheel)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip install torch-scatter -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
+pip install torch-sparse -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
+pip install torch-cluster -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
+pip install torch-spline-conv -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
+pip install torch-geometric
+
+# 3. Other dependencies
+pip install pandas pykdtree numba plyfile wandb
+```
+
+📎 [PyTorch install guide](https://pytorch.org/get-started/locally/) · [PyG install guide](https://pytorch-geometric.readthedocs.io/en/latest/notes/installation.html)
+
+---
+
+## Model Weights (Git LFS)
+
+```bash
+# Install Git LFS
+sudo apt-get install git-lfs   # Ubuntu
+brew install git-lfs           # macOS
 git lfs install
+
+# After cloning, pull weights
+git lfs pull                                              # all models
+git lfs pull --include="pointstowood/model/h4mcc-eu.pth" # teacher only
 ```
 
-**After cloning the repository, download model weights (choose one):**
+---
 
-#### Download Options
-- **All models (~500MB):**
-  ```bash
-  git lfs pull
-  ```
-- **Only EU models (~230MB):**
-  ```bash
-  git lfs pull --include="pointstowood/model/fbeta-eu.pth"
-  git lfs pull --include="pointstowood/model/fbeta-harmonic-eu.pth"
-  git lfs pull --include="pointstowood/model/fbeta-xyz-eu.pth"
-  ```
-- **Only biome models (~7MB):**
-  ```bash
-  git lfs pull --include="pointstowood/model/fbeta-spain.pth"
-  git lfs pull --include="pointstowood/model/fbeta-poland.pth"
-  git lfs pull --include="pointstowood/model/fbeta-finland.pth"
-  ```
-- **A specific model:**
-  ```bash
-  git lfs pull --include="pointstowood/model/fbeta-eu.pth"  # Replace as needed
-  ```
-
-*Tip: You can always run `git lfs pull` later to fetch any missing models.*
-
-
-#
-
-### Running PointsToWood
-   
-1. Activate your conda environment.
-   
-```
-conda activate myenv. 
-```
-
-2. Navigate to the PointsToWood directory.
-   
-```
-cd ~/PointsToWood/pointstowood/
-```
-
-3. Run PointsToWood.
-
-**EU Models (Recommended for General Use):**
-```bash
-# F-beta optimized model with reflectance (recommended)
-python3 predict.py --point-cloud your_data.ply --model fbeta-eu.pth
-
-# Harmonic mean optimized model
-python3 predict.py --point-cloud your_data.ply --model fbeta-harmonic-eu.pth
-
-# XYZ-only model (no reflectance required)
-python3 predict.py --point-cloud your_data.ply --model fbeta-xyz-eu.pth
-```
-
-**Biome-Specific Models (Faster Inference):**
-```bash
-# Spanish forests
-python3 predict.py --point-cloud your_data.ply --model fbeta-spain.pth
-
-# Polish forests
-python3 predict.py --point-cloud your_data.ply --model fbeta-poland.pth
-
-# Finnish forests
-python3 predict.py --point-cloud your_data.ply --model fbeta-finland.pth
-```
-
-**Detection Strategies:**
-- **`--any-wood`**: Aggressive wood detection - classifies as wood if ANY neighbor exceeds threshold
-- **`--is-wood`**: Conservative wood detection - classifies as wood if the MEAN exceeds threshold
-- **`--max-probabilities`**: Uses most confident prediction in each neighborhood
-
-## Knowledge Distillation Training
-
-To train your own distilled models using knowledge distillation:
+## Inference
 
 ```bash
-# Train a lightweight distilled model from EU teacher
-python3 distill.py --teacher-model model/fbeta-eu.pth --data-path your_training_data/
+# Full EU teacher model (recommended)
+python predict.py --point-cloud your_plot.ply --model h4mcc-eu.pth
+
+# No reflectance available
+python predict.py --point-cloud your_plot.ply --model h4mcc-eu.pth --no-reflectance
+
+# Biome-specific distilled model
+python predict.py --point-cloud your_plot.ply --model h4mcc-fin.pth
 ```
 
-## Data Requirements
+**Detection strategies:**
+- `--is-wood` — conservative: wood if mean neighbourhood probability exceeds threshold (default)
+- `--any-wood` — aggressive: wood if any neighbour exceeds threshold
+- `--max-probabilities` — uses most confident prediction per neighbourhood
 
-### Input Format
-- **File Format**: Point cloud must be in `.ply` format
-- **Point Cloud Type**: TLS (Terrestrial Laser Scanner) data
-- **Required Columns**: `x y z` (coordinates)
-- **Optional Columns**: `reflectance` or `intensity` (recommended for best performance)
-- **Point Spacing**: Sub 2 cm optimal, but can function beyond that (not ideal for larger spacing)
-- **Processing**: Handles downsampling from raw TLS output automatically
+**Input requirements:**
+- Format: `.ply`
+- Data type: TLS (terrestrial laser scanning)
+- Required columns: `x y z`
+- Recommended: `reflectance` or `intensity`
+- Point spacing: ≤2 cm optimal; adaptive voxelisation handles denser inputs automatically
 
-### Output Format
-The model will append two new columns to your point cloud:
-- **`prediction`**: Binary classification (0 = leaf, 1 = wood)
-- **`pwood`**: Probability of wood classification (0.0 to 1.0)
+---
 
-## Model Information
+## Training Your Own Model
 
-### Available Models
+### 1. Prepare data
 
-#### **EU Models (18.7M parameters)**
-- **`fbeta-eu.pth`**: F-beta optimized model with slight preference for precision (β = 0.9)
-  - Best for applications where precision is slightly more important than recall
-  - Trained on European forest data with reflectance integration
-  - Recommended for most use cases
-- **`fbeta-harmonic-eu.pth`**: F-beta model with harmonic mean optimization
-  - Optimized using harmonic mean of precision and recall
-  - Enhanced performance on challenging mixed boundaries
-  - Advanced reflectance attention weighting
-- **`fbeta-xyz-eu.pth`**: F-beta model using only XYZ coordinates
-  - Geometry-only model for data without reflectance information
-  - Maintains high performance using spatial features alone
-  - Compatible with any TLS data regardless of reflectance availability
+Split raw plot files 80/10/10 (train/test/eval) along the x-axis:
 
-#### **Knowledge Distilled Biome-Specific Models (565k parameters)**
-Ultra-lightweight models created through knowledge distillation from the full EU models:
-- **`fbeta-spain.pth`**: F-beta optimized distilled model for Spanish forests
-- **`fbeta-poland.pth`**: F-beta optimized distilled model for Polish forests
-- **`fbeta-finland.pth`**: F-beta optimized distilled model for Finnish forests
+```bash
+# Single file
+python split_ply.py /data/fin_plot1.ply --prefix fin --output data/
 
-**Compression Achievements:**
-- **33.2x parameter compression** compared to full EU models (18.7M → 565k parameters)
-- **Reduced kernel complexity**: 8 learnable kernel fields (vs 32 fixed in EU models)
-- **Minimal memory footprint** ideal for edge deployment and resource-constrained environments
-- Uses **semantic distillation** for knowledge transfer
-- **Edge-aware weighted loss** for challenging boundary regions
-- **PointCutMix augmentation** on mono-label samples for robust mixed-boundary training
+# Folder of files
+python split_ply.py /data/finland/ --prefix fin --output data/
+```
 
-**Model Selection Guide:**
-- **Use EU models** for general European forest applications requiring highest accuracy
-- **Use biome-specific distilled models** for targeted regions with fast inference and minimal memory footprint
-- **Use `fbeta-eu.pth`** for best overall performance with reflectance
-- **Use `fbeta-harmonic-eu.pth`** for enhanced boundary detection
-- **Use `fbeta-xyz-eu.pth`** when reflectance data is unavailable 
+Files are named by ISO 3166-1 alpha-3 prefix (`fin`, `esp`, `pol`, `gbr`, `nor`, etc.) and written to `data/train/`, `data/test/`, `data/eval/`. All regions share one raw pool — voxel preprocessing is per-region to prevent mixing.
 
+### 2. Preprocess and train
 
-### References 
+```bash
+# Train on all European data
+python train.py --region eu --preprocess --device cuda
 
-<sub>Mspace Lab (2024) ‘ForestSemantic: A Dataset for Semantic Learning of Forest from Close-Range Sensing’, Geo-spatial Information Science. Zenodo. https://doi.org/10.5281/zenodo.13285640. Distributed under a Creative Commons Attribution Non Commercial No Derivatives 4.0 International licence. <</sub>
+# Train on a single biome
+python train.py --region fin --preprocess --device cuda
 
-<sub>Wang, Di; Takoudjou, Stéphane Momo; Casella, Eric (2021). LeWoS: A universal leaf‐wood classification method to facilitate the 3D modelling of large tropical trees using terrestrial LiDAR [Dataset]. Dryad. https://doi.org/10.5061/dryad.np5hqbzp6. Distributed under a Creative Commons 0 1.0 Universal licence. <</sub>
+# Train on everything
+python train.py --region global --preprocess --device cuda
+```
 
-<sub>Wan, Peng; Zhang, Wuming; Jin, Shuangna (2021). Plot-level wood-leaf separation for terrestrial laser scanning point clouds [Dataset]. Dryad. https://doi.org/10.5061/dryad.rfj6q5799. Distributed under a Creative Commons CC0 1.0 Universal licence. <</sub>
+---
 
-<sub>Weiser, Hannah; Ulrich, Veit; Winiwarter, Lukas; Esmorís, Alberto M.; Höfle, Bernhard, 2024, "Manually labeled terrestrial laser scanning point clouds of individual trees for leaf-wood separation", https://doi.org/10.11588/data/UUMEDI, heiDATA, V1, UNF:6:9U7BGTgjjsWd1GduT1qXjA== [fileUNF]. Distributed under a Creative Commons Attribution 4.0 International Deed.<</sub>
+## Knowledge Distillation
 
-<sub>Harry, J. F. O., Emily, L., & Grieve, S. (2024). Plot-level semantically labelled terrestrial laser scanning point clouds (1.0) [Data set]. Zenodo. https://doi.org/10.5281/zenodo.13268500<</sub>
+Train a lightweight student model from the EU teacher:
 
+```bash
+# Distill to a biome-specific student
+python distill.py --region fin --preprocess --teacher-model h4mcc-eu.pth
+
+# With PACED frontier-weighted KD (concentrate soft loss on uncertain points)
+python distill.py --region fin --preprocess --teacher-model h4mcc-eu.pth --paced
+
+# Scratch baseline (supervised only, no KD — for ablation)
+python distill.py --region fin --preprocess --teacher-model h4mcc-eu.pth --scratch
+```
+
+Student architecture is configurable:
+
+```bash
+--student-c 16          # base channel width
+--student-kernels 16    # kernel points (matches teacher geometric resolution)
+--student-blocks 1 2 1  # residual blocks per encoder stage
+```
+
+---
+
+## Architecture
+
+### The problem
+
+Wood-leaf segmentation in high-resolution TLS is genuinely difficult. The target class spans orders of magnitude in scale — from fine twigs at sub-centimetre resolution to trunk cross-sections metres across. Point density and reflectance calibration vary substantially across sensors and sites. At the boundaries where errors matter most, geometry and reflectance are ambiguous by definition. The architecture is designed around these constraints rather than general-purpose point cloud processing.
+
+### Teacher model (~22M parameters)
+
+A 3-stage encoder-decoder with a custom anisotropic convolution operator.
+
+**Reflectance as a spatial modulator.** Rather than treating LiDAR reflectance as a flat input channel, a per-point gate uses it to weight how strongly each geometric neighbour contributes to the convolution — effectively using material properties to illuminate local structure. The operator remains fully functional without reflectance, falling back to geometry alone.
+
+**Scale and density invariance.** Encoder resolutions scale with input voxel size; neighbourhood distances are normalised by per-neighbourhood maximum rather than a fixed radius. The model is sensor-agnostic by design.
+
+**Boundary-focused supervision.** A multi-scale contrastive loss runs at every encoder stage simultaneously, with labels propagated through the subsampling cascade so boundary points are identified at each geometric scale — not only at the finest resolution after the model has already committed.
+
+**Cyclical focal loss.** The focal exponent follows a cosine schedule: zero at the start (pure cross-entropy for stable early gradients), rising to focus on hard examples mid-training, then tapering for convergence. This resolves the known conflict between focal weighting and early optimisation.
+
+**Decoder.** Grid-based unpooling using encoder cluster indices rather than k-NN interpolation — sharp boundaries, no cross-class averaging.
+
+### Student model (configurable, ~200k–1M parameters)
+
+Same architecture as the teacher, compressed via channel width and block depth rather than geometric resolution — kernel count is kept at K=16 to preserve spatial expressiveness. Trained via knowledge distillation from the teacher with optional frontier-weighted soft targets (concentrating the distillation signal on uncertain boundary points).
+
+---
+
+## Evaluation — H4-MCC
+
+Models are saved on **H4-MCC**: the harmonic mean of Matthews Correlation Coefficient across four evaluation conditions:
+
+| | With reflectance | Without reflectance |
+|---|---|---|
+| All points | MCC | MCC |
+| Boundary points only | MCC | MCC |
+
+This penalises models that degrade without reflectance, perform well on easy interior points but fail at boundaries, or overfit to a single sensor modality.
+
+---
+
+## Region and Data Naming
+
+Files follow ISO 3166-1 alpha-3 naming (`fin01.ply`, `esp03.ply`, `gbr01.ply`). The `--region` flag selects which files are used:
+
+| `--region` | Files used |
+|---|---|
+| `global` | All files in the pool |
+| `eu` | All European ISO codes |
+| `fin` / `esp` / `pol` / ... | That prefix only |
+
+---
+
+## References
+
+<sub>Mspace Lab (2024) ForestSemantic: A Dataset for Semantic Learning of Forest from Close-Range Sensing. Zenodo. https://doi.org/10.5281/zenodo.13285640.</sub>
+
+<sub>Wang, Di; Takoudjou, Stéphane Momo; Casella, Eric (2021). LeWoS: A universal leaf-wood classification method to facilitate the 3D modelling of large tropical trees using terrestrial LiDAR. Dryad. https://doi.org/10.5061/dryad.np5hqbzp6.</sub>
+
+<sub>Wan, Peng; Zhang, Wuming; Jin, Shuangna (2021). Plot-level wood-leaf separation for terrestrial laser scanning point clouds. Dryad. https://doi.org/10.5061/dryad.rfj6q5799.</sub>
+
+<sub>Weiser, Hannah et al. (2024). Manually labeled terrestrial laser scanning point clouds of individual trees for leaf-wood separation. https://doi.org/10.11588/data/UUMEDI.</sub>
+
+<sub>Owen, H. J. F., Lines, E., & Grieve, S. (2024). Plot-level semantically labelled terrestrial laser scanning point clouds (1.0). Zenodo. https://doi.org/10.5281/zenodo.13268500.</sub>

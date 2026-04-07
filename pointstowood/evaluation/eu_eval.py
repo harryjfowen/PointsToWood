@@ -147,7 +147,7 @@ class CollatedEvaluator:
             
             # Load and preprocess the point cloud data
             from src.io import load_file
-            from predict import preprocess_point_cloud_data
+            from src.utils import preprocess_point_cloud_data
             import glob as glob_module
             
             os.makedirs(args.vxfile, exist_ok=True)
