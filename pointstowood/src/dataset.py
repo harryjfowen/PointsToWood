@@ -24,26 +24,37 @@ def _parse_group(key: str) -> str:
     return re.sub(r'\d+$', '', token).lower() or 'unknown'
 
 def sor_filter(pos, reflectance=None, y=None, edge_scores=None, k=16, std_threshold=1.0):
+    """Statistical Outlier Removal: filter points with anomalously high k-NN distances.
+
+    Uses pykdtree for speed; applies boolean mask once to all tensors to reduce overhead.
+    """
     try:
-        from sklearn.neighbors import KDTree
+        from pykdtree.kdtree import KDTree
     except ImportError:
-        print("Warning: sklearn not available, skipping denoising")
-        return pos, reflectance, y, edge_scores
-    
+        try:
+            from sklearn.neighbors import KDTree
+            print("Warning: pykdtree not available, using sklearn KDTree (slower)")
+        except ImportError:
+            print("Warning: KDTree not available, skipping denoising")
+            return pos, reflectance, y, edge_scores
+
     pos_np = pos.cpu().numpy()
     tree = KDTree(pos_np)
     distances, _ = tree.query(pos_np, k=k)
-    mean_distances = np.mean(distances, axis=1)
-    mean = np.mean(mean_distances)
-    std = np.std(mean_distances)
-    threshold = mean + std_threshold * std
+
+    # Mean k-NN distance per point (exclude self, k=1)
+    mean_distances = np.mean(distances[:, 1:], axis=1)
+
+    # Threshold: mean + std_threshold * std
+    threshold = np.mean(mean_distances) + std_threshold * np.std(mean_distances)
     mask = mean_distances < threshold
-    
+
+    # Batch apply mask to all tensors (avoid repeated indexing)
     pos_filtered = pos[mask]
     reflectance_filtered = reflectance[mask] if reflectance is not None else None
     y_filtered = y[mask] if y is not None else None
     edge_scores_filtered = edge_scores[mask] if edge_scores is not None else None
-    
+
     return pos_filtered, reflectance_filtered, y_filtered, edge_scores_filtered
 
 

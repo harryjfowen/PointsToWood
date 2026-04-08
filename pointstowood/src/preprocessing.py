@@ -16,16 +16,29 @@ from src.memory_utils import should_use_cpu_preprocessing
 
 
 def _sor_voxel(voxel_xyz_np, k=10, std_mult=1.0):
-    """Per-voxel SOR on small point set (fast: O(n log n) with n ≤ maxpoints). Returns bool mask (keep inliers)."""
-    try:
-        from sklearn.neighbors import NearestNeighbors
-    except ImportError:
-        return np.ones(voxel_xyz_np.shape[0], dtype=bool)
+    """Per-voxel SOR: filter points with anomalously high k-NN distances.
+
+    Returns bool mask (keep inliers). Uses pykdtree for speed.
+    """
     n = voxel_xyz_np.shape[0]
     if n < k + 2:
         return np.ones(n, dtype=bool)
-    nn = NearestNeighbors(n_neighbors=k + 1, algorithm='kd_tree', n_jobs=1).fit(voxel_xyz_np)
-    dists, _ = nn.kneighbors(voxel_xyz_np)
+
+    try:
+        from pykdtree.kdtree import KDTree
+    except ImportError:
+        try:
+            from sklearn.neighbors import NearestNeighbors
+            nn = NearestNeighbors(n_neighbors=k + 1, algorithm='kd_tree', n_jobs=1).fit(voxel_xyz_np)
+            dists, _ = nn.kneighbors(voxel_xyz_np)
+        except ImportError:
+            return np.ones(n, dtype=bool)
+    else:
+        # Use pykdtree: faster than sklearn for this use case
+        tree = KDTree(voxel_xyz_np)
+        dists, _ = tree.query(voxel_xyz_np, k=k + 1)
+
+    # Mean k-NN distance (exclude self at k=0)
     mean_d = np.mean(dists[:, 1:], axis=1)
     thresh = np.mean(mean_d) + std_mult * (np.std(mean_d) + 1e-8)
     return mean_d <= thresh
