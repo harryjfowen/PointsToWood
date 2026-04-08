@@ -128,7 +128,7 @@ def _resolve_amp_config(device, amp_dtype: str = "auto"):
     return True, torch.float16, "fp16(auto)"
 
 
-def run_validation_pass(model, test_loader, device, mode_name, augmentation_mode, args):
+def run_validation_pass(model, test_loader, device, mode_name, augmentation_mode, args, track_groups=False):
     """Run a single validation pass with specified augmentation mode."""
     # Temporarily modify the dataset mode
     original_mode = test_loader.dataset.mode
@@ -137,6 +137,9 @@ def run_validation_pass(model, test_loader, device, mode_name, augmentation_mode
     # Edge voxel size for ASD normalization (hardcoded in dataset.py:51 as 0.25m)
     # This is the resolution used to detect mixed-label voxels (edge points)
     test_tracker = MetricsTracker(full_metrics=True, edge_voxel_size=0.25)
+
+    group_list = getattr(test_loader.dataset, 'group_list', None)
+    group_preds: dict = {}  # group_name -> {'y_true': [], 'y_pred': []}
 
     # Limit validation steps (0 = use all data)
     val_steps = getattr(args, 'val_steps', 0)
@@ -160,6 +163,23 @@ def run_validation_pass(model, test_loader, device, mode_name, augmentation_mode
                                    edge_scores=getattr(data, 'edge_scores', None),
                                    pos=getattr(data, 'pos', None))
 
+                # Accumulate per-group predictions using batch + group_idx
+                if track_groups and group_list is not None and hasattr(data, 'group_idx') and data.group_idx is not None:
+                    probs = torch.sigmoid(outputs)
+                    y_pred = (probs >= 0.5).int().cpu().numpy()
+                    y_true = (data.y >= 0.5).int().cpu().numpy()
+                    batch_idx = data.batch.cpu().numpy()
+                    group_ids = data.group_idx.view(-1).cpu().numpy()
+                    for sample_i, gid in enumerate(group_ids):
+                        gname = group_list[gid]
+                        mask = batch_idx == sample_i
+                        if not mask.any():
+                            continue
+                        if gname not in group_preds:
+                            group_preds[gname] = {'y_true': [], 'y_pred': []}
+                        group_preds[gname]['y_true'].append(y_true[mask])
+                        group_preds[gname]['y_pred'].append(y_pred[mask])
+
                 # Use fast running averages for progress bar (no expensive metrics)
                 curr_metrics = test_tracker.get_running_averages()
                 tepoch.set_description(f"Val {mode_name}")
@@ -176,6 +196,16 @@ def run_validation_pass(model, test_loader, device, mode_name, augmentation_mode
 
     # Restore original mode
     test_loader.dataset.mode = original_mode
+
+    if track_groups and group_preds:
+        from sklearn.metrics import matthews_corrcoef
+        parts = []
+        for gname in sorted(group_preds):
+            yt = np.concatenate(group_preds[gname]['y_true'])
+            yp = np.concatenate(group_preds[gname]['y_pred'])
+            mcc = matthews_corrcoef(yt, yp) if len(set(yt)) > 1 else 0.0
+            parts.append(f'{gname}:{mcc:.3f}')
+        print(f'[Test group MCC] {" | ".join(parts)}')
 
     return test_tracker.get_averages()
 
@@ -338,6 +368,7 @@ def run_eval_visualization(model, args, device, epoch):
 
     vis_dir = os.path.join(os.path.dirname(eval_vxfile), 'visualisations')
     os.makedirs(vis_dir, exist_ok=True)
+    n_saved = 0
     grid_size_model = getattr(args, 'eval_grid_size', None)
     if grid_size_model is None:
         grid_size_model = args.grid_size[0] if isinstance(args.grid_size, (list, tuple)) else args.grid_size
@@ -475,8 +506,9 @@ def run_eval_visualization(model, args, device, epoch):
 
         aggregate_and_save(classified, out_path)
         aggregate_and_save(classified_xyz, out_path_xyz)
-        if getattr(args, 'verbose', False):
-            print(f'Eval visualization saved: {out_path}, {out_path_xyz}')
+        n_saved += 1
+
+    print(f'[Eval] Saved {n_saved} visualisation(s) → {vis_dir}')
 
 
 class EMAModel:
@@ -1042,7 +1074,7 @@ def SemanticTraining(args):
             if ema_model is not None:
                 ema_model.apply_shadow()
 
-            test_metrics_with_refl = run_validation_pass(model, test_loader, device, "With Reflectance", "val_with_reflectance", args)
+            test_metrics_with_refl = run_validation_pass(model, test_loader, device, "With Reflectance", "val_with_reflectance", args, track_groups=True)
             test_metrics_no_refl = run_validation_pass(model, test_loader, device, "No Reflectance", "val_no_reflectance", args)
 
             harmonic_metrics = calculate_harmonic_metrics(test_metrics_with_refl, test_metrics_no_refl)

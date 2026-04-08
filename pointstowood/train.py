@@ -107,6 +107,8 @@ if __name__ == '__main__':
                             help='Disable FP penalty ramp (use full weight from epoch 1). Default: ramp 0→1 over training.')
         parser.add_argument('--eval', nargs='?', default=True, const=True, metavar='PLY',
                             help='Eval visualization: optional PLY filename in data/eval/ filtered by region prefix (if omitted, use all matching files)')
+        parser.add_argument('--no-eval', dest='eval', action='store_const', const=None,
+                            help='Disable eval visualization entirely.')
         parser.add_argument('--eval-grid-size', type=float, default=2.0,
                             help='Grid size (m) used only for eval visualization voxelization (default 2.0).')
         parser.add_argument('--sor', action='store_true', help='Per-voxel SOR before subsampling when writing voxels (k=10, 1 std)')

@@ -592,7 +592,6 @@ class HistoryLogger:
                 os.path.splitext(self.args.model)[0] + "_history.csv"
             )
             np.savetxt(history_path, self.history)
-            print("Saved training history successfully.")
         except OSError:
             backup_path = os.path.join(
                 self.args.wdir, 'model', 
