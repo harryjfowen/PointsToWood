@@ -259,7 +259,6 @@ class SAModule(torch.nn.Module):
             x,
             (pos_conv, pos_conv[idx]),
             edge_index,
-            neighborhood_radius=None,  # use max_d in conv → density-invariant radial feature
         )
 
         # 4. Restore metres for next layer (pos*sf)
