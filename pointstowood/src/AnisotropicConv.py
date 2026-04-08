@@ -119,9 +119,7 @@ class AnisotropicConv(MessagePassing):
             nn.init.constant_(self.refl_reliability_gate[2].bias, self.refl_gate_bias_init)
 
     def forward(self, x: Union[OptTensor, PairOptTensor],
-                pos: Union[Tensor, PairTensor], edge_index: Adj,
-                sf: Optional[Tensor] = None, voxel_size: Optional[Union[float, Tensor]] = None,
-                batch_idx: Optional[Tensor] = None, **unused_kwargs) -> Tensor:
+                pos: Union[Tensor, PairTensor], edge_index: Adj) -> Tensor:
         """Anisotropic convolution: geometry-first routing with reflectance gating.
 
         Args:
@@ -129,7 +127,6 @@ class AnisotropicConv(MessagePassing):
             pos: Node positions. Expects pos[:, :3] = xyz coordinates, pos[:, 3] = reflectance.
                  Shape [N, >=4] or tuple of (pos_src, pos_tgt).
             edge_index: Graph connectivity.
-            sf, voxel_size, batch_idx: Legacy parameters (unused, accepted for API compatibility).
 
         Returns:
             Output features [N, K*F + 3] where K*F are aggregated features across kernel

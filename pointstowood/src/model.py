@@ -259,9 +259,6 @@ class SAModule(torch.nn.Module):
             x,
             (pos_conv, pos_conv[idx]),
             edge_index,
-            sf=sf[batch[idx]],
-            voxel_size=voxel_size,
-            batch_idx=batch[idx],
             neighborhood_radius=None,  # use max_d in conv → density-invariant radial feature
         )
 
