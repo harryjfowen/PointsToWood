@@ -6,6 +6,7 @@ from src.AnisotropicConv import AnisotropicConv
 from torch_geometric.nn.pool.consecutive import consecutive_cluster
 from torch_scatter import scatter_max, scatter_add
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 
 def initialize_weights(model):
@@ -234,7 +235,6 @@ class SAModule(torch.nn.Module):
         Returns cluster indices for grid unpooling in decoder (KPConvX-style).
         """
         pos = torch.cat([pos[:, :3], reflectance.unsqueeze(-1)], dim=-1)
-        pos_conv = pos
 
         # 1. Graph construction in METRES (k-NN, density-agnostic)
         # Always exactly k neighbours regardless of point spacing — sensor-agnostic.
@@ -250,19 +250,17 @@ class SAModule(torch.nn.Module):
         )
         edge_index = torch.stack([col, row], dim=0)
 
-        # 2. Normalize to unit scale for conv (pos/sf → ~[-1,1])
-        pos_conv[:, :3] = pos_conv[:, :3] / sf[batch].unsqueeze(-1)
+        # 2. Normalize xyz to unit scale for conv (pos/sf → ~[-1,1])
+        # Non-in-place: critical for gradient checkpointing (forward reruns during backward)
+        sf_scale = sf[batch].unsqueeze(-1)
+        pos_conv = torch.cat([pos[:, :3] / sf_scale, pos[:, 3:]], dim=-1)
 
         # 3. Conv: radial feature normalized by max_d (density-invariant), not fixed radius.
-        # Graph and SA resolution still scale with voxel_size; only dist_norm uses per-neighborhood max distance.
         x = self.conv(
             x,
             (pos_conv, pos_conv[idx]),
             edge_index,
         )
-
-        # 4. Restore metres for next layer (pos*sf)
-        pos_conv[:, :3] = pos_conv[:, :3] * sf[batch].unsqueeze(-1)
 
         residual_edge_index = None
         if self.spatial_mix_lite:
@@ -278,11 +276,12 @@ class SAModule(torch.nn.Module):
         for block in self.residual_blocks:
             x = block(x, batch_coarse, edge_index=residual_edge_index)
 
-        pos = pos_conv[idx, :3]
-        reflectance = pos_conv[idx, 3]
+        # pos was never mutated (non-in-place scaling), so idx into original pos for metres
+        pos_out = pos[idx, :3]
+        reflectance = pos[idx, 3]
         batch = batch_coarse
         # Return cluster for grid unpooling: cluster[i] = index of coarse point for fine point i
-        return x, pos, batch, reflectance, sf, cluster
+        return x, pos_out, batch, reflectance, sf, cluster
 
 class FPModule(torch.nn.Module):
     """Feature Propagation with grid unpooling (KPConvX-style).
@@ -348,8 +347,11 @@ class NetFull(torch.nn.Module):
     - SA1, SA2, SA3: Flashlight-enabled (reflectance structure tensor)
     - Block pattern 4-6-2: weighted toward fine/mid scale where leaf-twig errors occur
     """
-    def __init__(self, num_classes, C=128, num_kernel_points=16, learnable_kernels=False, drop_path_rate=0.0, dualnorm_lite: bool = False, spatial_mix_lite: bool = False):
+    def __init__(self, num_classes, C=128, num_kernel_points=16, learnable_kernels=False, drop_path_rate=0.0, dualnorm_lite: bool = False, spatial_mix_lite: bool = False, use_gradient_checkpointing: bool = True):
         super(NetFull, self).__init__()
+
+        # Gradient checkpointing: trade computation for memory (20-30% memory savings, ~15-20% slowdown)
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         # Voxelsample resolution RATIOS (relative to voxel_size, for scale invariance)
         # At runtime, multiply by voxel_size so resolutions scale with input
@@ -420,14 +422,23 @@ class NetFull(torch.nn.Module):
 
         # Encoder: each SA module returns (x, pos, batch, refl, sf, cluster)
         # SA1, SA2: flashlight-enabled (use reflectance)
-        sa1_out = self.sa1_module(*sa0_out, voxel_size=voxel_size)
+        if self.use_gradient_checkpointing and self.training:
+            sa1_out = checkpoint(self.sa1_module, *sa0_out, voxel_size=voxel_size, use_reentrant=False)
+        else:
+            sa1_out = self.sa1_module(*sa0_out, voxel_size=voxel_size)
         x1, pos1, batch1, refl1, sf, cluster1 = sa1_out
 
-        sa2_out = self.sa2_module(x1, pos1, batch1, refl1, sf, voxel_size=voxel_size)
+        if self.use_gradient_checkpointing and self.training:
+            sa2_out = checkpoint(self.sa2_module, x1, pos1, batch1, refl1, sf, voxel_size=voxel_size, use_reentrant=False)
+        else:
+            sa2_out = self.sa2_module(x1, pos1, batch1, refl1, sf, voxel_size=voxel_size)
         x2, pos2, batch2, refl2, sf, cluster2 = sa2_out
 
         # SA3: flashlight at coarse scale (~8cm) – bright sampling + pattern_diff for coarse bright vs dark regions
-        sa3_out = self.sa3_module(x2, pos2, batch2, refl2, sf, voxel_size=voxel_size)
+        if self.use_gradient_checkpointing and self.training:
+            sa3_out = checkpoint(self.sa3_module, x2, pos2, batch2, refl2, sf, voxel_size=voxel_size, use_reentrant=False)
+        else:
+            sa3_out = self.sa3_module(x2, pos2, batch2, refl2, sf, voxel_size=voxel_size)
         x3, pos3, batch3, refl3, sf, cluster3 = sa3_out
 
         # Store encoder features for CBL / feature KD

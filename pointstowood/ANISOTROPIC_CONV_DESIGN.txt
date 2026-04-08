@@ -1,0 +1,118 @@
+================================================================================
+                    AnisotropicConv: Design Essence
+       Geometry-First with Reflectance as Flashlight Illuminating Structure
+================================================================================
+
+CORE PRINCIPLE
+==============
+In LiDAR point clouds, geometry and reflectance are entangled. AnisotropicConv
+learns to separate them:
+  - Geometry determines WHERE to look (kernel routing, neighbor discovery)
+  - Reflectance illuminates WHAT is structure vs. noise (gating mechanism)
+
+Without reflectance: noisy geometry looks like noise
+With reflectance: bright twigs in dark canopy become visible; dark branches in
+                  bright clearings become visible; uniform brightness is suppressed
+
+
+TECHNICAL FLOW
+==============
+
+1. FLASHLIGHT DETECTION: Robust Local Contrast
+   ─────────────────────────────────────────────
+   Per-neighborhood median reflectance (robust to specular spikes)
+   r_local = |reflectance - median|  for each edge
+
+   Uniformly bright or dark → r_local ≈ 0 → flashlight is "off"
+   Contrast exists → r_local > 0 → flashlight reveals structure
+
+   Absolute deviation: dark twigs in bright leaves = bright twigs in dark leaves
+
+
+2. STRUCTURE TENSOR TRINITY: Three Perspectives
+   ─────────────────────────────────────────────
+   Each point aggregates directional outer products from its neighbors:
+
+   a) M_geom = (1/k) Σ d̂⊗d̂
+      Pure geometry. Large eigenvalues = coherent clustering.
+      Small eigenvalues = scattered, noise-like.
+
+   b) M_refl = (1/k) Σ r_local·d̂⊗d̂
+      Brightness-weighted geometry. Eigenvectors align with directions
+      where reflectance contrasts exist.
+
+   c) D = M_refl - M_geom
+      THE FLASHLIGHT EFFECT. Shows where brightness adds/removes structure:
+      - Positive eigenvalues: reflectance reveals structure (twigs in foliage)
+      - Negative eigenvalues: reflectance contradicts geometry (lichen on rock)
+      - Near-zero: reflectance is pure noise
+
+
+3. PER-DIRECTION EIGENVALUE GATES: Learned Discrimination
+   ───────────────────────────────────────────────────────
+   Gate sees: [kernel routing (K) + M_geom eigvals (3) + M_refl eigvals (3)
+               + D eigvals (3) + contrast strength (1)]
+
+   Gate outputs: 3 scalar gates (one per eigenvalue direction) + 1 point trust
+                 + 1 signed edge modulation scalar
+
+   Key insight: Different directions have different reflectance SNR
+     e0 (fine texture): reflectance reveals small branches → gate ↑
+     e1 (curvature):    reflectance indicates edges → gate ↑
+     e2 (dominant):     geometry is clean, reflectance is noise → gate ↓
+
+   The gate learns this discriminatively. Not a binary switch; fine control.
+
+
+4. TRUST-AWARE SIGNED EDGE MODULATION: Geometry Routes, Reflectance Sharpens or Suppresses
+   ─────────────────────────────────────────────────────────────────────────────────────────
+   Geometry still determines kernel routing (which bin is each edge assigned to)
+   Reflectance modulates edge strength before aggregation:
+
+   refl_score = r_local / (mean_contrast_in_neighborhood + epsilon)
+   signed_mod = tanh(mod_logit)
+   refl_gain = 1.0 + trust * beta * signed_mod * tanh(refl_score)
+   refl_gain = clamp(refl_gain, 1.0 - cap, 1.0 + cap)
+   weighted_feat = weighted_feat * refl_gain
+
+   High trust + positive signed_mod + strong local contrast → gain > 1.0 → amplify edge
+   High trust + negative signed_mod + strong local contrast → gain < 1.0 → suppress edge
+   Low trust or uniform neighborhood → gain ≈ 1.0 → let geometry dominate
+
+   This prevents reflectance from inventing structure where geometry is flat,
+   and lets the model actively damp misleading brightness in geometry-sufficient zones.
+
+
+WHY THIS DESIGN
+===============
+✓ Directional Control: Per-eigenvalue gates recognize that not all directions
+  benefit equally from reflectance (some are geometry-clean, others are noisy)
+
+✓ Contrast-Aware: Normalizing by neighborhood contrast handles scale variations
+  (dense clusters vs. sparse forests) automatically
+
+✓ Point-Level Reliability: Each point's trust depends on its own
+  geometry-reflectance consistency, not global thresholds
+
+✓ Rooted in Theory: Structure tensors from classical geometry (curvature,
+  normal estimation); eigenvalue analysis from spectral methods. Not black-box.
+
+✓ Sensor-Agnostic: Uses absolute contrast (|brightness deviation|), so works
+  with any reflectance scale or sensor gain.
+
+
+OUTPUTS
+=======
+Convolution produces:
+  - agg_feat: Aggregated features across K kernel directions [N, K*F]
+  - eigvals_gated: The three gated eigenvalues of D [N, 3]
+            (tells decoder which directions reflectance was trusted)
+
+
+IMPLEMENTATION NOTES
+====================
+- Median is computed robustly via two-level stable sort (avoids float precision)
+- Eigenvalues computed via torch.linalg.eigvalsh (ascending order: e0 ≤ e1 ≤ e2)
+- Tensor cleanup: intermediate [E, 9] and [E, F, K] tensors deleted after use
+  to reduce GPU memory fragmentation during gradient accumulation
+- In-place mutations avoided to preserve checkpoint recomputation correctness

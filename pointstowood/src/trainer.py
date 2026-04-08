@@ -50,6 +50,9 @@ class GroupWeightTracker:
     def log_str(self) -> str:
         return ' | '.join(f'{g}:{w:.3f}' for g, w in sorted(self.weights.items()))
 
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 seed = 141190
 torch.manual_seed(seed)
 torch.backends.cudnn.benchmark = False
@@ -401,6 +404,7 @@ def run_eval_visualization(model, args, device, epoch):
                 data.voxel_size = torch.tensor([float(grid_size_model)], dtype=torch.float32, device=data.pos.device)
                 batch_ids = data.batch.cpu()
                 pos = data.pos.cpu()
+                refl = data.reflectance.cpu() if hasattr(data, 'reflectance') else None
                 local_shift = data.local_shift.cpu()
 
                 # Pass 1: with reflectance
@@ -415,7 +419,10 @@ def run_eval_visualization(model, args, device, epoch):
                 for b, (s, e) in enumerate(zip(starts, splits)):
                     shift = local_shift[3 * b : 3 * b + 3]
                     pos_global = (pos[s:e] + shift).numpy()
-                    output_list.append(np.column_stack((pos_global, probs_np[s:e].ravel())))
+                    if refl is not None:
+                        output_list.append(np.column_stack((pos_global, probs_np[s:e].ravel(), refl[s:e].numpy())))
+                    else:
+                        output_list.append(np.column_stack((pos_global, probs_np[s:e].ravel())))
 
                 # Pass 2: reflectance zeroed (XYZ-only, for visualization)
                 data.reflectance = torch.zeros_like(data.reflectance, device=data.reflectance.device)
@@ -433,9 +440,12 @@ def run_eval_visualization(model, args, device, epoch):
         if not output_list:
             continue
 
-        def aggregate_and_save(classified_arr, out_path):
+        def aggregate_and_save(classified_arr, out_path, include_refl=True):
             pos_t = torch.as_tensor(classified_arr[:, :3], dtype=torch.float32, device='cpu')
             prob_t = torch.as_tensor(classified_arr[:, 3], dtype=torch.float32, device='cpu')
+            has_refl = classified_arr.shape[1] > 4
+            if has_refl and include_refl:
+                refl_t = torch.as_tensor(classified_arr[:, 4], dtype=torch.float32, device='cpu')
             cluster = voxel_grid(pos_t, collect_grid_size)
             cluster, _ = consecutive_cluster(cluster)
             # Argmax on |p - 0.5|: pick the most confident point (either direction) to decide voxel label
@@ -445,8 +455,15 @@ def run_eval_visualization(model, args, device, epoch):
             voxel_label = (winning_prob >= 0.5).long().numpy()
             point_labels = voxel_label[cluster.numpy()]
             pos_np = pos_t.numpy()
-            out_df = pd.DataFrame({'x': pos_np[:, 0], 'y': pos_np[:, 1], 'z': pos_np[:, 2], 'label': point_labels})
-            save_file(out_path, out_df, additional_fields=['label'], verbose=False)
+            out_dict = {'x': pos_np[:, 0], 'y': pos_np[:, 1], 'z': pos_np[:, 2], 'label': point_labels}
+            additional_fields = ['label']
+            # Add reflectance from the winning point if available
+            if has_refl and include_refl:
+                winning_refl = refl_t[argmax_idx[cluster.numpy()]]
+                out_dict['reflectance'] = winning_refl.numpy()
+                additional_fields.append('reflectance')
+            out_df = pd.DataFrame(out_dict)
+            save_file(out_path, out_df, additional_fields=additional_fields, verbose=False)
 
         classified = np.vstack(output_list)
         classified_xyz = np.vstack(output_list_xyz)
@@ -504,8 +521,8 @@ def run_eval_visualization(model, args, device, epoch):
             out_path = os.path.join(vis_dir, f'{prefix}_eval.ply')
             out_path_xyz = os.path.join(vis_dir, f'{prefix}_eval_xyz.ply')
 
-        aggregate_and_save(classified, out_path)
-        aggregate_and_save(classified_xyz, out_path_xyz)
+        aggregate_and_save(classified, out_path, include_refl=True)
+        aggregate_and_save(classified_xyz, out_path_xyz, include_refl=False)
         n_saved += 1
 
     print(f'[Eval] Saved {n_saved} visualisation(s) → {vis_dir}')
@@ -622,15 +639,20 @@ def SemanticTraining(args):
     gamma_peak_pct = min(0.95, max(0.05, gamma_peak_pct))
     label_smoothing = getattr(args, 'label_smoothing', 0.1)
     focal_alpha = getattr(args, 'focal_alpha', None)
+    boundary_max = getattr(args, 'boundary_weight', 2.0)
+    boundary_ramp_start = getattr(args, 'boundary_ramp_start', 0.1)
     criterion = FocalLoss(
         gamma_max=gamma_max,
         alpha=focal_alpha,
         label_smoothing=label_smoothing,
         cyclical=True,
         pct_peak=gamma_peak_pct,
+        boundary_max=boundary_max,
+        boundary_ramp_start=boundary_ramp_start,
     )
+    boundary_str = f", boundary={boundary_max}x (ramp from {boundary_ramp_start:.0%})" if boundary_max > 0 else ""
     print(
-        f"Loss: Focal gamma_max={gamma_max}, peak={gamma_peak_pct:.2f}, alpha={focal_alpha}, label_smoothing={label_smoothing}"
+        f"Loss: Focal gamma_max={gamma_max}, peak={gamma_peak_pct:.2f}, alpha={focal_alpha}, label_smoothing={label_smoothing}{boundary_str}"
         + (" (plain BCE)" if gamma_max == 0 else "")
     )
 
@@ -674,6 +696,8 @@ def SemanticTraining(args):
             alpha=focal_alpha,
             label_smoothing=label_smoothing,
             cyclical=False,
+            boundary_max=boundary_max,
+            boundary_ramp_start=boundary_ramp_start,
             reduction='none',
         )
         # Force gamma=0 on main criterion too — avoid double hard-example focusing
@@ -756,10 +780,13 @@ def SemanticTraining(args):
 
         criterion.set_epoch(epoch, args.num_epochs)
         cbl_criterion.set_epoch(epoch, args.num_epochs)
+        if criterion_none is not None:
+            criterion_none.set_epoch(epoch, args.num_epochs)
         if refl_fp_criterion is not None:
             refl_fp_criterion.set_epoch(epoch, args.num_epochs)
         refl_str = f" | ReflFP: {refl_fp_criterion.ramp_factor:.3f}" if refl_fp_criterion is not None else ""
-        print(f"LR: {optimizer.param_groups[0]['lr']:.6f} | Gamma: {criterion.current_gamma:.3f} | CBL: {cbl_criterion.ramp_factor:.3f}{refl_str}")
+        boundary_str = f" | Boundary: {criterion.boundary_weight:.2f}x" if criterion.boundary_max > 0 else ""
+        print(f"LR: {optimizer.param_groups[0]['lr']:.6f} | Gamma: {criterion.current_gamma:.3f} | CBL: {cbl_criterion.ramp_factor:.3f}{boundary_str}{refl_str}")
         train_tracker = MetricsTracker(full_metrics=False)  # Fast metrics only for training
         epoch_group_losses: dict = {}  # group_name -> list of per-sample losses (for GroupDRO update)
 
@@ -817,6 +844,7 @@ def SemanticTraining(args):
                     pass
                 
                 _set_batch_voxel_size(data, args)
+
                 with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=amp_enabled):
                     model_output = model(data)
 
@@ -830,7 +858,7 @@ def SemanticTraining(args):
 
                     if use_group_dro and hasattr(data, 'group_idx') and data.group_idx is not None:
                         # Per-point BCE (gamma=0), aggregate to per-sample, apply group weights
-                        loss_per_point = criterion_none(outputs, data.y.float())  # [N_points]
+                        loss_per_point = criterion_none(outputs, data.y.float(), edge_scores=getattr(data, 'edge_scores', None))  # [N_points]
                         n_samples = int(data.batch.max().item()) + 1
 
                         # Per-sample mean loss
@@ -857,7 +885,7 @@ def SemanticTraining(args):
                                 epoch_group_losses[g_name] = []
                             epoch_group_losses[g_name].append(per_sample_loss[s].item())
                     else:
-                        loss = criterion(outputs, data.y.float())
+                        loss = criterion(outputs, data.y.float(), edge_scores=getattr(data, 'edge_scores', None))
 
                     if hasattr(model, 'encoder_stages') and model.encoder_stages:
                         cbl_loss = cbl_criterion(
@@ -887,7 +915,6 @@ def SemanticTraining(args):
                     train_tracker.update(loss_value * accumulation_steps, outputs, data.y, 
                                         edge_scores=data.edge_scores, pos=None)  # No pos needed for training metrics
 
-                    # Explicit memory clearing (avoid empty_cache every batch - it's slow)
                     del data, outputs, loss
 
                 # Check for gradient update
@@ -1093,7 +1120,7 @@ def SemanticTraining(args):
         history_logger.log_epoch(epoch, optimizer.param_groups[0]["lr"], train_metrics, test_metrics)
         wandb_logger.log_epoch(epoch, optimizer.param_groups[0]["lr"], train_metrics, test_metrics, model_metrics=model_metrics)
 
-        if getattr(args, 'eval', False):
+        if getattr(args, 'eval', False) and epoch % 10 == 0:
             if ema_model is not None:
                 ema_model.apply_shadow()
             run_eval_visualization(model, args, device, epoch)

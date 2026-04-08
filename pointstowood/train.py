@@ -83,8 +83,10 @@ if __name__ == '__main__':
                             help='Avoid batches smaller than this (e.g., single 4K voxel). Packs small samples with next even if over target; collate downsamples.')
         parser.add_argument('--packing-mode', type=str, default='balanced_bfd', choices=['ffd', 'bfd', 'balanced', 'balanced_bfd'],
                             help='Batch packing: bfd=Best-Fit Decreasing (flattest), ffd=First-Fit, balanced=class round-robin, balanced_bfd=class-aware BFD + smoothing (default: balanced_bfd)')
-        parser.add_argument('--edge-weight-loss', type=float, default=0.0,
-                            help='Max edge weighting in focal loss (0=off). Ramps in after 10%% of training.')
+        parser.add_argument('--boundary-weight', type=float, default=2.0,
+                            help='Boundary curriculum: max extra weight for mixed-label points (0=off, 2.0=3x at peak). Normalized to preserve loss scale.')
+        parser.add_argument('--boundary-ramp-start', type=float, default=0.1,
+                            help='Fraction of training before boundary weight ramp begins (default 0.1).')
         parser.add_argument('--gamma-max', type=float, default=1.0,
                             help='Focal loss max gamma (0=plain BCE, no focal weighting). Cyclical: 0→gamma_max→0 over training.')
         parser.add_argument('--gamma-peak-pct', type=float, default=0.5,

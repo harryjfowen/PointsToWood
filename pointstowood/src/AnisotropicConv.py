@@ -7,6 +7,8 @@ Flashlight: D = M_refl - M_geom, where M_refl weights direction outer-products b
   a uniformly bright or dark neighbourhood gives r_local≈0 so M_refl≈0 and the gate suppresses.
   Both bright and dark deviations count so dark twigs in bright canopy are detectable.
 Reflectance reliability gate: per-eigenvalue learned gate — scales eigvals(D) independently.
+Signed edge modulation: learned reflectance gain around 1.0 can either amplify
+  or attenuate edge contributions while remaining strictly positive.
 Output: agg_feat (F*K) + eigvals_gated (3).
 """
 
@@ -95,17 +97,18 @@ class AnisotropicConv(MessagePassing):
 
         # Per-point reflectance reliability gate.
         # Input: geom kernel mass (K) + geom eigvals (3) + refl eigvals (3) + D eigvals (3) + contrast strength (1)
-        # Output: 3 eigval gates + 1 trust scalar
+        # Output: 3 eigval gates + 1 trust scalar + 1 signed modulation scalar
         # Gate sees all three spectra to learn relationships:
         # - Eigval gates (3): independently scale each eigenvalue (directional control)
-        # - Trust scalar (1): point-level reliability for edge-level reflectance gain
+        # - Trust scalar (1): point-level reliability for edge-level reflectance magnitude
+        # - Signed modulation (1): whether reflectance should amplify or attenuate edges
         gate_hidden = max(8, num_kernel_points)
         self.refl_reliability_gate = nn.Sequential(
             nn.Linear(num_kernel_points + 10, gate_hidden),
             nn.ReLU(),
-            nn.Linear(gate_hidden, 4),
-            nn.Sigmoid(),
         )
+        self.refl_gate_head = nn.Linear(gate_hidden, 4)
+        self.refl_mod_head = nn.Linear(gate_hidden, 1)
 
         self.reset_parameters()
 
@@ -113,10 +116,15 @@ class AnisotropicConv(MessagePassing):
         reset(self.local_nn)
         reset(self.global_nn)
         reset(self.refl_reliability_gate)
+        reset(self.refl_gate_head)
+        reset(self.refl_mod_head)
         # Gate bias controls initial reflectance reliance.
         # 0.0 = neutral, negative = cautious, positive = rely-more.
-        if isinstance(self.refl_reliability_gate[2], nn.Linear):
-            nn.init.constant_(self.refl_reliability_gate[2].bias, self.refl_gate_bias_init)
+        nn.init.constant_(self.refl_gate_head.bias, self.refl_gate_bias_init)
+        # Start the signed edge modulator at exactly neutral so retraining begins
+        # from geometry-only edge strength and learns suppression/amplification.
+        nn.init.zeros_(self.refl_mod_head.weight)
+        nn.init.zeros_(self.refl_mod_head.bias)
 
     def forward(self, x: Union[OptTensor, PairOptTensor],
                 pos: Union[Tensor, PairTensor], edge_index: Adj) -> Tensor:
@@ -256,26 +264,33 @@ class AnisotropicConv(MessagePassing):
         # M_geom = (1/k) Σ d̂⊗d̂           — geometric neighbourhood shape
         # M_refl = (1/k) Σ r_local·d̂⊗d̂   — brightness-weighted shape
         # D = M_refl - M_geom: where does brightness deviate from pure geometry?
+        # Cache outer_flat to avoid recomputing (used for both M_geom and M_refl scatter_add)
         outer_flat = (rel_dir.unsqueeze(-1) * rel_dir.unsqueeze(-2)).view(-1, 9)  # [E, 9]
         nc = neighbor_count.unsqueeze(-1)  # [N, 1, 1] after second unsqueeze below
 
         M_geom = scatter_add(outer_flat, index, dim=0, dim_size=dim_size).view(n_pts, 3, 3) / nc  # nc [N,1,1] broadcasts to [N,3,3]
         M_refl = scatter_add(r_local.unsqueeze(1) * outer_flat, index, dim=0, dim_size=dim_size).view(n_pts, 3, 3) / nc
+        del outer_flat  # [E, 9] — no longer needed, free before eigvalsh workspace
 
         # Eigenvalues of geometry structure tensor (tells gate if geometry is coherent or scattered)
         M_geom_sym = (M_geom + M_geom.transpose(-1, -2)) * 0.5
         eigvals_geom = torch.linalg.eigvalsh(M_geom_sym)  # [N, 3] ascending
         eigvals_geom = torch.nan_to_num(eigvals_geom, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Eigenvalues of reflectance structure tensor (tells gate if reflectance shows structure)
-        M_refl_sym = (M_refl + M_refl.transpose(-1, -2)) * 0.5
-        eigvals_refl = torch.linalg.eigvalsh(M_refl_sym)  # [N, 3] ascending
-        eigvals_refl = torch.nan_to_num(eigvals_refl, nan=0.0, posinf=0.0, neginf=0.0)
-
-        D_sym = (M_refl - M_geom)
-        D_sym = (D_sym + D_sym.transpose(-1, -2)) * 0.5  # enforce symmetry for eigvalsh
+        # D = M_refl - M_geom: where does brightness deviate from pure geometry?
+        D_sym = M_refl - M_geom
+        del M_geom  # free before next eigvalsh
+        D_sym = (D_sym + D_sym.transpose(-1, -2)) * 0.5
         eigvals = torch.linalg.eigvalsh(D_sym)  # [N, 3] ascending: e0 ≤ e1 ≤ e2
         eigvals = torch.nan_to_num(eigvals, nan=0.0, posinf=0.0, neginf=0.0)
+        del D_sym
+
+        # Eigenvalues of reflectance structure tensor (tells gate if reflectance shows structure)
+        M_refl_sym = (M_refl + M_refl.transpose(-1, -2)) * 0.5
+        del M_refl  # free before eigvalsh workspace
+        eigvals_refl = torch.linalg.eigvalsh(M_refl_sym)  # [N, 3] ascending
+        eigvals_refl = torch.nan_to_num(eigvals_refl, nan=0.0, posinf=0.0, neginf=0.0)
+        del M_refl_sym
 
         # Contrast strength: mean absolute deviation from median — tells gate how
         # much local reflectance variation exists in this neighbourhood.
@@ -286,21 +301,28 @@ class AnisotropicConv(MessagePassing):
         #        difference spectrum (3), and local contrast strength (1).
         kernel_mass_geom_norm = kernel_mass_geom / kernel_mass_geom.sum(dim=1, keepdim=True).clamp(min=1e-8)
         gate_input = torch.cat([kernel_mass_geom_norm, eigvals_geom, eigvals_refl, eigvals, contrast_strength], dim=1)  # [N, K+10]
-        gate_output = self.refl_reliability_gate(gate_input)  # [N, 4]
-        refl_gate = gate_output[:, :3]  # [N, 3] per-eigenvalue gates (directional control)
-        trust = gate_output[:, 3]  # [N] scalar trust (point-level reliability)
+        gate_features = self.refl_reliability_gate(gate_input)
+        gate_output = self.refl_gate_head(gate_features)  # [N, 4]
+        refl_gate = torch.sigmoid(gate_output[:, :3])  # [N, 3] per-eigenvalue gates
+        trust = torch.sigmoid(gate_output[:, 3])  # [N] scalar trust (point-level reliability)
+        signed_mod = torch.tanh(self.refl_mod_head(gate_features).squeeze(1))  # [N] signed edge modulation
 
         refl_gate = torch.nan_to_num(refl_gate, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        trust = torch.nan_to_num(trust, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        signed_mod = torch.nan_to_num(signed_mod, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
         if self.refl_gate_cap < 1.0:
             refl_gate = refl_gate * self.refl_gate_cap
         eigvals_gated = eigvals * refl_gate  # [N, 3]
 
-        # Trust-aware per-edge reflectance gain: modulate edge contributions before aggregation.
+        # Trust-aware signed per-edge reflectance gain: modulate edge contributions
+        # around 1.0 so reflectance can either sharpen or suppress ambiguous edges.
         # Geometry still determines routing (kernel bins); reflectance only changes edge strength.
-        # This allows reflectance to sharpen faint structures (twigs in noise) without inventing
-        # structure from pure brightness.
+        # This allows reflectance to sharpen faint structures (twigs in noise) or
+        # damp misleading bright leaf returns without inventing structure from brightness.
+        refl_gain_mean = refl_gain_min = refl_gain_max = None
         if self.use_refl_edge_gain:
             edge_trust = trust[index]  # [E] broadcast per-point trust to edges
+            edge_signed_mod = signed_mod[index]  # [E] signed boost/suppress control
 
             contrast_mean_edge = contrast_strength[index].squeeze(1)  # [E]
             # Normalize edge reflectance contrast by neighborhood scale
@@ -308,14 +330,21 @@ class AnisotropicConv(MessagePassing):
             # Clamp to 3.0 to prevent extreme amplification in high-contrast regions
             refl_score = torch.clamp(refl_score, 0.0, 3.0)
 
-            # Beta init=-2.2 gives sigmoid≈0.09, cap=0.35 allows max gain ≈1.35x
+            # Beta init=-2.2 gives sigmoid≈0.09. Combined with the cap, gain stays
+            # in a safe positive band around 1.0 instead of flipping feature signs.
             beta = torch.sigmoid(self.refl_edge_gain_logit).to(weighted_feat.dtype) * self.refl_edge_gain_cap
-            refl_gain = 1.0 + beta * edge_trust * torch.tanh(refl_score)  # [E]
+            refl_gain = 1.0 + beta * edge_trust * edge_signed_mod * torch.tanh(refl_score)  # [E]
+            refl_gain = refl_gain.clamp(1.0 - self.refl_edge_gain_cap, 1.0 + self.refl_edge_gain_cap)
 
             weighted_feat = weighted_feat * refl_gain.view(-1, 1, 1)
+            refl_gain_mean = float(refl_gain.mean().item())
+            refl_gain_min = float(refl_gain.min().item())
+            refl_gain_max = float(refl_gain.max().item())
+            del refl_gain, edge_trust, edge_signed_mod, refl_score, contrast_mean_edge
 
         # Now aggregate features with optional reflectance modulation
         agg_feat = scatter_add(weighted_feat, index, dim=0, dim_size=dim_size)  # [N, F, K]
+        del weighted_feat  # [E, F, K] — largest edge tensor, free immediately
         agg_feat = agg_feat / neighbor_count.unsqueeze(1)
 
         agg_feat = agg_feat.transpose(1, 2).contiguous().view(dim_size, -1)
@@ -335,18 +364,26 @@ class AnisotropicConv(MessagePassing):
                     'refl_gate_max': refl_gate.max().item(),
                     'eigvals_gated_mean': eigvals_gated.mean().item(),
                     'trust_mean': trust.mean().item(),
+                    'signed_mod_mean': signed_mod.mean().item(),
+                    'signed_mod_min': signed_mod.min().item(),
+                    'signed_mod_max': signed_mod.max().item(),
                     'has_nan': has_nan,
                 }
+                if refl_gain_mean is not None:
+                    self.diagnostics['refl_gain_mean'] = refl_gain_mean
+                    self.diagnostics['refl_gain_min'] = refl_gain_min
+                    self.diagnostics['refl_gain_max'] = refl_gain_max
                 if has_nan:
                     self.diagnostics['warning'] = 'NaN detected in eigvals'
 
-        # Trainer logging — maximum eigenvalue of D (dominant orientation of reflectance-geometry difference)
-        self.last_D_max_eig = float(eigvals[:, 2].mean().detach().cpu().item())
-        self.last_D_max_eig_per_point = eigvals[:, 2].detach()
-        self.last_refl_gate = float(refl_gate.mean().detach().cpu().item())
-        self.last_refl_gate_per_point = refl_gate.mean(dim=1).detach()
-        self.last_trust = float(trust.mean().detach().cpu().item())
-        self.last_contrast_strength_per_point = contrast_strength.squeeze(1).detach()
+        # Trainer logging — scalars only (no per-point GPU tensors to avoid memory retention)
+        with torch.no_grad():
+            self.last_D_max_eig = float(eigvals[:, 2].mean().item())
+            self.last_refl_gate = float(refl_gate.mean().item())
+            self.last_trust = float(trust.mean().item())
+            self.last_signed_mod = float(signed_mod.mean().item())
+            if refl_gain_mean is not None:
+                self.last_refl_gain = refl_gain_mean
 
         if self.local_nn is not None:
             combined = self.local_nn(combined)

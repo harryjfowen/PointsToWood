@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PointsToWood Viewer</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Chivo:wght@400;600;700&family=IBM+Plex+Mono:wght@400;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="bg-glow bg-glow-a"></div>
+    <div class="bg-glow bg-glow-b"></div>
+
+    <main class="layout">
+      <section class="panel">
+        <p class="kicker">PointsToWood</p>
+        <h1>Leaf vs Wood Point Cloud</h1>
+        <p class="subtitle">
+          Rotate with mouse. Scroll to zoom. Slider maps <code>prediction</code>
+          to leaf/wood.
+        </p>
+
+        <label class="field" for="threshold">
+          <span>Leaf / Wood Threshold</span>
+          <span id="threshold-value">0.50</span>
+        </label>
+        <input id="threshold" type="range" min="0" max="1" step="0.01" value="0.5" />
+
+        <label class="field" for="softness">
+          <span>Blend Softness</span>
+          <span id="softness-value">0.05</span>
+        </label>
+        <input id="softness" type="range" min="0" max="0.2" step="0.005" value="0.05" />
+
+        <label class="field" for="point-size">
+          <span>Point Size</span>
+          <span id="point-size-value">2.2</span>
+        </label>
+        <input id="point-size" type="range" min="0.6" max="6" step="0.1" value="2.2" />
+
+        <div class="meta">
+          <div><strong id="sample-count">-</strong> points rendered</div>
+          <div><strong id="split-count">-</strong></div>
+          <div id="source-file">loading source...</div>
+        </div>
+      </section>
+
+      <section class="viewer">
+        <div id="status" class="status">Loading point cloud…</div>
+        <canvas id="scene"></canvas>
+      </section>
+    </main>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

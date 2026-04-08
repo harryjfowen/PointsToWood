@@ -14,6 +14,11 @@ class FocalLoss(nn.Module):
     Gamma cycles from 0 to gamma_max using cosine schedule, addressing the
     conflict between focal loss and early training dynamics.
 
+    Boundary curriculum: optional per-point upweighting of mixed-label boundary
+    regions (edge_scores), ramping from 1x to (1 + boundary_max)x over training.
+    Focal loss handles generic easy-vs-hard; boundary weighting targets the
+    specific hard regions (wood/leaf transitions) that matter most.
+
     Reference: Smith & Kindermans, "Cyclical Focal Loss"
 
     Args:
@@ -21,16 +26,14 @@ class FocalLoss(nn.Module):
         alpha: Class weight for positive class (wood). None = no weighting
         label_smoothing: Smooth labels toward 0.5. 0 = no smoothing, 0.1 = recommended
         cyclical: If True, cycle gamma. If False, use fixed gamma=gamma_max
+        boundary_max: Maximum extra weight for boundary points (e.g. 2.0 = 3x at peak)
+        boundary_ramp_start: Fraction of training before boundary ramp begins (default 0.1)
         reduction: 'mean' or 'sum' or 'none'
-
-    Cyclical schedule (front-loaded to match OneCycleLR):
-        - Epoch 0: gamma = 0 (pure BCE, strong gradients)
-        - pct_peak (default 25%): gamma = gamma_max (focus on hard examples)
-        - End training: gamma = 0 (long tail for stable convergence)
     """
     def __init__(self, gamma_max: float = 2.0, alpha: float = None,
                  label_smoothing: float = 0.1, cyclical: bool = True,
-                 pct_peak: float = 0.33, reduction: str = 'mean'):
+                 pct_peak: float = 0.33, boundary_max: float = 2.0,
+                 boundary_ramp_start: float = 0.1, reduction: str = 'mean'):
         super().__init__()
         self.gamma_max = gamma_max
         self.alpha = alpha
@@ -39,9 +42,12 @@ class FocalLoss(nn.Module):
         self.pct_peak = pct_peak
         self.reduction = reduction
         self.current_gamma = 0.0 if cyclical else gamma_max
+        self.boundary_max = boundary_max
+        self.boundary_ramp_start = boundary_ramp_start
+        self.boundary_weight = 0.0
 
     def set_epoch(self, epoch: int, total_epochs: int):
-        """Update gamma: 0 → gamma_max at pct_peak → 0 (front-loaded cycle)."""
+        """Update gamma and boundary weight for this epoch."""
         if self.cyclical and total_epochs > 0:
             progress = epoch / total_epochs
 
@@ -52,7 +58,16 @@ class FocalLoss(nn.Module):
                 # Ramp down: gamma_max → 0 (long tail)
                 self.current_gamma = self.gamma_max * (1 + math.cos(math.pi * (progress - self.pct_peak) / (1 - self.pct_peak))) / 2
 
-    def forward(self, logits: Tensor, labels: Tensor, **kwargs) -> Tensor:
+        # Boundary curriculum: linear ramp from 0 to boundary_max
+        if total_epochs > 0 and self.boundary_max > 0:
+            progress = epoch / total_epochs
+            if progress < self.boundary_ramp_start:
+                self.boundary_weight = 0.0
+            else:
+                t = (progress - self.boundary_ramp_start) / (1.0 - self.boundary_ramp_start)
+                self.boundary_weight = self.boundary_max * min(t, 1.0)
+
+    def forward(self, logits: Tensor, labels: Tensor, edge_scores: Tensor = None) -> Tensor:
         # Label smoothing: push labels away from 0/1
         if self.label_smoothing > 0:
             labels = labels * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
@@ -71,6 +86,16 @@ class FocalLoss(nn.Module):
         if self.alpha is not None:
             alpha_t = self.alpha * labels + (1 - self.alpha) * (1 - labels)
             bce = alpha_t * bce
+
+        # Boundary curriculum: upweight mixed-label regions (normalized to preserve loss scale)
+        if edge_scores is not None and self.boundary_weight > 0:
+            sample_weights = 1.0 + self.boundary_weight * edge_scores
+            bce = bce * sample_weights
+            if self.reduction == 'mean':
+                return bce.sum() / sample_weights.sum().clamp(min=1.0)
+            elif self.reduction == 'sum':
+                return bce.sum()
+            return bce
 
         if self.reduction == 'mean':
             return bce.mean()
