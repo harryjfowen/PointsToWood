@@ -58,6 +58,9 @@ class AnisotropicConv(MessagePassing):
                  refl_gate_bias_init: float = 0.0,
                  refl_gate_cap: float = 1.0,
                  **kwargs):
+        # Pop any legacy parameters that model.py might pass
+        kwargs.pop('use_dualnorm_lite', None)
+        kwargs.pop('dualnorm_lite', None)
         kwargs.setdefault('aggr', 'add')
         super().__init__(**kwargs)
 
