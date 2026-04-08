@@ -128,14 +128,15 @@ class Voxelise:
         # overlap is now an integer: 4 or 8
         num_offsets = int(self.overlap)
 
+        # Normalize reflectance once before downsampling
+        reflectance_not_zero = self.pos.shape[1] > 3 and not torch.all(self.pos[:, 3] == 0)
+        if reflectance_not_zero:
+            self.pos[:, 3] = quantile_normalize_reflectance(self.pos[:, 3])
+
         # Downsample once
         spacing = self.pointspacing if (self.pointspacing is not None and self.pointspacing > 0) else (grid_size / 100.0)
         self.pointspacing = spacing
         self.pos = self.downsample()
-
-        reflectance_not_zero = self.pos.shape[1] > 3 and not torch.all(self.pos[:, 3] == 0)
-        if reflectance_not_zero:
-            self.pos[:, 3] = quantile_normalize_reflectance(self.pos[:, 3])
 
         # Create overlapping voxels
         voxels = create_point_grid_with_overlap(
@@ -163,18 +164,19 @@ class Voxelise:
         """Write voxels using multiple grid resolutions (original behavior)."""
         original_pos = self.pos.clone()
 
+        # Normalize reflectance once upfront on full cloud (before downsampling for any grid size)
+        reflectance_not_zero = original_pos.shape[1] > 3 and not torch.all(original_pos[:, 3] == 0)
+        if reflectance_not_zero:
+            original_pos[:, 3] = quantile_normalize_reflectance(original_pos[:, 3])
+
         for grid_size in self.gridsize:
-            # Reset to original before per-grid processing
+            # Reset to normalized original before per-grid processing
             self.pos = original_pos.clone()
 
             # Spacing: resolution>0 = fixed (same for all grid sizes); 0 = adaptive (spacing = grid_size/100 so points-per-voxel scale is consistent)
             spacing = self.pointspacing if (self.pointspacing is not None and self.pointspacing > 0) else (grid_size / 100.0)
             self.pointspacing = spacing
             self.pos = self.downsample()
-
-            reflectance_not_zero = self.pos.shape[1] > 3 and not torch.all(self.pos[:, 3] == 0)
-            if reflectance_not_zero:
-                self.pos[:, 3] = quantile_normalize_reflectance(self.pos[:, 3])
 
             # Build voxels for this grid size only
             voxels = create_point_grid(self.pos, [grid_size], min_points=self.minpoints, max_points=self.maxpoints)

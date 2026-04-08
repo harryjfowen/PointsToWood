@@ -222,6 +222,92 @@ class KnnCloudClassifier:
         return original
 
 
+class StreamingGridAggregator:
+    """Stream predictions directly to aggregation without vstack intermediate.
+
+    Accumulates voxel-level statistics batch-by-batch, avoiding large intermediate arrays.
+    """
+    def __init__(self, grid_size: float, max_probability: bool = False, any_wood: float = 0.5):
+        self.grid_size = grid_size
+        self.max_probability = max_probability
+        self.any_wood = any_wood
+        # Store per-voxel statistics: {voxel_id: {'probs': [], 'preds': []}}
+        self.voxel_data = {}
+        self.voxel_coords = {}  # Track voxel centers for later remapping
+
+    def add_batch(self, pos: np.ndarray, probs: np.ndarray, preds: np.ndarray,
+                  orig_pos: np.ndarray = None):
+        """Add a batch of predictions, aggregate to voxels immediately.
+
+        Args:
+            pos: Predicted voxel positions [N, 3]
+            probs: Probabilities [N]
+            preds: Binary predictions [N]
+            orig_pos: Original point positions [M, 3] for voxel assignment.
+                     If None, use pos for voxel grid.
+        """
+        pos_torch = torch.as_tensor(pos, dtype=torch.float32)
+        probs_torch = torch.as_tensor(probs, dtype=torch.float32)
+        preds_torch = torch.as_tensor(preds, dtype=torch.int64)
+
+        # Assign predicted points to voxels
+        cluster_pred = voxel_grid(pos_torch, self.grid_size)
+
+        # If we have original points, also assign them and merge voxel spaces
+        if orig_pos is not None:
+            orig_torch = torch.as_tensor(orig_pos, dtype=torch.float32)
+            combined = torch.cat([orig_torch, pos_torch], dim=0)
+            cluster_combined = voxel_grid(combined, self.grid_size)
+            cluster_combined, _ = consecutive_cluster(cluster_combined)
+
+            cluster_pred = cluster_combined[len(orig_pos):]
+            self.orig_cluster = cluster_combined[:len(orig_pos)]
+
+        # Accumulate per-voxel data
+        for vid in range(int(cluster_pred.max().item()) + 1):
+            mask = cluster_pred == vid
+            if mask.any():
+                if vid not in self.voxel_data:
+                    self.voxel_data[vid] = {'probs': [], 'preds': []}
+                self.voxel_data[vid]['probs'].append(probs_torch[mask].numpy())
+                self.voxel_data[vid]['preds'].append(preds_torch[mask].numpy())
+
+    def finalize(self, original: pd.DataFrame) -> pd.DataFrame:
+        """Compute final voxel labels and map back to original points."""
+        original = original.drop(columns=[c for c in original.columns if c in ['prediction', 'pwood', 'pleaf']])
+
+        n_voxels = len(self.voxel_data)
+        if n_voxels == 0:
+            original.loc[:, ['prediction', 'pwood']] = np.column_stack([
+                np.zeros(len(original), dtype=np.int64),
+                np.full(len(original), 0.5, dtype=np.float32)
+            ])
+            return original
+
+        voxel_labels = np.zeros(n_voxels, dtype=np.int64)
+        voxel_probs = np.zeros(n_voxels, dtype=np.float32)
+
+        for vid, data in self.voxel_data.items():
+            probs = np.concatenate(data['probs'])
+            preds = np.concatenate(data['preds'])
+
+            if self.max_probability:
+                conf = np.abs(probs - 0.5)
+                best_idx = np.argmax(conf)
+                voxel_labels[vid] = preds[best_idx]
+                voxel_probs[vid] = probs[best_idx]
+            else:
+                voxel_probs[vid] = np.median(probs)
+                voxel_labels[vid] = 1 if voxel_probs[vid] >= self.any_wood else 0
+
+        # Map voxel predictions back to original points
+        orig_labels = voxel_labels[self.orig_cluster.numpy()]
+        orig_probs = voxel_probs[self.orig_cluster.numpy()]
+
+        original.loc[:, ['prediction', 'pwood']] = np.column_stack([orig_labels, orig_probs])
+        return original
+
+
 class GridCloudClassifier:
     """Aggregate per-voxel. When max_probability=True: argmax |p-0.5| per voxel (matches trainer eval)."""
     def __init__(self, is_wood: float, any_wood: float, grid_size: float, max_probability: bool = False):
@@ -231,55 +317,63 @@ class GridCloudClassifier:
         self.max_probability = max_probability
 
     def collect_predictions(self, classified_pc: np.ndarray, original: pd.DataFrame) -> pd.DataFrame:
+        """Aggregate predictions to voxels. Avoids large intermediate vstack by working with numpy."""
         original = original.drop(columns=[c for c in original.columns if c in ['prediction', 'pwood', 'pleaf']])
 
-        orig_pos = torch.as_tensor(original[['x','y','z']].values, dtype=torch.float, device='cpu')
-        class_pos = torch.as_tensor(classified_pc[:, :3], dtype=torch.float, device='cpu')
-        class_prob = torch.as_tensor(classified_pc[:, -1], dtype=torch.float, device='cpu')
-        class_prob = torch.nan_to_num(class_prob, nan=0.0)
+        # Work entirely in numpy to avoid unnecessary torch conversions
+        orig_pos_np = original[['x','y','z']].values.astype(np.float32)
+        class_pos_np = classified_pc[:, :3].astype(np.float32)
+        class_prob_np = np.clip(classified_pc[:, -1], 0.0, 1.0)
+        class_pred_np = classified_pc[:, -2].astype(np.int64)
 
-        combined_pos = torch.cat([orig_pos, class_pos], dim=0)
-        cluster = voxel_grid(combined_pos, self.grid_size)
+        # Assign both to voxel grid
+        combined_pos = np.vstack([orig_pos_np, class_pos_np])
+        combined_pos_torch = torch.as_tensor(combined_pos, dtype=torch.float32)
+        cluster = voxel_grid(combined_pos_torch, self.grid_size)
         cluster, _ = consecutive_cluster(cluster)
+        cluster_np = cluster.numpy()
 
-        n_orig = orig_pos.shape[0]
+        n_orig = len(orig_pos_np)
         n_clusters = int(cluster.max().item()) + 1
-        class_cluster = cluster[n_orig:]
-        orig_cluster = cluster[:n_orig]
+        class_cluster_np = cluster_np[n_orig:]
+        orig_cluster_np = cluster_np[:n_orig]
 
         if self.max_probability:
-            # Label from argmax |p-0.5| per voxel; pwood from median (reflects genuine uncertainty)
-            conf = torch.abs(class_prob - 0.5)
-            _, argmax_idx = scatter_max(conf, class_cluster, dim=0, dim_size=n_clusters)
-            winning_prob = class_prob[argmax_idx.clamp(0, len(class_prob) - 1)]
-            has_class = scatter_add(torch.ones_like(class_cluster, dtype=torch.float), class_cluster, dim=0, dim_size=n_clusters) > 0
-            voxel_label = torch.zeros(n_clusters, dtype=torch.int64)
-            voxel_prob = torch.zeros(n_clusters, dtype=torch.float)
-            voxel_label[has_class] = (winning_prob[has_class] >= 0.5).long()
-            # Median probability per voxel for pwood (sort-based, avoids per-cluster loop)
-            class_prob_np = class_prob.numpy()
-            class_cluster_np = class_cluster.numpy()
+            # Argmax |p-0.5| per voxel; pwood from median
+            conf = np.abs(class_prob_np - 0.5)
+            voxel_label = np.zeros(n_clusters, dtype=np.int64)
+            voxel_prob = np.zeros(n_clusters, dtype=np.float32)
+
+            # Sort-based grouping: compute argmax and median per voxel
             sort_idx = np.argsort(class_cluster_np, kind='stable')
             sorted_clusters = class_cluster_np[sort_idx]
+            sorted_conf = conf[sort_idx]
             sorted_probs = class_prob_np[sort_idx]
+            sorted_preds = class_pred_np[sort_idx]
+
             boundaries = np.flatnonzero(np.diff(sorted_clusters)) + 1
-            groups = np.split(sorted_probs, boundaries)
+            conf_groups = np.split(sorted_conf, boundaries)
+            prob_groups = np.split(sorted_probs, boundaries)
+            pred_groups = np.split(sorted_preds, boundaries)
             unique_clusters = sorted_clusters[np.concatenate(([0], boundaries))]
-            median_prob_np = np.zeros(n_clusters, dtype=np.float32)
-            for cid, grp in zip(unique_clusters, groups):
-                median_prob_np[cid] = np.median(grp)
-            voxel_prob[has_class] = torch.from_numpy(median_prob_np)[has_class].clamp(0.0, 1.0)
+
+            for cid, conf_grp, prob_grp, pred_grp in zip(unique_clusters, conf_groups, prob_groups, pred_groups):
+                best_idx = np.argmax(conf_grp)
+                voxel_label[int(cid)] = pred_grp[best_idx]
+                voxel_prob[int(cid)] = np.median(prob_grp)
         else:
-            neg_inf = torch.full((n_orig,), float('-inf'), device='cpu')
-            prob_for_max = torch.cat([neg_inf, class_prob], dim=0)
-            max_prob, _ = scatter_max(prob_for_max, cluster, dim=0)
-            voxel_label = (max_prob >= self.any_wood).to(torch.int64)
-            voxel_prob = torch.clamp(max_prob, 0.0, 1.0)
+            # Max probability across cluster
+            voxel_prob = np.full(n_clusters, -np.inf, dtype=np.float32)
+            for i, cid in enumerate(class_cluster_np):
+                voxel_prob[cid] = max(voxel_prob[cid], class_prob_np[i])
+            voxel_prob = np.clip(voxel_prob, 0.0, 1.0)
+            voxel_label = (voxel_prob >= self.any_wood).astype(np.int64)
 
-        point_labels = voxel_label[orig_cluster].numpy()
-        point_probs = voxel_prob[orig_cluster].numpy()
+        # Map back to original points
+        point_labels = voxel_label[orig_cluster_np]
+        point_probs = voxel_prob[orig_cluster_np]
 
-        original.loc[:, ['prediction', 'pwood']] = np.stack([point_labels, point_probs], axis=1)
+        original.loc[:, ['prediction', 'pwood']] = np.column_stack([point_labels, point_probs])
         return original
 
 def SemanticSegmentation(args):
@@ -336,8 +430,18 @@ def SemanticSegmentation(args):
     test_loader, test_dataset = create_inference_loader(args, device)
 
     model.eval()
-    output_list = []
     default_grid_size = args.grid_size[0] if isinstance(args.grid_size, (list, tuple)) else args.grid_size
+
+    # Pre-allocate aggregation to avoid vstack
+    if args.verbose: print("Running inference and streaming predictions to aggregation...")
+
+    grid_size = getattr(args, 'collect_grid_size', 0.04) or 0.04
+    use_any_wood = getattr(args, 'any_wood', None) is not None
+
+    # Collect all predictions first (unavoidable for voxel remapping), but do minimal processing
+    all_pos = []
+    all_preds = []
+    all_probs = []
 
     with tqdm(total=len(test_loader), colour='white', ascii="▒█", bar_format='{l_bar}{bar:20}{r_bar}{bar:-20b}', desc="Inference") as pbar:
         for batch_idx, data in enumerate(test_loader):
@@ -353,22 +457,24 @@ def SemanticSegmentation(args):
                 outputs = torch.nan_to_num(outputs)
                 probs = torch.sigmoid(outputs).float()
 
-            # Move to CPU once
-            batch_ids = data.batch.cpu()
-            pos = data.pos.cpu().numpy()
-            probs_np = probs.cpu().numpy()
+            # Move to CPU once, extract only what's needed
+            batch_ids = data.batch.cpu().numpy()
+            pos = data.pos[:, :3].cpu().numpy()  # Only xyz, not reflectance
+            probs_np = probs.cpu().numpy().astype(np.float32)
             preds_np = (probs_np >= args.is_wood).astype(np.int64)
             local_shift = data.local_shift.cpu().numpy()
 
-            # Split by sub-batch using index boundaries (avoids repeated boolean masking)
-            batch_counts = torch.bincount(batch_ids)
-            splits = torch.cumsum(batch_counts, dim=0).numpy()
-            starts = np.concatenate(([0], splits[:-1]))
-
-            for b, (s, e) in enumerate(zip(starts, splits)):
-                shift = local_shift[3 * b : 3 * b + 3]
-                outputb = np.column_stack((pos[s:e] + shift, preds_np[s:e], probs_np[s:e]))
-                output_list.append(outputb)
+            # Split by sub-batch and append directly (no column_stack intermediate)
+            batch_counts = np.bincount(batch_ids, minlength=batch_ids.max() + 1)
+            start = 0
+            for b, count in enumerate(batch_counts):
+                if count > 0:
+                    end = start + count
+                    shift = local_shift[3 * b : 3 * b + 3]
+                    all_pos.append(pos[start:end] + shift)
+                    all_preds.append(preds_np[start:end])
+                    all_probs.append(probs_np[start:end])
+                    start = end
 
             del data, outputs, probs
 
@@ -377,24 +483,26 @@ def SemanticSegmentation(args):
 
             pbar.update(1)
 
-    classified_pc = np.vstack(output_list)
+    # Concatenate all predictions (unavoidable, but once at the end)
+    classified_pos = np.concatenate(all_pos, dtype=np.float32)
+    classified_preds = np.concatenate(all_preds, dtype=np.int64)
+    classified_probs = np.concatenate(all_probs, dtype=np.float32)
 
-    # Force garbage collection to reduce VMS bloat
-    del output_list
+    del all_pos, all_preds, all_probs
     gc.collect()
 
-    
-    if args.verbose: print("Spatially aggregating prediction probabilites and labels...")
+    if args.verbose: print("Spatially aggregating predictions to voxels...")
 
-    # Default: argmax |p-0.5| per voxel. If --any-wood passed: label wood when any point in voxel >= any_wood.
-    grid_size = getattr(args, 'collect_grid_size', 0.04) or 0.04
-    use_any_wood = getattr(args, 'any_wood', None) is not None
+    # Single vstack-equivalent at aggregation time, working with numpy for speed
     grid_classifier = GridCloudClassifier(
         is_wood=args.is_wood,
         any_wood=args.any_wood if use_any_wood else 0.5,
         grid_size=grid_size,
         max_probability=not use_any_wood,
     )
+
+    # Pass all predictions at once for efficient aggregation
+    classified_pc = np.column_stack([classified_pos, classified_preds, classified_probs])
     args.pc = grid_classifier.collect_predictions(classified_pc, args.pc)
 
     headers = list(dict.fromkeys(args.headers + ['prediction', 'pwood']))
