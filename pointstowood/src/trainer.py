@@ -1,54 +1,268 @@
-from src.dataset import create_train_loader, create_test_loader, create_inference_loader
+from src.dataset import create_train_loader, create_test_loader, create_inference_loader, TrainingDataset, _fixed_batch_collate, FOCUS_ONLY_PREFIXES
 from src.logger import MetricsTracker, ModelManager, HistoryLogger, WandbLogger
 from src.statistics import calculate_harmonic_metrics, print_validation_summary, update_test_metrics_with_harmonic
 from src.AnisotropicConv import AnisotropicConv
 from tqdm import tqdm
 import numpy as np
 import torch
+import torch.nn.functional as F
 import os
 import glob
 import pandas as pd
-from src.loss import FocalLoss, ContrastiveBoundaryLoss, ReflectanceFPPenalty
+from src.loss import FocalLoss, ReflectanceFPPenalty, SupConLoss
 from torch.optim import AdamW
 from torch_geometric.nn import voxel_grid
+from torch_geometric.loader import DataLoader
 from torch_geometric.nn.pool.consecutive import consecutive_cluster
 from torch_scatter import scatter_max, scatter_add
+from torch.utils.data import Subset
 from src.io import save_file
 import warnings
 import copy
 import math
 
 
-class GroupWeightTracker:
-    """Epoch-level GroupDRO weight tracker.
 
-    After each training epoch, call update() with per-group mean losses.
-    The weights q_g are used to reweight per-sample losses in the next epoch,
-    pushing the model to improve on underperforming biome groups.
 
-    η (eta): step size for weight update. Too high → oscillation. Too low → no effect.
-    Typical range: 0.01–0.05.
+class ValidationGroupSamplerTracker:
+    """Convert validation group performance into conservative sampling multipliers."""
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        warmup_epochs: int = 20,
+        ramp_epochs: int = 30,
+        ema: float = 0.8,
+        alpha: float = 1.0,
+        min_multiplier: float = 0.75,
+        max_multiplier: float = 2.0,
+        metric: str = "balanced_acc",
+    ):
+        self.enabled = bool(enabled)
+        self.warmup_epochs = max(1, int(warmup_epochs))
+        self.ramp_epochs = max(1, int(ramp_epochs))
+        self.ema = min(0.99, max(0.0, float(ema)))
+        self.alpha = max(0.0, float(alpha))
+        self.min_multiplier = float(min_multiplier)
+        self.max_multiplier = float(max_multiplier)
+        self.metric = metric
+        self.scores = {}
+        self.multipliers = {}
+        self.last_status = f"warmup 0/{self.warmup_epochs}" if self.enabled else "off"
+        self.last_breakdown = self.last_status
+
+    def update(self, epoch: int, group_metrics: dict):
+        if not self.enabled:
+            self.last_status = "off"
+            self.last_breakdown = self.last_status
+            return False
+        if not group_metrics:
+            self.last_status = "no group metrics"
+            self.last_breakdown = self.last_status
+            return False
+
+        current = {}
+        for group_name, metrics in group_metrics.items():
+            value = metrics.get(self.metric, metrics.get("balanced_acc", None))
+            if value is None or not np.isfinite(value):
+                continue
+            current[group_name] = float(value)
+        if not current:
+            self.last_status = "no valid group metrics"
+            self.last_breakdown = self.last_status
+            return False
+
+        for group_name, value in current.items():
+            if group_name not in self.scores:
+                self.scores[group_name] = value
+            else:
+                self.scores[group_name] = self.ema * self.scores[group_name] + (1.0 - self.ema) * value
+
+        if epoch < self.warmup_epochs:
+            self.multipliers = {g: 1.0 for g in self.scores}
+            self.last_status = f"warmup {epoch}/{self.warmup_epochs}"
+            self.last_breakdown = self._breakdown(prefix=self.last_status)
+            return False
+
+        values = np.asarray(list(self.scores.values()), dtype=np.float64)
+        target = float(np.median(values))
+        denom = max(abs(target), 1e-6)
+        raw = {}
+        for group_name, score in self.scores.items():
+            deficit = target - score
+            multiplier = 1.0 + self.alpha * (deficit / denom)
+            raw[group_name] = float(np.clip(multiplier, self.min_multiplier, self.max_multiplier))
+
+        raw_mean = max(float(np.mean(list(raw.values()))), 1e-6)
+        ramp_t = min(1.0, (epoch - self.warmup_epochs + 1) / self.ramp_epochs)
+        self.multipliers = {
+            group_name: float(np.clip(1.0 + ramp_t * ((value / raw_mean) - 1.0), self.min_multiplier, self.max_multiplier))
+            for group_name, value in raw.items()
+        }
+
+        worst_group = min(self.scores, key=self.scores.get)
+        mult_values = list(self.multipliers.values())
+        self.last_status = (
+            f"active {self.metric} worst={worst_group}:{self.scores[worst_group]:.3f} "
+            f"ramp={ramp_t:.2f} mult∈[{min(mult_values):.3f},{max(mult_values):.3f}]"
+        )
+        self.last_breakdown = self._breakdown(prefix=f"active {self.metric}")
+        return True
+
+    def status_str(self):
+        return self.last_status
+
+    def breakdown_str(self):
+        return self.last_breakdown
+
+    def _breakdown(self, prefix: str):
+        if not self.scores:
+            return prefix
+        parts = []
+        for group_name, score in sorted(self.scores.items(), key=lambda item: item[1]):
+            multiplier = self.multipliers.get(group_name, 1.0)
+            parts.append(f"{group_name}:{score:.3f}@{multiplier:.2f}x")
+        return f"{prefix} | " + " ".join(parts)
+
+
+class VoxelDifficultyTracker:
+    """Per-voxel boundary-weighted loss EMA for hard example mining.
+
+    Each training step, records per-sample boundary-weighted BCE loss indexed
+    by voxel_idx (the position in train_dataset.keys). Maintains an EMA so
+    voxels that are consistently hard get progressively higher sampling weight.
+    Warm-starts from edge_fraction prior so cold voxels aren't initialised at 0.
+
+    normalised_weights() returns values centred on 1.0 via tanh(z/2) so the
+    deviation from 1.0 is controlled by voxel_alpha in the weight composition.
     """
-    def __init__(self, eta: float = 0.01):
-        self.eta = eta
-        self.weights: dict = {}
+    def __init__(self, n_real: int, prior=None, alpha_ema: float = 0.9):
+        self.n_real = int(n_real)
+        self.alpha = float(alpha_ema)
+        if prior is not None and len(prior) == self.n_real:
+            self.ema = np.asarray(prior, dtype=np.float64).copy()
+        else:
+            self.ema = np.zeros(self.n_real, dtype=np.float64)
+        self.n_seen = np.zeros(self.n_real, dtype=np.int32)
 
-    def update(self, group_losses: dict):
-        for g, loss_val in group_losses.items():
-            if g not in self.weights:
-                self.weights[g] = 1.0
-            self.weights[g] *= math.exp(self.eta * float(loss_val))
-        total = sum(self.weights.values())
-        if total > 0:
-            for g in self.weights:
-                self.weights[g] /= total
+    def update(self, voxel_ids: np.ndarray, losses: np.ndarray):
+        for vid, loss in zip(voxel_ids, losses):
+            vid = int(vid)
+            if vid < 0 or vid >= self.n_real:
+                continue
+            loss = float(loss)
+            if self.n_seen[vid] == 0:
+                self.ema[vid] = loss
+            else:
+                self.ema[vid] = self.alpha * self.ema[vid] + (1.0 - self.alpha) * loss
+            self.n_seen[vid] += 1
 
-    def weight(self, group_name: str) -> float:
-        n = max(len(self.weights), 1)
-        return self.weights.get(group_name, 1.0 / n)
+    def normalised_weights(self) -> np.ndarray:
+        x = self.ema.copy()
+        if x.size == 0:
+            return np.ones(self.n_real, dtype=np.float64)
+        sd = x.std()
+        if np.isfinite(sd) and sd > 1e-8:
+            mu = x.mean()
+            z = (x - mu) / (sd + 1e-8)
+            return 1.0 + np.tanh(z / 2.0)
+        return np.ones(self.n_real, dtype=np.float64)
 
-    def log_str(self) -> str:
-        return ' | '.join(f'{g}:{w:.3f}' for g, w in sorted(self.weights.items()))
+    def status_str(self) -> str:
+        seen = int((self.n_seen > 0).sum())
+        if seen == 0:
+            return f"seen=0/{self.n_real} (prior only)"
+        top_idx = int(np.argmax(self.ema))
+        return (f"seen={seen}/{self.n_real} "
+                f"max_ema={self.ema[top_idx]:.3f} "
+                f"mean_ema={self.ema[self.n_seen > 0].mean():.3f}")
+
+
+def _build_train_sampler_weights(train_dataset, edge_alpha: float = 0.0,
+                                  group_multipliers: dict = None,
+                                  voxel_difficulty=None, voxel_alpha: float = 0.0,
+                                  coverage_tracker=None, unseen_boost: float = 0.0):
+    """Compose edge-difficulty, per-voxel loss EMA, and group multipliers into per-sample weights."""
+    n_real = len(getattr(train_dataset, 'keys', []))
+    if n_real <= 0:
+        return None
+
+    weights = np.ones(n_real, dtype=np.float64)
+
+    edge_fracs = np.asarray(getattr(train_dataset, 'edge_fractions', np.zeros(n_real)), dtype=np.float64)
+    if edge_alpha > 0 and edge_fracs.size >= n_real:
+        weights *= 1.0 + float(edge_alpha) * edge_fracs[:n_real]
+
+    if voxel_difficulty is not None and voxel_alpha > 0:
+        vw = voxel_difficulty.normalised_weights()  # centred on 1.0
+        weights *= 1.0 + float(voxel_alpha) * (vw - 1.0)
+
+    if coverage_tracker is not None and unseen_boost > 1.0:
+        n_seen = getattr(coverage_tracker, 'n_seen', None)
+        if n_seen is not None and len(n_seen) >= n_real:
+            unseen = np.asarray(n_seen[:n_real]) <= 0
+            if unseen.any() and not unseen.all():
+                weights[unseen] *= float(unseen_boost)
+
+    if group_multipliers:
+        group_list = getattr(train_dataset, 'group_list', [])
+        group_indices = getattr(train_dataset, 'group_indices', [])
+        if group_list and len(group_indices) >= n_real:
+            for idx in range(n_real):
+                group_name = group_list[group_indices[idx]]
+                weights[idx] *= float(group_multipliers.get(group_name, 1.0))
+
+    weights = np.clip(weights, 1e-8, 8.0)  # cap before normalisation to prevent extreme starvation
+    weights *= n_real / weights.sum()  # normalise mean to 1 so effective dataset size is stable
+    mix_slots = getattr(train_dataset, '_num_mix_slots', 0)
+    if mix_slots > 0:
+        mix_weights = np.full(mix_slots, float(weights.mean()), dtype=np.float64)
+        weights = np.concatenate([weights, mix_weights])
+    return weights
+
+
+def _apply_train_sampler_weights(train_loader, train_dataset, edge_alpha: float = 0.0,
+                                  group_multipliers: dict = None,
+                                  voxel_difficulty=None, voxel_alpha: float = 0.0,
+                                  coverage_tracker=None, unseen_boost: float = 0.0,
+                                  allow_replacement: bool = True):
+    sampler = getattr(train_loader, 'batch_sampler', None)
+    if sampler is None or not hasattr(sampler, 'set_weights'):
+        return None
+    weights = _build_train_sampler_weights(
+        train_dataset, edge_alpha=edge_alpha, group_multipliers=group_multipliers,
+        voxel_difficulty=voxel_difficulty, voxel_alpha=voxel_alpha,
+        coverage_tracker=coverage_tracker, unseen_boost=unseen_boost,
+    )
+    if weights is None:
+        return None
+    try:
+        sampler.set_weights(weights, allow_replacement=allow_replacement)
+    except TypeError:
+        sampler.set_weights(weights)
+    return weights
+
+
+def _per_sample_boundary_weighted_bce(logits: torch.Tensor, labels: torch.Tensor,
+                                      batch: torch.Tensor, edge_scores: torch.Tensor = None) -> torch.Tensor:
+    """Per-sample BCE with a light fixed emphasis on boundary points.
+
+    This tracker is diagnostic/sampling-only, not the training objective. It uses
+    raw BCE and a simple `(1 + edge_scores)` weight so mixed-label boundary voxels
+    contribute more strongly to the voxel difficulty EMA regardless of the main
+    loss curriculum.
+    """
+    point_loss = F.binary_cross_entropy_with_logits(logits, labels.float(), reduction='none')
+    if edge_scores is not None and edge_scores.numel() == point_loss.numel():
+        point_weight = 1.0 + edge_scores.float()
+        point_loss = point_loss * point_weight
+    else:
+        point_weight = torch.ones_like(point_loss)
+
+    n_samples = int(batch.max().item()) + 1
+    per_sample_sum = scatter_add(point_loss, batch, dim=0, dim_size=n_samples)
+    per_sample_weight = scatter_add(point_weight, batch, dim=0, dim_size=n_samples).clamp(min=1.0)
+    return per_sample_sum / per_sample_weight
 
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -91,6 +305,10 @@ def downsample_batch_to_point_budget(data, max_points, device):
             data.sf = data.sf[unique_old]
         elif data.sf.numel() == n:
             data.sf = data.sf[indices]
+    for attr in ('voxel_idx', 'group_idx', 'difficulty'):
+        value = getattr(data, attr, None)
+        if value is not None and hasattr(value, 'size') and value.size(0) == old_batch.max().item() + 1:
+            setattr(data, attr, value[unique_old])
     return data
 
 
@@ -200,21 +418,130 @@ def run_validation_pass(model, test_loader, device, mode_name, augmentation_mode
     # Restore original mode
     test_loader.dataset.mode = original_mode
 
+    averages = test_tracker.get_averages()
     if track_groups and group_preds:
-        from sklearn.metrics import matthews_corrcoef
-        parts = []
+        group_metrics = {}
         for gname in sorted(group_preds):
             yt = np.concatenate(group_preds[gname]['y_true'])
             yp = np.concatenate(group_preds[gname]['y_pred'])
-            mcc = matthews_corrcoef(yt, yp) if len(set(yt)) > 1 else 0.0
-            parts.append(f'{gname}:{mcc:.3f}')
-        print(f'[Test group MCC] {" | ".join(parts)}')
+            if yt.size:
+                group_metrics[gname] = _binary_site_metrics(yt, yp)
+        if group_metrics:
+            averages['group_metrics'] = group_metrics
 
-    return test_tracker.get_averages()
+    return averages
+
+
+def _binary_site_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+    """Pooled binary metrics for one focused source prefix."""
+    y_true = y_true.astype(np.int64)
+    y_pred = y_pred.astype(np.int64)
+    tp = int(((y_true == 1) & (y_pred == 1)).sum())
+    tn = int(((y_true == 0) & (y_pred == 0)).sum())
+    fp = int(((y_true == 0) & (y_pred == 1)).sum())
+    fn = int(((y_true == 1) & (y_pred == 0)).sum())
+
+    wood_recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    leaf_recall = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    wood_precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    wood_f1 = 2.0 * wood_precision * wood_recall / (wood_precision + wood_recall) if (wood_precision + wood_recall) > 0 else 0.0
+    fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+    denom = math.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+    mcc = ((tp * tn - fp * fn) / denom) if denom > 0 else 0.0
+    return {
+        'balanced_acc': 0.5 * (wood_recall + leaf_recall),
+        'wood_precision': wood_precision,
+        'wood_recall': wood_recall,
+        'wood_f1': wood_f1,
+        'leaf_recall': leaf_recall,
+        'fpr': fpr,
+        'mcc': mcc,
+        'true_wood_frac': float((y_true == 1).mean()) if y_true.size else 0.0,
+        'pred_wood_frac': float((y_pred == 1).mean()) if y_pred.size else 0.0,
+    }
+
+
+def print_focus_site_eval(model, test_dataset, device, args, epoch, prefixes=('deu08', 'fin04', 'fin04-hard')):
+    """Print one compact focused eval line for named shard prefixes."""
+    if test_dataset is None or not hasattr(test_dataset, 'keys'):
+        return
+
+    best_by_prefix = getattr(print_focus_site_eval, '_best_balanced_acc', {})
+    original_mode = getattr(test_dataset, 'mode', None)
+    test_dataset.mode = 'val_with_reflectance'
+    parts = []
+
+    try:
+        for prefix in prefixes:
+            indices = [i for i, key in enumerate(test_dataset.keys)
+                       if os.path.basename(str(key)).split('_voxel_')[0] == prefix]
+            if not indices:
+                continue
+
+            subset = Subset(test_dataset, indices)
+            loader = DataLoader(
+                subset,
+                batch_size=1,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=False,
+                collate_fn=_fixed_batch_collate,
+            )
+
+            y_true_parts = []
+            y_pred_parts = []
+            with torch.no_grad():
+                for data in loader:
+                    data = data.to(device)
+                    _set_batch_voxel_size(data, args)
+                    outputs = model(data)
+                    probs = torch.sigmoid(outputs)
+                    y_true_parts.append((data.y >= 0.5).int().detach().cpu().numpy())
+                    y_pred_parts.append((probs >= 0.5).int().detach().cpu().numpy())
+
+            if not y_true_parts:
+                continue
+            metrics = _binary_site_metrics(np.concatenate(y_true_parts), np.concatenate(y_pred_parts))
+            prev_best = best_by_prefix.get(prefix, float('-inf'))
+            is_best = metrics['balanced_acc'] >= prev_best
+            if is_best:
+                best_by_prefix[prefix] = metrics['balanced_acc']
+            ba_marker = '↑' if is_best else '↓'
+            wood_delta_pct = 100.0 * (metrics['pred_wood_frac'] - metrics['true_wood_frac'])
+            parts.append(
+                f"  {prefix}: BA[{ba_marker}]={metrics['balanced_acc']:.3f} "
+                f"Wood P/R={metrics['wood_precision']:.3f}/{metrics['wood_recall']:.3f} "
+                f"WoodΔ={wood_delta_pct:+.1f}pp"
+            )
+    finally:
+        if original_mode is not None:
+            test_dataset.mode = original_mode
+
+    if parts:
+        print_focus_site_eval._best_balanced_acc = best_by_prefix
+        print(f"Focus Eval Summary E{epoch}:")
+        for part in parts:
+            print(part)
 
 
 def compute_refl_dominance_diagnostic(model, test_loader, device, args):
-    """Run one batch with reflectance.requires_grad, backward from output sum; return mean |∂logit/∂refl|."""
+    """One-batch sensitivity of logits to reflectance, split by boundary/wood regions."""
+    result = {
+        "all": float("nan"),
+        "edge": float("nan"),
+        "pure": float("nan"),
+        "edge_wood": float("nan"),
+        "edge_ratio": float("nan"),
+    }
+
+    def _masked_mean(values, mask):
+        if mask is None or values.numel() == 0:
+            return float("nan")
+        mask = mask.to(device=values.device, dtype=torch.bool)
+        if mask.numel() != values.numel() or not bool(mask.any().detach().cpu().item()):
+            return float("nan")
+        return float(values[mask].mean().detach().cpu().item())
+
     model.eval()
     orig_mode = test_loader.dataset.mode
     test_loader.dataset.mode = "val_with_reflectance"
@@ -227,23 +554,35 @@ def compute_refl_dominance_diagnostic(model, test_loader, device, args):
             out = model(data)
             out.sum().backward()
         if data.reflectance.grad is not None:
-            mean_abs_grad = float(data.reflectance.grad.abs().mean().cpu().item())
-        else:
-            mean_abs_grad = float("nan")
+            grad_abs = data.reflectance.grad.detach().abs()
+            result["all"] = float(grad_abs.mean().detach().cpu().item())
+
+            edge_scores = getattr(data, "edge_scores", None)
+            if edge_scores is not None and edge_scores.numel() == grad_abs.numel():
+                edge_mask = edge_scores > 0.5
+                pure_mask = ~edge_mask
+                wood_mask = data.y >= 0.5
+                result["edge"] = _masked_mean(grad_abs, edge_mask)
+                result["pure"] = _masked_mean(grad_abs, pure_mask)
+                result["edge_wood"] = _masked_mean(grad_abs, edge_mask & wood_mask)
+                if np.isfinite(result["edge"]) and np.isfinite(result["pure"]) and result["pure"] > 0:
+                    result["edge_ratio"] = result["edge"] / result["pure"]
     except Exception:
-        mean_abs_grad = float("nan")
+        pass
     finally:
         test_loader.dataset.mode = orig_mode
         model.zero_grad(set_to_none=True)
-    return mean_abs_grad
+    return result
 
 
 
-def _eval_metrics(classified_with_refl, classified_no_refl, gt_xyz_label, collect_grid_size):
+def _eval_metrics(classified_with_refl, classified_no_refl, gt_xyz_label, collect_grid_size, any_wood_threshold=None):
     """Compute MCC and FPR for both refl conditions vs GT at collect grid resolution.
 
     Concatenates pred and GT points into one voxel_grid so cluster IDs are consistent,
-    then compares argmax-|p-0.5| pred label against majority-vote GT label per voxel.
+    then compares predictions against majority-vote GT per voxel. By default the
+    prediction is argmax-|p-0.5|; with any_wood_threshold it becomes max(pwood)
+    >= threshold, matching deployment any-wood aggregation.
 
     Args:
         classified_with_refl: [N, 4] (x, y, z, prob)
@@ -271,10 +610,14 @@ def _eval_metrics(classified_with_refl, classified_no_refl, gt_xyz_label, collec
         pred_c = clusters[:len(pred_pos)]
         gt_c   = clusters[len(pred_pos):]
 
-        # Pred: argmax |p-0.5| per voxel
-        conf = torch.abs(pred_prob - 0.5)
-        _, argmax_idx = scatter_max(conf, pred_c, dim=0, dim_size=n_clusters)
-        pred_label = (pred_prob[argmax_idx.clamp(0, len(pred_prob) - 1)] >= 0.5).long()
+        if any_wood_threshold is not None:
+            pred_max, _ = scatter_max(pred_prob, pred_c, dim=0, dim_size=n_clusters)
+            pred_label = (pred_max >= float(any_wood_threshold)).long()
+        else:
+            # Pred: argmax |p-0.5| per voxel
+            conf = torch.abs(pred_prob - 0.5)
+            _, argmax_idx = scatter_max(conf, pred_c, dim=0, dim_size=n_clusters)
+            pred_label = (pred_prob[argmax_idx.clamp(0, len(pred_prob) - 1)] >= 0.5).long()
 
         # GT: majority vote per voxel
         gt_sum   = _scatter_add(gt_lab, gt_c, dim=0, dim_size=n_clusters)
@@ -286,7 +629,15 @@ def _eval_metrics(classified_with_refl, classified_no_refl, gt_xyz_label, collec
         gt_has   = _scatter_add(torch.ones(len(gt_pos)),   gt_c,   dim=0, dim_size=n_clusters) > 0
         valid = pred_has & gt_has
 
-        return pred_label[valid].numpy(), gt_label[valid].numpy(), pred_c, gt_c, clusters, valid, n_clusters
+        return {
+            'pred': pred_label[valid].numpy(),
+            'gt': gt_label[valid].numpy(),
+            'gt_pos': gt_pos,
+            'gt_lab': gt_lab,
+            'gt_cluster': gt_c,
+            'valid': valid,
+            'n_clusters': n_clusters,
+        }
 
     def _mcc_fpr(p, g):
         tp = int(((p == 1) & (g == 1)).sum())
@@ -298,30 +649,71 @@ def _eval_metrics(classified_with_refl, classified_no_refl, gt_xyz_label, collec
         fpr = float(fp) / float(fp + tn) if (fp + tn) > 0 else 0.0
         return mcc, fpr
 
-    def _edge_mask(gt_label_full, clusters_full, n_clusters):
-        """Voxels whose GT label differs from at least one neighbour in the cluster space."""
-        from torch_scatter import scatter_add as sa
-        # Simple proxy: voxels where GT is mixed within a 2x-coarser grid
-        coarse_size = collect_grid_size * 3.0
-        return None  # fallback: skip edge metric if too expensive
+    def _basic_stats(p, g):
+        tp = int(((p == 1) & (g == 1)).sum())
+        tn = int(((p == 0) & (g == 0)).sum())
+        fp = int(((p == 1) & (g == 0)).sum())
+        fn = int(((p == 0) & (g == 1)).sum())
+        wood_recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        leaf_recall = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        wood_precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        fbeta = 2.0 * wood_precision * wood_recall / (wood_precision + wood_recall) if (wood_precision + wood_recall) > 0 else 0.0
+        fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+        denom = math.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+        mcc = ((tp * tn - fp * fn) / denom) if denom > 0 else 0.0
+        return {
+            'accuracy': (tp + tn) / max(1, tp + tn + fp + fn),
+            'balanced_accuracy': 0.5 * (wood_recall + leaf_recall),
+            'precision': wood_precision,
+            'recall': wood_recall,
+            'fbeta': fbeta,
+            'fpr': fpr,
+            'mcc': mcc,
+        }
+
+    def _gt_edge_mask(meta, edge_voxel_size=0.25):
+        """GT-derived edge mask projected onto eval voxels.
+
+        A collect-grid voxel is considered an edge voxel if any GT point inside it
+        belongs to a mixed-label 25 cm neighborhood, matching the training-time
+        boundary definition used in the loss.
+        """
+        from src.pointcutmix import recompute_edge_scores
+
+        point_edge = recompute_edge_scores(meta['gt_pos'], meta['gt_lab'], batch=None, voxel_size=edge_voxel_size)
+        point_edge = (point_edge > 0.5).float()
+        edge_hits = _scatter_add(point_edge, meta['gt_cluster'], dim=0, dim_size=meta['n_clusters'])
+        edge_cluster = edge_hits > 0
+        return edge_cluster[meta['valid']].cpu().numpy()
 
     if gt_xyz_label is None or len(gt_xyz_label) == 0:
         return {}
 
     try:
-        pred_w, gt_w, *_ = _agg_pred(classified_with_refl, gt_xyz_label, collect_grid_size)
-        pred_n, gt_n, *_ = _agg_pred(classified_no_refl,   gt_xyz_label, collect_grid_size)
+        meta_w = _agg_pred(classified_with_refl, gt_xyz_label, collect_grid_size)
+        meta_n = _agg_pred(classified_no_refl,   gt_xyz_label, collect_grid_size)
 
+        pred_w, gt_w = meta_w['pred'], meta_w['gt']
+        pred_n, gt_n = meta_n['pred'], meta_n['gt']
+
+        stats_w = _basic_stats(pred_w, gt_w)
+        stats_n = _basic_stats(pred_n, gt_n)
         mcc_w, fpr_w = _mcc_fpr(pred_w, gt_w)
         mcc_n, fpr_n = _mcc_fpr(pred_n, gt_n)
 
-        # Edge voxels: GT label is 1 but surrounded by disagreement proxy
-        # Simple: voxels where pred_w != gt_w OR pred_n != gt_n (model-uncertain boundary)
-        is_edge = (pred_w != gt_w) | (pred_n != gt_n)
+        # GT-derived edge voxels: fixed boundary subset shared by both modes.
+        is_edge = _gt_edge_mask(meta_w)
         mcc_edge_w = _mcc_fpr(pred_w[is_edge], gt_w[is_edge])[0] if is_edge.sum() > 10 else float('nan')
         mcc_edge_n = _mcc_fpr(pred_n[is_edge], gt_n[is_edge])[0] if is_edge.sum() > 10 else float('nan')
 
         return {
+            'accuracy':      stats_w['accuracy'],
+            'balanced_accuracy': stats_w['balanced_accuracy'],
+            'precision':     stats_w['precision'],
+            'recall':        stats_w['recall'],
+            'fbeta':         stats_w['fbeta'],
+            'fpr':           stats_w['fpr'],
+            'mcc':           stats_w['mcc'],
             'mcc_with_refl':      mcc_w,
             'mcc_no_refl':        mcc_n,
             'refl_gain':          mcc_w - mcc_n,
@@ -336,54 +728,138 @@ def _eval_metrics(classified_with_refl, classified_no_refl, gt_xyz_label, collec
         return {}
 
 
-def run_eval_visualization(model, args, device, epoch):
-    """Run inference on eval voxels, aggregate to 4cm grid (argmax |p-0.5| per voxel), save PLY for visualization.
+def run_eval_visualization(model, args, device, epoch, save_outputs: bool = True):
+    """Run inference on eval voxels and aggregate to the deployment grid.
 
-    Writes two outputs per source: one with reflectance (e.g. prefix_eval.ply) and one with reflectance
-    zeroed for XYZ-only visualization (e.g. prefix_eval_xyz.ply). Supports multiple source files.
+    By default this saves PLY outputs for inspection. Pass save_outputs=False to
+    keep the eval pass metrics-only.
     """
     import re
 
     eval_vxfile = getattr(args, 'eval_vxfile', None)
     if not eval_vxfile or not os.path.isdir(eval_vxfile):
         if epoch == 1 and getattr(args, 'eval', False):
-            print('[Eval] No eval voxels found; put a .ply in data/<region>_eval and run with --preprocess --eval first.')
-        return
-    all_keys = glob.glob(os.path.join(eval_vxfile, '*.pt'))
-    if not all_keys:
-        if epoch == 1 and getattr(args, 'eval', False):
-            print('[Eval] Eval voxel folder is empty; put a .ply in data/<region>_eval and run with --preprocess --eval first.')
+            print('[Eval] No eval voxels found; put a .ply in data/eval and run with --preprocess --eval first.')
         return
 
-    # Group voxel files by source prefix
-    # Pattern: {prefix}_voxel_{num}.pt or voxel_{num}.pt (no prefix)
-    source_files = {}
-    for key in all_keys:
-        basename = os.path.basename(key)
-        match = re.match(r'(.+)_voxel_\d+\.pt$', basename)
-        if match:
-            prefix = match.group(1)
-        else:
-            prefix = '_default_'
-        if prefix not in source_files:
-            source_files[prefix] = []
-        source_files[prefix].append(key)
+    # Group voxel payloads by source prefix. Preprocessing writes a single shard.pt containing
+    # entries whose `name` is `{source}_voxel_{counter}`; fall back to per-voxel .pt globs only
+    # when running in low-memory (disk_individual) mode.
+    source_entries = {}  # prefix -> list[dict entries] or list[file paths]
+    shard_path = os.path.join(eval_vxfile, 'shard.pt')
+    if os.path.isfile(shard_path):
+        try:
+            shard = torch.load(shard_path, map_location='cpu', weights_only=False)
+        except Exception as e:
+            print(f'[Eval] Failed to load shard {shard_path}: {e}')
+            return
+        for entry in shard:
+            name = entry.get('name', '') if isinstance(entry, dict) else ''
+            m = re.match(r'(.+)_voxel_\d+$', name)
+            prefix = m.group(1) if m else '_default_'
+            source_entries.setdefault(prefix, []).append(entry)
+    else:
+        all_keys = glob.glob(os.path.join(eval_vxfile, '*.pt'))
+        if not all_keys:
+            if epoch == 1 and getattr(args, 'eval', False):
+                print('[Eval] Eval voxel folder is empty; put a .ply in data/eval and run with --preprocess --eval first.')
+            return
+        for key in all_keys:
+            basename = os.path.basename(key)
+            m = re.match(r'(.+)_voxel_\d+\.pt$', basename)
+            prefix = m.group(1) if m else '_default_'
+            source_entries.setdefault(prefix, []).append(key)
+
+    if not source_entries:
+        return
 
     vis_dir = os.path.join(os.path.dirname(eval_vxfile), 'visualisations')
-    os.makedirs(vis_dir, exist_ok=True)
+    if save_outputs:
+        os.makedirs(vis_dir, exist_ok=True)
     n_saved = 0
     grid_size_model = getattr(args, 'eval_grid_size', None)
     if grid_size_model is None:
         grid_size_model = args.grid_size[0] if isinstance(args.grid_size, (list, tuple)) else args.grid_size
     collect_grid_size = getattr(args, 'eval_collect_grid_size', 0.04)
 
-    # Process each source file separately
-    for prefix, keys in source_files.items():
-        # Build minimal args for inference loader
+    any_wood_threshold = getattr(args, 'eval_any_wood', None)
+
+    def aggregate_and_save(classified_arr, out_path, gt_arr=None):
+        """classified_arr columns: [x, y, z, prob, reflectance]. Argmax |p-0.5| per voxel."""
+        pos_t = torch.as_tensor(classified_arr[:, :3], dtype=torch.float32, device='cpu')
+        prob_t = torch.as_tensor(classified_arr[:, 3], dtype=torch.float32, device='cpu')
+        refl_t = torch.as_tensor(classified_arr[:, 4], dtype=torch.float32, device='cpu')
+
+        if gt_arr is not None and len(gt_arr) > 0:
+            gt_pos_t = torch.as_tensor(gt_arr[:, :3], dtype=torch.float32, device='cpu')
+            gt_lab_t = torch.as_tensor(gt_arr[:, 3], dtype=torch.float32, device='cpu')
+            all_pos = torch.cat([pos_t, gt_pos_t], dim=0)
+            raw_cluster = voxel_grid(all_pos, collect_grid_size)
+            cluster, _ = consecutive_cluster(raw_cluster)
+            n_clusters = int(cluster.max().item()) + 1
+            n_pred = len(pos_t)
+            pred_cluster = cluster[:n_pred]
+            gt_cluster_t = cluster[n_pred:]
+        else:
+            pred_cluster = voxel_grid(pos_t, collect_grid_size)
+            pred_cluster, _ = consecutive_cluster(pred_cluster)
+            n_clusters = int(pred_cluster.max().item()) + 1
+            gt_cluster_t = None
+
+        pred_cnt = scatter_add(torch.ones_like(prob_t), pred_cluster, dim=0, dim_size=n_clusters)
+        valid_pred = pred_cnt > 0
+
+        voxel_pred = torch.zeros(n_clusters, dtype=torch.long)
+        voxel_prob = torch.zeros(n_clusters, dtype=prob_t.dtype)
+        voxel_refl = torch.zeros(n_clusters, dtype=refl_t.dtype)
+        if any_wood_threshold is not None:
+            max_prob, max_idx = scatter_max(prob_t, pred_cluster, dim=0, dim_size=n_clusters)
+            safe_idx = max_idx.clamp(0, max(len(prob_t) - 1, 0))
+            voxel_prob[valid_pred] = max_prob[valid_pred]
+            voxel_pred[valid_pred] = (voxel_prob[valid_pred] >= float(any_wood_threshold)).long()
+            voxel_refl[valid_pred] = refl_t[safe_idx[valid_pred]]
+        else:
+            conf = torch.abs(prob_t - 0.5)
+            _, argmax_idx = scatter_max(conf, pred_cluster, dim=0, dim_size=n_clusters)
+            safe_argmax_idx = argmax_idx.clamp(0, max(len(prob_t) - 1, 0))
+            voxel_pred[valid_pred] = (prob_t[safe_argmax_idx[valid_pred]] >= 0.5).long()
+            voxel_prob[valid_pred] = prob_t[safe_argmax_idx[valid_pred]]
+            voxel_refl[valid_pred] = refl_t[safe_argmax_idx[valid_pred]]
+
+        point_preds = voxel_pred[pred_cluster].numpy()
+        point_probs = voxel_prob[pred_cluster].numpy()
+        winning_refl = voxel_refl[pred_cluster].numpy()
+        pos_np = pos_t.numpy()
+
+        out_dict = {
+            'x': pos_np[:, 0],
+            'y': pos_np[:, 1],
+            'z': pos_np[:, 2],
+            'reflectance': winning_refl,
+            'prediction': point_preds,
+            'pwood': point_probs,
+        }
+        fields = ['reflectance', 'prediction', 'pwood']
+
+        if gt_cluster_t is not None:
+            gt_sum = scatter_add(gt_lab_t, gt_cluster_t, dim=0, dim_size=n_clusters)
+            gt_cnt = scatter_add(torch.ones_like(gt_lab_t), gt_cluster_t, dim=0, dim_size=n_clusters)
+            valid_gt = gt_cnt > 0
+            voxel_gt = torch.zeros(n_clusters, dtype=torch.long)
+            voxel_gt[valid_gt] = (gt_sum[valid_gt] / gt_cnt[valid_gt] >= 0.5).long()
+            out_dict['label'] = voxel_gt[pred_cluster].numpy()
+            fields.append('label')
+
+        if save_outputs:
+            out_df = pd.DataFrame(out_dict)
+            save_file(out_path, out_df, additional_fields=fields, verbose=False)
+
+    combined = []  # (classified_arr, prefix) for side-by-side export
+
+    for prefix, entries_or_keys in sorted(source_entries.items()):
         class EvalArgs:
             pass
         eval_args = EvalArgs()
-        eval_args.vxfile = eval_vxfile
         eval_args.batch_size = getattr(args, 'batch_size', 4)
         eval_args.max_pts = getattr(args, 'max_pts', 16384)
         eval_args.grid_size = [float(grid_size_model)]
@@ -391,12 +867,17 @@ def run_eval_visualization(model, args, device, epoch):
         eval_args.verbose = False
         eval_args.wdir = args.wdir
         eval_args.model = args.model
-        eval_args.eval_file_pattern = f'{prefix}_voxel_*.pt' if prefix != '_default_' else 'voxel_*.pt'
+        eval_args.vxfile = eval_vxfile
+        if entries_or_keys and isinstance(entries_or_keys[0], dict):
+            eval_args.in_memory = True
+            eval_args.inference_voxels = entries_or_keys
+        else:
+            eval_args.in_memory = False
+            eval_args.eval_file_pattern = f'{prefix}_voxel_*.pt' if prefix != '_default_' else 'voxel_*.pt'
 
         eval_loader, _ = create_inference_loader(eval_args, device)
         model.eval()
-        output_list = []
-        output_list_xyz = []
+        output_list = []  # (N, 5) per batch element: x, y, z, prob, reflectance
 
         with torch.no_grad():
             for data in eval_loader:
@@ -407,125 +888,113 @@ def run_eval_visualization(model, args, device, epoch):
                 refl = data.reflectance.cpu() if hasattr(data, 'reflectance') else None
                 local_shift = data.local_shift.cpu()
 
-                # Pass 1: with reflectance
                 with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
                     outputs = model(data)
                     outputs = torch.nan_to_num(outputs)
                     probs = torch.sigmoid(outputs).float()
-                probs_np = probs.cpu().numpy()
+                probs_np = probs.cpu().numpy().ravel()
                 batch_counts = torch.bincount(batch_ids)
                 splits = torch.cumsum(batch_counts, dim=0).numpy()
                 starts = np.concatenate(([0], splits[:-1]))
                 for b, (s, e) in enumerate(zip(starts, splits)):
                     shift = local_shift[3 * b : 3 * b + 3]
                     pos_global = (pos[s:e] + shift).numpy()
-                    if refl is not None:
-                        output_list.append(np.column_stack((pos_global, probs_np[s:e].ravel(), refl[s:e].numpy())))
-                    else:
-                        output_list.append(np.column_stack((pos_global, probs_np[s:e].ravel())))
-
-                # Pass 2: reflectance zeroed (XYZ-only, for visualization)
-                data.reflectance = torch.zeros_like(data.reflectance, device=data.reflectance.device)
-                with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
-                    outputs_xyz = model(data)
-                    outputs_xyz = torch.nan_to_num(outputs_xyz)
-                    probs_xyz = torch.sigmoid(outputs_xyz).float()
-                probs_xyz_np = probs_xyz.cpu().numpy()
-                for b, (s, e) in enumerate(zip(starts, splits)):
-                    shift = local_shift[3 * b : 3 * b + 3]
-                    pos_global = (pos[s:e] + shift).numpy()
-                    output_list_xyz.append(np.column_stack((pos_global, probs_xyz_np[s:e].ravel())))
-                del data, outputs, outputs_xyz, probs, probs_xyz
+                    refl_col = refl[s:e].numpy() if refl is not None else np.zeros(int(e - s), dtype=np.float32)
+                    output_list.append(np.column_stack((pos_global, probs_np[s:e], refl_col)))
+                del data, outputs, probs
 
         if not output_list:
             continue
 
-        def aggregate_and_save(classified_arr, out_path, include_refl=True):
-            pos_t = torch.as_tensor(classified_arr[:, :3], dtype=torch.float32, device='cpu')
-            prob_t = torch.as_tensor(classified_arr[:, 3], dtype=torch.float32, device='cpu')
-            has_refl = classified_arr.shape[1] > 4
-            if has_refl and include_refl:
-                refl_t = torch.as_tensor(classified_arr[:, 4], dtype=torch.float32, device='cpu')
-            cluster = voxel_grid(pos_t, collect_grid_size)
-            cluster, _ = consecutive_cluster(cluster)
-            # Argmax on |p - 0.5|: pick the most confident point (either direction) to decide voxel label
-            conf = torch.abs(prob_t - 0.5)
-            _, argmax_idx = scatter_max(conf, cluster, dim=0)
-            winning_prob = prob_t[argmax_idx]
-            voxel_label = (winning_prob >= 0.5).long().numpy()
-            point_labels = voxel_label[cluster.numpy()]
-            pos_np = pos_t.numpy()
-            out_dict = {'x': pos_np[:, 0], 'y': pos_np[:, 1], 'z': pos_np[:, 2], 'label': point_labels}
-            additional_fields = ['label']
-            # Add reflectance from the winning point if available
-            if has_refl and include_refl:
-                winning_refl = refl_t[argmax_idx[cluster.numpy()]]
-                out_dict['reflectance'] = winning_refl.numpy()
-                additional_fields.append('reflectance')
-            out_df = pd.DataFrame(out_dict)
-            save_file(out_path, out_df, additional_fields=additional_fields, verbose=False)
-
         classified = np.vstack(output_list)
-        classified_xyz = np.vstack(output_list_xyz)
-        del output_list, output_list_xyz
+        del output_list
 
-        # Load GT labels directly from .pt files (inference loader strips labels)
+        # GT labels from the voxel payloads (column 4): inference loader strips them.
+        payloads = []
+        if isinstance(entries_or_keys[0], dict):
+            payloads = [entry.get('point_cloud') if isinstance(entry, dict) else entry for entry in entries_or_keys]
+        else:
+            for key in entries_or_keys:
+                try:
+                    raw = torch.load(key, map_location='cpu', weights_only=True)
+                except Exception:
+                    raw = torch.load(key, map_location='cpu', weights_only=False)
+                payloads.append(raw.get('point_cloud') if isinstance(raw, dict) else raw)
         gt_points = []
-        for key in keys:
-            try:
-                raw = torch.load(key, map_location='cpu', weights_only=True)
-            except Exception:
-                raw = torch.load(key, map_location='cpu', weights_only=False)
-            pc = raw['point_cloud'] if isinstance(raw, dict) else raw
-            if pc.shape[1] >= 5:
-                gt_points.append(pc[:, [0, 1, 2, 4]].numpy())
+        for pc in payloads:
+            if isinstance(pc, torch.Tensor):
+                pc = pc.numpy()
+            elif not isinstance(pc, np.ndarray):
+                pc = np.array(pc)
+            if hasattr(pc, 'shape') and pc.ndim >= 2 and pc.shape[1] >= 5:
+                gt_points.append(pc[:, [0, 1, 2, 4]])
         gt_all = np.vstack(gt_points) if gt_points else None
 
-        # Compute and print eval metrics
-        eval_m = _eval_metrics(classified, classified_xyz, gt_all, collect_grid_size)
+        # No-refl pass is temporarily disabled; pass refl twice so _eval_metrics keeps working.
+        eval_m = _eval_metrics(
+            classified[:, :4],
+            classified[:, :4],
+            gt_all,
+            collect_grid_size,
+            any_wood_threshold=any_wood_threshold,
+        )
         if eval_m:
             tag = prefix if prefix != '_default_' else 'eval'
             print(
                 f'[Eval {tag}] E{epoch} | '
-                f'MCC refl={eval_m["mcc_with_refl"]:.4f} | '
-                f'MCC no-refl={eval_m["mcc_no_refl"]:.4f} | '
-                f'ReflGain={eval_m["refl_gain"]:+.4f} | '
-                f'ReflGain(edge)={eval_m["refl_gain_edge"]:+.4f}'
-                if not np.isnan(eval_m.get("refl_gain_edge", float("nan")))
-                else
-                f'[Eval {tag}] E{epoch} | '
-                f'MCC refl={eval_m["mcc_with_refl"]:.4f} | '
-                f'MCC no-refl={eval_m["mcc_no_refl"]:.4f} | '
-                f'ReflGain={eval_m["refl_gain"]:+.4f}'
+                f'BAc={eval_m.get("balanced_accuracy", 0.0):.4f} '
+                f'Pr={eval_m.get("precision", 0.0):.4f} '
+                f'Re={eval_m.get("recall", 0.0):.4f} '
+                f'Fbeta={eval_m.get("fbeta", 0.0):.4f} '
+                f'MCC={eval_m.get("mcc", eval_m.get("mcc_with_refl", 0.0)):.4f} '
+                f'H4={eval_m.get("h4_mcc", 0.0):.4f}'
             )
             try:
                 import wandb as _wandb
                 if _wandb.run is not None:
-                    _wandb.log({f'eval_{tag}/mcc_with_refl':      eval_m['mcc_with_refl'],
-                                f'eval_{tag}/mcc_no_refl':        eval_m['mcc_no_refl'],
-                                f'eval_{tag}/refl_gain':          eval_m['refl_gain'],
-                                f'eval_{tag}/refl_gain_edge':     eval_m.get('refl_gain_edge', 0),
-                                f'eval_{tag}/mcc_edge_with_refl': eval_m.get('mcc_edge_with_refl', 0),
-                                f'eval_{tag}/mcc_edge_no_refl':   eval_m.get('mcc_edge_no_refl', 0),
-                                f'eval_{tag}/fpr_with_refl':      eval_m['fpr_with_refl'],
-                                f'eval_{tag}/fpr_no_refl':        eval_m['fpr_no_refl'],
-                                'epoch': epoch})
+                    _wandb.log({f'eval_{tag}/mcc': eval_m.get('mcc', eval_m.get('mcc_with_refl', 0.0)), 'epoch': epoch})
             except Exception:
                 pass
 
-        # Output filenames: one with refl, one XYZ-only (zeroed reflectance)
-        if prefix == '_default_':
-            out_path = os.path.join(vis_dir, 'eval_latest.ply')
-            out_path_xyz = os.path.join(vis_dir, 'eval_latest_xyz.ply')
-        else:
-            out_path = os.path.join(vis_dir, f'{prefix}_eval.ply')
-            out_path_xyz = os.path.join(vis_dir, f'{prefix}_eval_xyz.ply')
-
-        aggregate_and_save(classified, out_path, include_refl=True)
-        aggregate_and_save(classified_xyz, out_path_xyz, include_refl=False)
+        if save_outputs:
+            out_path = (
+                os.path.join(vis_dir, 'eval_latest.ply')
+                if prefix == '_default_'
+                else os.path.join(vis_dir, f'{prefix}_eval.ply')
+            )
+            aggregate_and_save(classified, out_path, gt_arr=gt_all)
+        combined.append((classified, prefix, gt_all))
         n_saved += 1
 
-    print(f'[Eval] Saved {n_saved} visualisation(s) → {vis_dir}')
+    if save_outputs and len(combined) >= 2:
+        padding = 1.0
+        shifted_parts = []
+        shifted_gts = []
+        x_offset = 0.0
+        for arr, _pfx, gt in combined:
+            arr_shifted = arr.copy()
+            mins = arr_shifted[:, :3].min(axis=0)
+            maxs = arr_shifted[:, :3].max(axis=0)
+            width = float(maxs[0] - mins[0])
+            arr_shifted[:, 0] = arr_shifted[:, 0] - mins[0] + x_offset
+            arr_shifted[:, 1] = arr_shifted[:, 1] - mins[1]
+            arr_shifted[:, 2] = arr_shifted[:, 2] - mins[2]
+            shifted_parts.append(arr_shifted)
+            if gt is not None and len(gt) > 0:
+                gt_shifted = gt.copy()
+                gt_shifted[:, 0] = gt_shifted[:, 0] - mins[0] + x_offset
+                gt_shifted[:, 1] = gt_shifted[:, 1] - mins[1]
+                gt_shifted[:, 2] = gt_shifted[:, 2] - mins[2]
+                shifted_gts.append(gt_shifted)
+            x_offset += width + padding
+        combined_arr = np.vstack(shifted_parts)
+        combined_gt = np.vstack(shifted_gts) if shifted_gts else None
+        combined_path = os.path.join(vis_dir, 'all_eval.ply')
+        aggregate_and_save(combined_arr, combined_path, gt_arr=combined_gt)
+        print(f'[Eval] Combined side-by-side: {combined_path} ({len(combined)} sources)')
+
+    if save_outputs:
+        print(f'[Eval] Saved {n_saved} visualisation(s) → {vis_dir}')
 
 
 class EMAModel:
@@ -567,20 +1036,34 @@ def SemanticTraining(args):
 
     drop_path_rate = getattr(args, 'drop_path_rate', 0.0)
     learnable_kernels = getattr(args, 'learnable_kernels', False)
-    num_kernel_points = getattr(args, 'num_kernel_points', 16)
-    dualnorm_lite = getattr(args, 'dualnorm_lite', False)
+    num_kernel_points = getattr(args, 'num_kernel_points', (16, 16, 8))
     spatial_mix_lite = getattr(args, 'spatial_mix_lite', False)
+    memory_efficient_conv = bool(getattr(args, 'memory_efficient_conv', False))
+    sparse_max = bool(getattr(args, 'sparse_max', True))
+    compressed_head = bool(getattr(args, 'compressed_head', False))
+    compressed_head_dim = int(getattr(args, 'compressed_head_dim', 64))
+    k_neighbors = int(getattr(args, 'k_neighbors', 16))
     lr = getattr(args, 'lr', 1e-3)
     if 'eu' in args.model.lower() or 'global' in args.model.lower():
         from src.model import NetFull as Net
-        model = Net(num_classes=1, C=128, num_kernel_points=num_kernel_points, learnable_kernels=learnable_kernels, drop_path_rate=drop_path_rate, dualnorm_lite=dualnorm_lite, spatial_mix_lite=spatial_mix_lite).to(device)
+        model = Net(num_classes=1, C=128, num_kernel_points=num_kernel_points, learnable_kernels=learnable_kernels, drop_path_rate=drop_path_rate, spatial_mix_lite=spatial_mix_lite, memory_efficient_conv=memory_efficient_conv, sparse_max=sparse_max, compressed_head=compressed_head, compressed_head_dim=compressed_head_dim, k_neighbors=k_neighbors).to(device)
         weight_decay = 1e-2
     else:
         from src.model import NetLight as Net
-        model = Net(num_classes=1, C=16, num_kernel_points=8, learnable_kernels=True, drop_path_rate=drop_path_rate, dualnorm_lite=dualnorm_lite, spatial_mix_lite=spatial_mix_lite).to(device)
+        model = Net(num_classes=1, C=16, num_kernel_points=num_kernel_points, learnable_kernels=True, drop_path_rate=drop_path_rate, spatial_mix_lite=spatial_mix_lite, memory_efficient_conv=memory_efficient_conv, sparse_max=sparse_max, compressed_head=compressed_head, compressed_head_dim=compressed_head_dim, k_neighbors=k_neighbors).to(device)
         weight_decay = 1e-2
     if spatial_mix_lite:
         print("SpatialMix-lite enabled (SA2 residual blocks)")
+    if memory_efficient_conv:
+        print("Memory-efficient AnisotropicConv enabled (lower peak memory, slower)")
+    if sparse_max:
+        print("Sparsemax kernel routing enabled")
+    print("Seg head: " + (f"compressed C3->{compressed_head_dim}->1" if compressed_head else "full-width FP residual MLP"))
+
+    stage_kernel_points = getattr(model, 'stage_kernel_points', None)
+    if stage_kernel_points is not None:
+        kernel_label = "/".join(str(k) for k in stage_kernel_points)
+        print(f"Kernel points per stage: SA1/SA2/SA3 = {kernel_label}")
     
     # Print model summary
     total_params = sum(p.numel() for p in model.parameters())
@@ -626,8 +1109,37 @@ def SemanticTraining(args):
                 save_file(os.path.join(debug_dir, f'pointcutmix_{i:02d}.ply'), df, additional_fields=extra, verbose=False)
             print(f"PointCutMix: wrote 10 sample mixes to {debug_dir}/")
 
+    test_dataset = None
+    focus_dataset = None
     if args.test:
-        test_loader, _ = create_test_loader(args, device)
+        test_loader, test_dataset = create_test_loader(args, device)
+        eval_vxfile = getattr(args, 'eval_vxfile', None)
+        if eval_vxfile and os.path.isdir(eval_vxfile):
+            focus_dataset = TrainingDataset(
+                voxels=eval_vxfile,
+                augmentation=False,
+                mode='test',
+                max_pts=args.max_pts,
+                device=device,
+                denoise=getattr(args, 'denoise', False),
+                denoise_k=getattr(args, 'denoise_k', 16),
+                denoise_std=getattr(args, 'denoise_std', 1.0),
+                pointcutmix=False,
+            )
+        else:
+            # Build focus dataset from same test voxels but without FOCUS_ONLY exclusions,
+            # so fin04-hard shards are available for focus eval but not in val/adaptive sampling.
+            focus_dataset = TrainingDataset(
+                voxels=args.tefile,
+                augmentation=False,
+                mode='test',
+                max_pts=args.max_pts,
+                device=device,
+                denoise=getattr(args, 'denoise', False),
+                denoise_k=getattr(args, 'denoise_k', 16),
+                denoise_std=getattr(args, 'denoise_std', 1.0),
+                pointcutmix=False,
+            )
 
     # Cyclical Focal Loss: gamma cycles 0 → gamma_max → 0 over training
     # Early: gamma=0 (pure BCE, strong gradients for learning)
@@ -635,12 +1147,78 @@ def SemanticTraining(args):
     # End: gamma→0 (stabilize predictions)
     # gamma_max=0 → plain BCE; label_smoothing=0 → no smoothing
     gamma_max = getattr(args, 'gamma_max', 2.0)
-    gamma_peak_pct = float(getattr(args, 'gamma_peak_pct', 0.5))
+    gamma_peak_pct = float(getattr(args, 'gamma_peak_pct', 0.33))
     gamma_peak_pct = min(0.95, max(0.05, gamma_peak_pct))
-    label_smoothing = getattr(args, 'label_smoothing', 0.1)
+    label_smoothing = getattr(args, 'label_smoothing', 0.05)
     focal_alpha = getattr(args, 'focal_alpha', None)
-    boundary_max = getattr(args, 'boundary_weight', 2.0)
+    boundary_max = getattr(args, 'boundary_weight', 0.0)
     boundary_ramp_start = getattr(args, 'boundary_ramp_start', 0.1)
+    difficulty_on = bool(getattr(args, 'difficulty_sampling', False)) and float(getattr(args, 'difficulty_alpha', 0.0)) > 0.0
+    adaptive_sampling_on = bool(getattr(args, 'adaptive_group_sampling', False))
+    adaptive_warmup = getattr(args, 'adaptive_sampling_warmup', None)
+    if adaptive_warmup is None:
+        adaptive_warmup = max(1, int(round(0.10 * args.num_epochs)))
+    adaptive_ramp = getattr(args, 'adaptive_sampling_ramp', None)
+    if adaptive_ramp is None:
+        adaptive_ramp = max(1, int(round(0.10 * args.num_epochs)))
+    adaptive_sampler = ValidationGroupSamplerTracker(
+        enabled=adaptive_sampling_on,
+        warmup_epochs=adaptive_warmup,
+        ramp_epochs=adaptive_ramp,
+        alpha=getattr(args, 'adaptive_sampling_alpha', 5.0),
+        min_multiplier=getattr(args, 'adaptive_sampling_min', 0.3),
+        max_multiplier=getattr(args, 'adaptive_sampling_max', 3.0),
+        metric=getattr(args, 'adaptive_sampling_metric', 'balanced_acc'),
+    )
+    if adaptive_sampling_on:
+        sampler = getattr(train_loader, 'batch_sampler', None)
+        if not hasattr(sampler, 'set_weights'):
+            adaptive_sampler.enabled = False
+            adaptive_sampling_on = False
+            print("Adaptive group sampling requested but current sampler cannot update weights; disabled.")
+        elif test_dataset is None or len(getattr(test_dataset, 'group_list', [])) <= 1:
+            adaptive_sampler.enabled = False
+            adaptive_sampling_on = False
+            groups_seen = getattr(test_dataset, 'group_list', [])
+            print(
+                "Adaptive group sampling requested but validation has no usable groups "
+                f"({groups_seen}); disabled. Rerun --preprocess so shard names keep source prefixes."
+            )
+        else:
+            print(
+                "Adaptive group sampling ON | "
+                f"metric={adaptive_sampler.metric} | warmup={adaptive_sampler.warmup_epochs} | "
+                f"ramp={adaptive_sampler.ramp_epochs} | cap={adaptive_sampler.min_multiplier:.2f}-{adaptive_sampler.max_multiplier:.2f}x"
+            )
+
+    # Per-voxel difficulty tracking: boundary-weighted loss EMA per training voxel.
+    # Warm-starts from edge_fraction prior; online loss updates identify which specific
+    # voxels the model is currently failing on (not just which biome).
+    per_voxel_on = bool(getattr(args, 'per_voxel_difficulty', False))
+    per_voxel_alpha = float(getattr(args, 'per_voxel_alpha', 2.0))
+    per_voxel_warmup = int(getattr(args, 'per_voxel_warmup_epochs', 3))
+    voxel_ema_alpha = float(getattr(args, 'voxel_ema_alpha', 0.9))
+    if per_voxel_on:
+        sampler = getattr(train_loader, 'batch_sampler', None)
+        if sampler is None or not hasattr(sampler, 'set_weights'):
+            per_voxel_on = False
+            print("Per-voxel difficulty requested but sampler has no set_weights; disabled.")
+        else:
+            prior = np.asarray(
+                getattr(train_dataset, 'edge_fractions', np.zeros(len(train_dataset.keys))),
+                dtype=np.float64,
+            )
+            voxel_tracker = VoxelDifficultyTracker(
+                n_real=len(train_dataset.keys), prior=prior, alpha_ema=voxel_ema_alpha,
+            )
+            print(
+                f"Per-voxel difficulty ON | alpha={per_voxel_alpha} | "
+                f"warmup={per_voxel_warmup} | ema={voxel_ema_alpha} | "
+                f"n_voxels={len(train_dataset.keys)}"
+            )
+    if not per_voxel_on:
+        voxel_tracker = None
+
     criterion = FocalLoss(
         gamma_max=gamma_max,
         alpha=focal_alpha,
@@ -650,61 +1228,26 @@ def SemanticTraining(args):
         boundary_max=boundary_max,
         boundary_ramp_start=boundary_ramp_start,
     )
-    boundary_str = f", boundary={boundary_max}x (ramp from {boundary_ramp_start:.0%})" if boundary_max > 0 else ""
-    print(
-        f"Loss: Focal gamma_max={gamma_max}, peak={gamma_peak_pct:.2f}, alpha={focal_alpha}, label_smoothing={label_smoothing}{boundary_str}"
-        + (" (plain BCE)" if gamma_max == 0 else "")
-    )
-
-    # Multi-scale Contrastive Boundary Learning (CBL) - faithful to CVPR 2022 paper
-    # Applied at all encoder stages with label propagation through sub-sampling
-    cbl_weight = getattr(args, 'cbl_weight', 0.25)
-    cbl_ramp = getattr(args, 'cbl_ramp', True)
-    cbl_ramp_pct = getattr(args, 'cbl_ramp_pct', 0.33)
-    cbl_criterion = ContrastiveBoundaryLoss(
-        k=16,
-        temperature=1.0,
-        weight=cbl_weight,
-        boundary_threshold=0.1,
-        ramp=cbl_ramp,
-        ramp_pct=cbl_ramp_pct,
-    )
-    if cbl_ramp:
-        print(f"CBL weight={cbl_weight} (ramp 0→1 over first {cbl_ramp_pct:.2f} of training)")
-    else:
-        print(f"CBL weight={cbl_weight} (no ramp)")
-    refl_fp_weight = getattr(args, 'refl_fp_penalty', 0.0)
+    boundary_str = f", boundary={boundary_max}x" if boundary_max > 0 else ""
+    refl_fp_weight = getattr(args, 'refl_fp_penalty', 0.15)
+    refl_fp_str = f" | FP_penalty={refl_fp_weight}" if refl_fp_weight > 0 else ""
+    print(f"Loss: Focal(γ={gamma_max},peak={gamma_peak_pct:.2f},label_smooth={label_smoothing}){boundary_str}{refl_fp_str}")
     refl_fp_ramp = getattr(args, 'refl_fp_ramp', True)
-    refl_fp_flat = getattr(args, 'refl_fp_flat', True)
+    refl_fp_flat = getattr(args, 'refl_fp_flat', False)
     refl_fp_criterion = ReflectanceFPPenalty(margin=1.0, strength=2.0, weight=refl_fp_weight, ramp=refl_fp_ramp, flat=refl_fp_flat) if refl_fp_weight > 0 else None
-    if refl_fp_criterion is not None:
-        ramp_str = "ramp 0→1 over epochs" if refl_fp_ramp else "full weight from epoch 1"
-        mode_str = "all leaf points" if refl_fp_flat else "high-refl weighted"
-        print(f"FP penalty: weight={refl_fp_weight} ({ramp_str}, {mode_str})")
 
-    # GroupDRO: biome-aware loss reweighting
-    # --group-dro implies gamma=0 (plain BCE); GroupDRO handles difficulty weighting at group level
-    use_group_dro = getattr(args, 'group_dro', False)
-    group_tracker = None
-    criterion_none = None
-    if use_group_dro:
-        group_dro_eta = getattr(args, 'group_dro_eta', 0.01)
-        group_tracker = GroupWeightTracker(eta=group_dro_eta)
-        # Per-point loss needed for group-level reweighting — same params as criterion but no reduction
-        criterion_none = FocalLoss(
-            gamma_max=0.0,  # plain BCE per point; GroupDRO handles difficulty weighting
-            alpha=focal_alpha,
-            label_smoothing=label_smoothing,
-            cyclical=False,
-            boundary_max=boundary_max,
-            boundary_ramp_start=boundary_ramp_start,
-            reduction='none',
+    contrastive_weight = float(getattr(args, 'contrastive_weight', 0.1))
+    if contrastive_weight > 0:
+        contrastive_criterion = SupConLoss(
+            n_anchors=512,
+            start_temp=0.2,
+            end_temp=0.07,
+            weight=contrastive_weight,
+            ramp_frac=0.15,
         )
-        # Force gamma=0 on main criterion too — avoid double hard-example focusing
-        criterion.gamma_max = 0.0
-        criterion.current_gamma = 0.0
-        group_list = train_dataset.group_list
-        print(f"GroupDRO enabled: eta={group_dro_eta}, groups={group_list}, gamma forced to 0")
+        print(f"Contrastive loss: SupCon weight={contrastive_weight} | temp 0.20→0.07 | ramp first 15% of training")
+    else:
+        contrastive_criterion = None
 
     decay_params = []
     no_decay_params = []
@@ -721,6 +1264,8 @@ def SemanticTraining(args):
         {'params': no_decay_params, 'weight_decay': 0.0}
     ], lr=lr) 
 
+    # Epoch-level OneCycleLR: total_steps is epochs, and step() is called once
+    # after each epoch rather than inside the batch loop.
     lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=lr,
@@ -735,16 +1280,15 @@ def SemanticTraining(args):
     wandb_logger = WandbLogger(args)
 
     if os.path.isfile(os.path.join(args.wdir,'model',args.model)):
-        print("Loading model")
         try:
             manager.load_model(os.path.join(args.wdir,'model',args.model))
+            print("Model loaded")
         except (KeyError, RuntimeError, Exception) as e:
-            print(f"Failed to load (corrupted or incompatible): {e}")
-            print("Creating new model...")
+            print(f"Failed to load model: {e}. Creating new...")
             torch.save(model.state_dict(), os.path.join(args.wdir,'model',args.model))
     else:
-        print("\nModel not found, creating new file...")
         torch.save(model.state_dict(), os.path.join(args.wdir,'model',args.model))
+        print("Model created")
 
     best_h4_mcc = 0.0
     early_stop_best = -float('inf')
@@ -753,7 +1297,6 @@ def SemanticTraining(args):
     amp_enabled, amp_dtype, amp_name = _resolve_amp_config(device, getattr(args, 'amp_dtype', 'auto'))
     # Grad scaling is only needed for fp16; bf16 has fp32-like exponent range.
     scaler = torch.amp.GradScaler(enabled=(amp_enabled and amp_dtype == torch.float16))
-    print(f"AMP: {amp_name}")
 
     # EMA Loss tracking
     ema_loss = None
@@ -765,37 +1308,95 @@ def SemanticTraining(args):
     if use_ema:
         ema_model = EMAModel(model, decay=ema_decay)
         ema_model.register()
-        print(f"EMA enabled (decay={ema_decay})")
     else:
         ema_model = None
 
     accumulation_steps = getattr(args, 'accumulation_steps', 4)
-    print(f"Gradient accumulation: {accumulation_steps} steps")
+    ema_str = f" | EMA(decay={ema_decay})" if use_ema else ""
+    print(f"AMP: {amp_name} | Grad accum: {accumulation_steps}{ema_str}")
     optimizer.zero_grad(set_to_none=True)
     accumulated_batches = 0  # Track actual accumulated batches
+    global_train_step = 0
+    wandb_train_log_interval = max(1, int(getattr(args, 'wandb_train_log_interval', 25)))
+
+    # Track best metrics across all epochs
+    best_metrics_by_epoch = {}
 
     for epoch in range(1, args.num_epochs + 1):
         model.train()
         print(f"\n{'='*100}\nEPOCH {epoch}\n{'='*100}")
 
         criterion.set_epoch(epoch, args.num_epochs)
-        cbl_criterion.set_epoch(epoch, args.num_epochs)
-        if criterion_none is not None:
-            criterion_none.set_epoch(epoch, args.num_epochs)
         if refl_fp_criterion is not None:
             refl_fp_criterion.set_epoch(epoch, args.num_epochs)
+        if contrastive_criterion is not None:
+            contrastive_criterion.set_epoch(epoch, args.num_epochs)
+
+        # Sampling ramps: edge difficulty can scale in, and validation-group weights can
+        # bias future epochs after a warmup without changing the loss.
+        _alpha_cur = 0.0
+        _sampler_weights = None
+        _voxel_alpha_cur = per_voxel_alpha if (per_voxel_on and epoch > per_voxel_warmup) else 0.0
+        if difficulty_on:
+            _alpha_full = float(getattr(args, 'difficulty_alpha', 2.0))
+            _ramp_pct = float(getattr(args, 'difficulty_ramp_pct', 0.5))
+            _t = min(1.0, (epoch - 1) / max(1, _ramp_pct * args.num_epochs))
+            _alpha_cur = _alpha_full * _t
+        # Once voxel-EMA is active it already encodes edge_frac via its warm-start prior —
+        # drop edge_alpha to avoid applying the same signal twice.
+        _edge_alpha_cur = 0.0 if _voxel_alpha_cur > 0 else _alpha_cur
+        _coverage_warmup = per_voxel_on and voxel_tracker is not None and epoch <= per_voxel_warmup
+        _unseen_boost = float(getattr(args, 'unseen_voxel_boost', 8.0)) if _coverage_warmup else 0.0
+        _allow_replacement = not (
+            _coverage_warmup and not bool(getattr(args, 'coverage_warmup_replacement', False))
+        )
+        if difficulty_on or adaptive_sampling_on or per_voxel_on:
+            _sampler_weights = _apply_train_sampler_weights(
+                train_loader,
+                train_dataset,
+                edge_alpha=_edge_alpha_cur,
+                group_multipliers=adaptive_sampler.multipliers if adaptive_sampling_on else None,
+                voxel_difficulty=voxel_tracker if per_voxel_on else None,
+                voxel_alpha=_voxel_alpha_cur,
+                coverage_tracker=voxel_tracker if _coverage_warmup else None,
+                unseen_boost=_unseen_boost,
+                allow_replacement=_allow_replacement,
+            )
+
+        # Push per-voxel difficulty into dataset so augmentations() can suppress
+        # compress/copy for consistently-hard voxels. Only after EMA warmup — during
+        # warmup the tracker is just the edge_fraction prior, not meaningful loss signal.
+        if per_voxel_on and voxel_tracker is not None and epoch > per_voxel_warmup:
+            _diff_raw = voxel_tracker.normalised_weights()  # [0, 2] centred at 1.0
+            train_dataset.difficulty_scores = np.clip(_diff_raw - 1.0, 0.0, 1.0)  # [0,1]; 0=avg/easy
+
         refl_str = f" | ReflFP: {refl_fp_criterion.ramp_factor:.3f}" if refl_fp_criterion is not None else ""
         boundary_str = f" | Boundary: {criterion.boundary_weight:.2f}x" if criterion.boundary_max > 0 else ""
-        print(f"LR: {optimizer.param_groups[0]['lr']:.6f} | Gamma: {criterion.current_gamma:.3f} | CBL: {cbl_criterion.ramp_factor:.3f}{boundary_str}{refl_str}")
+        diff_str = f" | DiffA: {_alpha_cur:.2f}" if difficulty_on and _sampler_weights is not None else ""
+        adapt_str = f" | AdaptS: {adaptive_sampler.status_str()}" if adaptive_sampling_on else ""
+        voxel_str = f" | VoxDiff: {voxel_tracker.status_str()}" if per_voxel_on and voxel_tracker is not None else ""
+        coverage_str = (
+            f" | Cover: unseen_boost={_unseen_boost:.1f}, no_repl={not _allow_replacement}"
+            if _coverage_warmup else ""
+        )
+        print(f"LR: {optimizer.param_groups[0]['lr']:.6f} | Gamma: {criterion.current_gamma:.3f}{boundary_str}{refl_str}{diff_str}{adapt_str}{voxel_str}{coverage_str}")
         train_tracker = MetricsTracker(full_metrics=False)  # Fast metrics only for training
-        epoch_group_losses: dict = {}  # group_name -> list of per-sample losses (for GroupDRO update)
+        clamp_hits = 0
+        clamp_max_unclamped = 0.0
+        ema_focal = None
+        ema_con = None
+        ema_refl_fp = None
 
         # Max points per batch to avoid OOM (adjust based on your GPU)
         max_points_per_batch = getattr(args, 'max_points_per_batch', 50000)
         verbose = getattr(args, 'verbose', False)
 
         # Limit steps per epoch (0 = use all data)
+        # If difficulty sampling is active and no explicit value was given, default to 50% of
+        # the loader so the weighted sampler has genuine selection pressure each epoch.
         epoch_steps = getattr(args, 'epoch_steps', 0)
+        if epoch_steps == 0 and difficulty_on:
+            epoch_steps = max(1, len(train_loader) // 2)
         total_steps = min(len(train_loader), epoch_steps) if epoch_steps > 0 else len(train_loader)
 
         with tqdm(total=total_steps, colour='white', ascii="░▒", bar_format='{l_bar}{bar:20}{r_bar}{bar:-20b}') as tepoch:
@@ -818,6 +1419,9 @@ def SemanticTraining(args):
                         spacing_min=spacing[0],
                         spacing_max=spacing[1],
                         prob=getattr(args, 'density_aug_prob', 0.5),
+                        difficulty=getattr(data, 'difficulty', None),
+                        hard_skip_threshold=getattr(args, 'density_aug_hard_threshold', 0.75),
+                        difficulty_power=getattr(args, 'density_aug_difficulty_power', 2.0),
                     )
 
                 # PointCutMix runs in the dataset (loader) like normal augmentation
@@ -849,6 +1453,7 @@ def SemanticTraining(args):
                     model_output = model(data)
 
                     outputs = model_output
+                    per_sample_tracking_loss = None
 
                     if not torch.isfinite(outputs).all():
                         print(f"[Warning] Non-finite model outputs at step {i}, skipping batch")
@@ -856,49 +1461,59 @@ def SemanticTraining(args):
                         accumulated_batches = 0
                         continue
 
-                    if use_group_dro and hasattr(data, 'group_idx') and data.group_idx is not None:
-                        # Per-point BCE (gamma=0), aggregate to per-sample, apply group weights
-                        loss_per_point = criterion_none(outputs, data.y.float(), edge_scores=getattr(data, 'edge_scores', None))  # [N_points]
-                        n_samples = int(data.batch.max().item()) + 1
+                    focal_loss_val = criterion(outputs, data.y.float(), edge_scores=getattr(data, 'edge_scores', None))
+                    loss = focal_loss_val
+                    per_sample_tracking_loss = None
 
-                        # Per-sample mean loss
-                        pt_ones = torch.ones(loss_per_point.size(0), device=device)
-                        per_sample_sum   = scatter_add(loss_per_point, data.batch, dim=0, dim_size=n_samples)
-                        per_sample_count = scatter_add(pt_ones, data.batch, dim=0, dim_size=n_samples).clamp(1)
-                        per_sample_loss  = per_sample_sum / per_sample_count  # [B]
+                    if per_voxel_on and voxel_tracker is not None:
+                        if per_sample_tracking_loss is None:
+                            with torch.no_grad():
+                                per_sample_tracking_loss = _per_sample_boundary_weighted_bce(
+                                    outputs.detach(),
+                                    data.y.float(),
+                                    data.batch,
+                                    edge_scores=getattr(data, 'edge_scores', None),
+                                )
+                        voxel_ids = getattr(data, 'voxel_idx', None)
+                        if voxel_ids is not None:
+                            voxel_ids_np = voxel_ids.view(-1).detach().cpu().numpy()
+                            voxel_tracker.update(
+                                voxel_ids_np[:per_sample_tracking_loss.numel()],
+                                per_sample_tracking_loss.detach().cpu().numpy(),
+                            )
 
-                        # Group weights for each sample in this batch
-                        group_ids = data.group_idx.view(-1)[:n_samples]  # [B]
-                        sample_weights = torch.tensor(
-                            [group_tracker.weight(group_list[gid.item()]) for gid in group_ids],
-                            device=device, dtype=torch.float32
-                        )
-                        # Scale so weights sum to n_samples (mean stays ~same magnitude)
-                        sample_weights = sample_weights * n_samples / sample_weights.sum().clamp(min=1e-8)
-
-                        loss = (per_sample_loss * sample_weights).mean()
-
-                        # Accumulate per-group losses for end-of-epoch weight update
-                        for s in range(n_samples):
-                            g_name = group_list[group_ids[s].item()]
-                            if g_name not in epoch_group_losses:
-                                epoch_group_losses[g_name] = []
-                            epoch_group_losses[g_name].append(per_sample_loss[s].item())
-                    else:
-                        loss = criterion(outputs, data.y.float(), edge_scores=getattr(data, 'edge_scores', None))
-
-                    if hasattr(model, 'encoder_stages') and model.encoder_stages:
-                        cbl_loss = cbl_criterion(
-                            encoder_stages=model.encoder_stages,
-                            labels=data.y
-                        )
-                        loss = loss + cbl_loss
-
+                    refl_fp_val = 0.0
                     if refl_fp_criterion is not None and getattr(data, 'reflectance', None) is not None:
-                        loss = loss + refl_fp_criterion(outputs, data.y.float(), data.reflectance)
+                        _rfp = refl_fp_criterion(outputs, data.y.float(), data.reflectance)
+                        loss = loss + _rfp
+                        refl_fp_val = float(_rfp.detach().item())
 
-                    # Clamp for stability
+                    con_val = 0.0
+                    if contrastive_criterion is not None and hasattr(model, 'last_proj'):
+                        con_loss = contrastive_criterion(
+                            model.last_proj,
+                            (data.y.float() >= 0.5),
+                            edge_scores=getattr(data, 'edge_scores', None),
+                        )
+                        if torch.isfinite(con_loss):
+                            loss = loss + con_loss
+                            con_val = float(con_loss.detach().item())
+
+                    # Track per-component EMAs for balance diagnostics
+                    _fv = float(focal_loss_val.detach().item())
+                    ema_focal  = _fv if ema_focal  is None else ema_alpha * ema_focal  + (1 - ema_alpha) * _fv
+                    ema_con    = con_val if ema_con    is None else ema_alpha * ema_con    + (1 - ema_alpha) * con_val
+                    ema_refl_fp= refl_fp_val if ema_refl_fp is None else ema_alpha * ema_refl_fp + (1 - ema_alpha) * refl_fp_val
+
+                    # Clamp for stability. Track unclamped value so we can warn if
+                    # stacked losses (focal + boundary + refl-FP) hit the ceiling.
+                    unclamped_loss_value = float(loss.detach().item())
                     loss = torch.clamp(loss, min=0.0, max=10.0)
+                    if unclamped_loss_value > 10.0:
+                        clamp_hits += 1
+                        if unclamped_loss_value > clamp_max_unclamped:
+                            clamp_max_unclamped = unclamped_loss_value
+                        print(f"[Clamp alarm] epoch {epoch} step {i}: unclamped={unclamped_loss_value:.2f} > 10.0 (gradients silently capped on edges)")
                     if not torch.isfinite(loss).all():
                         print(f"[Warning] Non-finite loss at step {i}, skipping batch")
                         optimizer.zero_grad(set_to_none=True)
@@ -950,15 +1565,31 @@ def SemanticTraining(args):
 
                 # Update progress bar with current batch metrics
                 current_metrics = train_tracker.get_averages()
-                tepoch.set_postfix({
-                    'Lo': round(current_metrics['loss'], 5),
-                    'EMA': round(ema_loss, 5),
+                pbar_dict = {
+                    'Lo': round(current_metrics['loss'], 4),
+                    'LoS': round(ema_loss, 4),
                     'BAc': round(current_metrics['accuracy'], 3),
-                    'Pr': round(current_metrics['precision'], 3),
                     'Re': round(current_metrics['recall'], 3),
                     'Fb': round(current_metrics['fbeta'], 3),
-                })
+                }
+                if contrastive_criterion is not None and ema_focal is not None and ema_focal > 1e-6:
+                    pbar_dict['ConR'] = round(ema_con / ema_focal, 2)
+                    pbar_dict['ConA'] = round(ema_con, 3)
+                tepoch.set_postfix(pbar_dict)
                 tepoch.update(1)
+
+                global_train_step += 1
+                if (
+                    wandb_logger.wandb is not None
+                    and (global_train_step % wandb_train_log_interval == 0 or (i + 1) == total_steps)
+                ):
+                    wandb_logger.log_train_step(
+                        global_train_step,
+                        optimizer.param_groups[0]["lr"],
+                        current_metrics,
+                        batch_loss=current_loss,
+                        ema_loss=ema_loss,
+                    )
             tepoch.close()
             
         # Handle any remaining gradients at epoch end
@@ -980,21 +1611,29 @@ def SemanticTraining(args):
                 optimizer.zero_grad(set_to_none=True)
                 accumulated_batches = 0
 
+        # Keep LR cycling per epoch, not within the epoch.
         lr_scheduler.step()
+
+        if clamp_hits > 0:
+            clamp_rate = 100.0 * clamp_hits / max(1, total_steps)
+            severity = "HIGH" if clamp_rate > 1.0 else "low"
+            print(f"[Clamp summary] epoch {epoch}: {clamp_hits}/{total_steps} steps clamped "
+                  f"({clamp_rate:.2f}% — {severity}), worst unclamped={clamp_max_unclamped:.2f}")
+            if clamp_rate > 1.0:
+                print(f"[Clamp warning] >1% of steps hit the 10.0 ceiling — consider lowering boundary_max/refl_fp_penalty or raising the clamp")
 
         train_metrics = train_tracker.get_averages()
 
-        # GroupDRO: update group weights from this epoch's per-group mean losses
-        if use_group_dro and epoch_group_losses:
-            group_mean_losses = {g: float(np.mean(v)) for g, v in epoch_group_losses.items()}
-            group_tracker.update(group_mean_losses)
-            print(f"GroupDRO weights: {group_tracker.log_str()}")
-            try:
-                import wandb as _wandb
-                if _wandb.run is not None:
-                    _wandb.log({f'group_dro/{g}': w for g, w in group_tracker.weights.items()} | {'epoch': epoch})
-            except Exception:
-                pass
+        # Loss component breakdown
+        if ema_focal is not None:
+            _focal_s = f"focal={ema_focal:.3f}"
+            _rfp_s   = f" refl_fp={ema_refl_fp:.3f}" if refl_fp_criterion is not None else ""
+            _con_s   = ""
+            if contrastive_criterion is not None and ema_focal > 1e-6:
+                con_ratio = ema_con / ema_focal
+                flag = " ⚠ con>2x focal" if con_ratio > 2.0 else (" ✓" if con_ratio < 1.0 else "")
+                _con_s = f" con={ema_con:.3f} (×{con_ratio:.2f} focal){flag}"
+            print(f"Loss breakdown: {_focal_s}{_rfp_s}{_con_s}")
 
         # Compact flashlight / reflectance diagnostics
         def _short_layer_name(layer_name: str) -> str:
@@ -1006,14 +1645,22 @@ def SemanticTraining(args):
                 return "sa3"
             return layer_name.replace("_module", "")
 
+        def _diag_float(value, default=None):
+            if value is None:
+                return default
+            try:
+                if isinstance(value, torch.Tensor):
+                    return float(value.detach().cpu().item())
+                return float(value)
+            except Exception:
+                return default
+
         kernel_metrics = []
-        flashlight_tags = []
-        similarity_list = []
-        gate_list = []
-        diag_rows = []
+        refl_rows = []
+        refl_gain_list = []
         diag_warnings = []
-        dualnorm_alphas = []
-        dualnorm_betas = []
+        contrast_gate_list = []
+        refl_stage_metrics = {}
 
         for name, module in model.named_modules():
             if hasattr(module, 'kernel_entropy'):
@@ -1022,80 +1669,74 @@ def SemanticTraining(args):
                 continue
 
             layer_name = _short_layer_name(name.split('.conv')[0])
-            similarity = getattr(module, 'last_similarity', None)
-            gate_val = getattr(module, 'last_refl_gate', None)
-
-            if similarity is not None:
-                similarity_list.append(similarity)
-            if gate_val is not None:
-                gate_list.append(gate_val)
-
-            if similarity is not None and gate_val is not None:
-                flashlight_tags.append(f"{layer_name}(s={similarity:.3f},g={gate_val:.3f})")
-            elif similarity is not None:
-                flashlight_tags.append(f"{layer_name}(s={similarity:.3f})")
-            elif gate_val is not None:
-                flashlight_tags.append(f"{layer_name}(g={gate_val:.3f})")
 
             if hasattr(module, 'diagnostics'):
                 diag = module.diagnostics
-                eig_dom = diag.get('eigvals_dominant_mean', 0.0)
-                eig_std = diag.get('eigvals_dominant_std', 0.0)
-                contrast = diag.get('contrast_strength_mean', 0.0)
-                gate_mean = diag.get('refl_gate_mean', None)
-                if gate_mean is not None:
-                    diag_rows.append(f"{layer_name}[eig={eig_dom:.3f}±{eig_std:.3f},c={contrast:.3f},g={gate_mean:.3f}]")
-                else:
-                    diag_rows.append(f"{layer_name}[eig={eig_dom:.3f}±{eig_std:.3f},c={contrast:.3f}]")
+                contrast_gate = diag.get('contrast_gate_mean', None)
+                refl_gain = diag.get('cobright_lift_mean', diag.get('refl_edge_gain_mean', diag.get('refl_gain_mean', None)))
+                contrast_gate_f = _diag_float(contrast_gate, None)
+                refl_gain_f = _diag_float(refl_gain, None)
+
+                if refl_gain_f is not None and np.isfinite(refl_gain_f):
+                    refl_gain_list.append(refl_gain_f)
+                if contrast_gate_f is not None and np.isfinite(contrast_gate_f):
+                    contrast_gate_list.append(contrast_gate_f)
+
+                gate_print = contrast_gate_f if contrast_gate_f is not None and np.isfinite(contrast_gate_f) else 0.0
+                gain_print = refl_gain_f if refl_gain_f is not None and np.isfinite(refl_gain_f) else 1.0
+                refl_rows.append(f"{layer_name}[gate={gate_print:.2f},gain={gain_print:.2f}x]")
+                refl_stage_metrics[f"refl_gate_{layer_name}"] = gate_print
+                refl_stage_metrics[f"refl_gain_{layer_name}"] = gain_print
 
                 if 'warning' in diag:
                     diag_warnings.append(f"{layer_name}: {diag['warning']}")
-                if diag.get('has_nan', False):
+                if bool(_diag_float(diag.get('has_nan', False), 0.0)):
                     diag_warnings.append(f"{layer_name}: NaN detected")
 
-            if getattr(module, 'use_dualnorm_lite', False):
-                if hasattr(module, 'last_dualnorm_alpha'):
-                    dualnorm_alphas.append(module.last_dualnorm_alpha)
-                if hasattr(module, 'last_dualnorm_beta'):
-                    dualnorm_betas.append(module.last_dualnorm_beta)
-
-        # Collect model internals for wandb
-        contrast_strengths = []
-        for name, module in model.named_modules():
-            if isinstance(module, AnisotropicConv) and hasattr(module, 'diagnostics'):
-                cs = module.diagnostics.get('contrast_strength_mean', 0.0)
-                contrast_strengths.append(cs)
-
         model_metrics = {
-            "refl_gate":        np.mean(gate_list) if gate_list else 0.0,
-            "contrast_strength": np.mean(contrast_strengths) if contrast_strengths else 0.0,
-            "dualnorm_alpha":   np.mean(dualnorm_alphas) if dualnorm_alphas else 0.0,
             "kernel_entropy":   sum(kernel_metrics) / len(kernel_metrics) if kernel_metrics else 0.0,
-            "cbl_sample_std":   getattr(cbl_criterion, 'last_sample_std', 0.0),
+            "refl_gate_mean": np.mean(contrast_gate_list) if contrast_gate_list else 0.0,
+            "refl_gain_mean": np.mean(refl_gain_list) if refl_gain_list else 1.0,
         }
+        model_metrics.update(refl_stage_metrics)
 
         if kernel_metrics:
             avg_entropy = sum(kernel_metrics) / len(kernel_metrics)
-            print(f"Kernel Entropy: {avg_entropy:.2f}")
-        if flashlight_tags:
-            print("Flashlight: " + " | ".join(flashlight_tags))
-        if similarity_list:
-            if gate_list:
-                print(f"Summary: sim={np.mean(similarity_list):.3f}, gate={np.mean(gate_list):.3f}")
-            else:
-                print(f"Summary: sim={np.mean(similarity_list):.3f}")
-        if dualnorm_alphas and dualnorm_betas:
-            print(f"DualNorm-lite: alpha={np.mean(dualnorm_alphas):.3f}, beta={np.mean(dualnorm_betas):.3f}")
-        if diag_rows:
-            print("Diag: " + " | ".join(diag_rows))
-        if diag_warnings:
-            print(f"Warnings: {'; '.join(diag_warnings)}")
+        else:
+            avg_entropy = 0.0
+
+        if not args.test:
+            print(f"Kernels: {avg_entropy:.2f}" + (" | Refl: " + " | ".join(refl_rows) if refl_rows else ""))
+            if diag_warnings:
+                print(f"Warnings: {'; '.join(diag_warnings)}")
 
         if args.test:
             model.eval()
-            mean_dlogit_drefl = compute_refl_dominance_diagnostic(model, test_loader, device, args)
+            refl_usage = {
+                "all": float("nan"),
+                "edge": float("nan"),
+                "pure": float("nan"),
+                "edge_wood": float("nan"),
+                "edge_ratio": float("nan"),
+            }
+            if getattr(args, 'refl_diagnostics', False):
+                refl_usage = compute_refl_dominance_diagnostic(model, test_loader, device, args)
+            mean_dlogit_drefl = refl_usage.get("all", float("nan"))
             if not np.isnan(mean_dlogit_drefl):
-                print(f"Refl dominance: mean |∂logit/∂refl| = {mean_dlogit_drefl:.4f}")
+                # Single-line diagnostic: refl strength, geometry structure per stage, refl gain per SA
+                edge_usage = refl_usage.get("edge", float("nan"))
+                pure_usage = refl_usage.get("pure", float("nan"))
+                edge_wood_usage = refl_usage.get("edge_wood", float("nan"))
+                edge_ratio = refl_usage.get("edge_ratio", float("nan"))
+                usage_str = (
+                    f"all={mean_dlogit_drefl:.2f},edge={edge_usage:.2f},"
+                    f"edgeW={edge_wood_usage:.2f},pure={pure_usage:.2f},e/p={edge_ratio:.2f}"
+                )
+                print(f"\033[96mRefl Strength: {usage_str} | Refl: {' | '.join(refl_rows) if refl_rows else 'N/A'}\033[0m")
+            else:
+                print(f"Kernels: {avg_entropy:.2f}" + (" | Refl: " + " | ".join(refl_rows) if refl_rows else ""))
+            if diag_warnings:
+                print(f"Warnings: {'; '.join(diag_warnings)}")
 
             # Apply EMA weights for testing (if enabled)
             if ema_model is not None:
@@ -1106,10 +1747,41 @@ def SemanticTraining(args):
 
             harmonic_metrics = calculate_harmonic_metrics(test_metrics_with_refl, test_metrics_no_refl)
             print_validation_summary(epoch, harmonic_metrics)
+            edge_gain = harmonic_metrics.get('mcc_edge_with_refl', 0.0) - harmonic_metrics.get('mcc_edge_no_refl', 0.0)
+            pure_gain = harmonic_metrics.get('mcc_pure_with_refl', 0.0) - harmonic_metrics.get('mcc_pure_no_refl', 0.0)
+            usage_ratio = refl_usage.get('edge_ratio', float('nan'))
+            usage_str = f" | usage edge/pure={usage_ratio:.2f}" if np.isfinite(usage_ratio) else ""
+            con_str = f" | SupCon τ={contrastive_criterion.temperature:.3f} ramp={contrastive_criterion.ramp_factor:.2f}" if contrastive_criterion is not None else ""
+            print(f"Reflectance ΔMCC: edge={edge_gain:+.4f} | pure={pure_gain:+.4f}{usage_str}{con_str}")
+            print_focus_site_eval(model, focus_dataset, device, args, epoch, prefixes=('deu08', 'fin04', 'fin04-hard', 'esp190'))
+            if adaptive_sampling_on:
+                adaptive_sampler.update(epoch, test_metrics_with_refl.get('group_metrics', {}))
+                print(f"Adaptive sampling: {adaptive_sampler.breakdown_str()}")
+                try:
+                    import wandb as _wandb
+                    if _wandb.run is not None and adaptive_sampler.multipliers:
+                        _wandb.log(
+                            {f'adaptive_sampling/{g}': w for g, w in adaptive_sampler.multipliers.items()} | {'epoch': epoch}
+                        )
+                except Exception:
+                    pass
+
+            # Track best metrics across all epochs
+            best_metrics_by_epoch[epoch] = {
+                'h4_mcc': harmonic_metrics.get('h4_mcc', 0.0),
+                'mcc_with_refl_pure': test_metrics_with_refl.get('mcc_pure', 0.0),
+                'mcc_no_refl_pure': test_metrics_no_refl.get('mcc_pure', 0.0),
+                'mcc_pure_h': harmonic_metrics.get('mcc_pure_h', 0.0),
+                'mcc_with_refl_edge': test_metrics_with_refl.get('mcc_edge', 0.0),
+                'mcc_no_refl_edge': test_metrics_no_refl.get('mcc_edge', 0.0),
+                'mcc_edge_h': harmonic_metrics.get('mcc_edge_h', 0.0),
+            }
 
             # Update test metrics with harmonic data for logging
             test_metrics = update_test_metrics_with_harmonic(test_metrics_with_refl.copy(), harmonic_metrics)
             test_metrics["refl_dominance"] = mean_dlogit_drefl if (np.isfinite(mean_dlogit_drefl) and not np.isnan(mean_dlogit_drefl)) else 0.0
+            for key, value in refl_usage.items():
+                test_metrics[f"refl_dominance_{key}"] = value if np.isfinite(value) else 0.0
             
             # Restore original weights for training
             if ema_model is not None:
@@ -1123,7 +1795,8 @@ def SemanticTraining(args):
         if getattr(args, 'eval', False) and epoch % 10 == 0:
             if ema_model is not None:
                 ema_model.apply_shadow()
-            run_eval_visualization(model, args, device, epoch)
+            if getattr(args, 'eval', False):
+                run_eval_visualization(model, args, device, epoch)
             if ema_model is not None:
                 ema_model.restore()
 
@@ -1152,12 +1825,36 @@ def SemanticTraining(args):
         # Save best model on H4-MCC: the single metric that demands good performance
         # across all four conditions (with/no refl × pure/edge).
         if args.test and epoch > int(args.num_epochs*0.25):
+            if ema_model is not None:
+                ema_model.apply_shadow()
             best_h4_mcc = manager.save_best_model(harmonic_metrics['h4_mcc'], best_h4_mcc, os.path.join(args.wdir,'model','h4mcc-' + os.path.basename(args.model)))
+            if ema_model is not None:
+                ema_model.restore()
 
         if epoch == args.num_epochs:
             print("Saving final GLOBAL model")
             if ema_model is not None:
                 ema_model.apply_shadow()
-            torch.save({'model_state_dict': model.state_dict()}, os.path.join(args.wdir,'model',args.model))
+            torch.save(manager.checkpoint_payload(), os.path.join(args.wdir,'model',args.model))
             if ema_model is not None:
                 ema_model.restore()
+
+    # Print final training summary with best metrics
+    if best_metrics_by_epoch:
+        print("\n" + "="*100)
+        print("FINAL TRAINING SUMMARY")
+        print("="*100)
+
+        best_h4_val = max(m['h4_mcc'] for m in best_metrics_by_epoch.values())
+        best_h4_epoch = [e for e, m in best_metrics_by_epoch.items() if m['h4_mcc'] == best_h4_val][0]
+
+        best_pure_val = max(m['mcc_pure_h'] for m in best_metrics_by_epoch.values())
+        best_pure_epoch = [e for e, m in best_metrics_by_epoch.items() if m['mcc_pure_h'] == best_pure_val][0]
+
+        best_edge_val = max(m['mcc_edge_h'] for m in best_metrics_by_epoch.values())
+        best_edge_epoch = [e for e, m in best_metrics_by_epoch.items() if m['mcc_edge_h'] == best_edge_val][0]
+
+        print(f"Best H4-MCC:                {best_h4_val:.4f} (Epoch {best_h4_epoch})")
+        print(f"Best Pure MCC (Harmonic):   {best_pure_val:.4f} (Epoch {best_pure_epoch})")
+        print(f"Best Edge MCC (Harmonic):   {best_edge_val:.4f} (Epoch {best_edge_epoch})")
+        print("="*100)

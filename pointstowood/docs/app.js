@@ -4,8 +4,10 @@ import { OrbitControls } from "https://unpkg.com/three@0.163.0/examples/jsm/cont
 const MAX_RENDER_POINTS = 240_000;
 const DEFAULT_COMPACT_META_CANDIDATES = ["./data/pointcloud.meta.json"];
 const DEFAULT_PLY_SOURCE_CANDIDATES = [
+  "./data/uk01_lw_pl_3-p2w.ply",
   "./data/uk01_lw_pl_3_p2w.ply",
   "./data/pointcloud.ply",
+  "../uk01_lw_pl_3-p2w.ply",
   "../uk01_lw_pl_3_p2w.ply",
 ];
 

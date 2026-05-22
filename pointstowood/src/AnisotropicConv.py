@@ -1,15 +1,46 @@
 """
 AnisotropicConv: Wood/leaf point conv — geometry-first, reflectance as flashlight.
 
-Geometry: Directional kernel routing (Fibonacci sphere) + density-normalized aggregation.
-Flashlight: D = M_refl - M_geom, where M_refl weights direction outer-products by local
-  reflectance contrast (absolute deviation from per-neighbourhood median). Sensor-agnostic:
-  a uniformly bright or dark neighbourhood gives r_local≈0 so M_refl≈0 and the gate suppresses.
-  Both bright and dark deviations count so dark twigs in bright canopy are detectable.
-Reflectance reliability gate: per-eigenvalue learned gate — scales eigvals(D) independently.
-Signed edge modulation: learned reflectance gain around 1.0 can either amplify
-  or attenuate edge contributions while remaining strictly positive.
-Output: agg_feat (F*K) + eigvals_gated (3).
+Geometry: Directional kernel routing (Fibonacci sphere) + density-normalised aggregation.
+Flashlight: three complementary structure tensors. Each is a weighted outer-product average
+  over the local neighbourhood, differing only in the per-edge weight:
+
+  M_geom     = (1/k) Σ d̂⊗d̂                              — uniform (pure geometry)
+  M_refl     = Σ c_j · d̂⊗d̂  /  Σ c_j                    — contrast-weighted
+  M_cobright = Σ (c_max - c_j) · d̂⊗d̂  /  Σ(c_max - c_j) — complement-weighted
+
+  where c_j = |r_j - r_i| (center-relative contrast) and c_max = max_j(c_j).
+
+  Partition identity: W_j + W'_j = c_max for every edge, so M_refl and M_cobright are
+  the conditional expectations of the outer-product tensor under the contrast measure and
+  its complement. The unnormalised tensors satisfy:
+
+      (Σ c_j) · M_refl  +  (Σ(c_max - c_j)) · M_cobright  =  k · c_max · M_geom
+
+  i.e. M_refl and M_cobright reconstruct M_geom when mixed in proportion to their
+  respective weight sums. The eigenvalue spectra of the three tensors are NOT related
+  by this identity (eigenvalues are not closed under linear combination), so eigvals(M_geom)
+  carries independent information and is kept in the flashlight.
+
+  M_refl captures directions toward DISSIMILAR-brightness neighbours. For a bright twig
+  center surrounded by dark leaves, leaf directions dominate M_refl (high c_j), while the
+  co-bright wood chain (c_j ≈ 0) gets zero weight. M_refl is blind to the chain.
+
+  M_cobright captures directions toward SIMILAR-brightness neighbours. For the same twig,
+  wood chain neighbors (c_j ≈ 0) receive weight c_max while leaf neighbors (c_j ≈ c_max)
+  receive weight ≈ 0. The twig chain axis becomes the dominant eigenvector of M_cobright
+  even in a neighbourhood dominated by leaf returns — with no calibration constants.
+
+  Calibration-free tensor construction: the weights use only relative contrast within
+  each neighbourhood (c_max is the local dynamic range, not a global threshold or σ).
+  The downstream flashlight_mlp carries the learned parameters.
+
+Output per point: agg_feat (F*K) + flashlight (11 channels).
+  flashlight = [eigvals(M_geom)(3), eigvals(M_refl)(3), eigvals(M_cobright)(3),
+                mean_c(1), c_max(1)]
+  mean_c and c_max together let the MLP distinguish a single specular outlier
+  (large c_max, small mean_c) from a genuine wood/leaf interface (both large).
+  All channels are unsigned and scale-invariant within each neighbourhood.
 """
 
 import math
@@ -34,17 +65,58 @@ from torch_geometric.utils import add_self_loops, remove_self_loops
 from torch_scatter import scatter_max, scatter_add
 
 
+def _eigvalsh_3x3_analytical(M: Tensor) -> Tensor:
+    """Closed-form eigenvalues for batched 3x3 symmetric matrices.
+
+    Uses Cardano's trigonometric solution — pure tensor ops, no LAPACK.
+    ~3-5x faster than torch.linalg.eigvalsh for 3x3. Returns eigenvalues
+    in ascending order [N, 3].
+
+    Always computed in fp32: the intermediate sqrt/acos operations underflow
+    silently in fp16/bf16 on near-isotropic tensors. AMP callers get fp32
+    output cast back to their dtype.
+    """
+    dtype_in = M.dtype
+    if dtype_in != torch.float32:
+        M = M.float()
+
+    a, b, c = M[:, 0, 0], M[:, 0, 1], M[:, 0, 2]
+    d, e    = M[:, 1, 1], M[:, 1, 2]
+    f       = M[:, 2, 2]
+
+    p1 = a + d + f
+    q  = p1 / 3.0
+    p2 = a * d - b * b + a * f - c * c + d * f - e * e
+    p3 = a * (d * f - e * e) - b * (b * f - c * e) + c * (b * e - c * d)
+
+    pp = (3.0 * p2 - p1 * p1) / 9.0
+    r  = (2.0 * p1 * p1 * p1 - 9.0 * p1 * p2 + 27.0 * p3) / 54.0
+
+    phi_denom = (-pp).clamp(min=1e-8).sqrt().pow(3)
+    cos_arg   = (r / phi_denom).clamp(-1.0, 1.0)
+    phi       = torch.acos(cos_arg) / 3.0
+
+    two_sqrt = 2.0 * (-pp).clamp(min=0.0).sqrt()
+    e0 = q + two_sqrt * torch.cos(phi + (2.0 * math.pi / 3.0))
+    e1 = q + two_sqrt * torch.cos(phi + (4.0 * math.pi / 3.0))
+    e2 = q + two_sqrt * torch.cos(phi)
+
+    eigvals = torch.stack([e0, e1, e2], dim=1)
+    eigvals, _ = eigvals.sort(dim=1)
+    return torch.nan_to_num(eigvals, nan=0.0, posinf=0.0, neginf=0.0).to(dtype_in)
+
+
 def fibonacci_sphere(n: int, radius: float = 1.0) -> Tensor:
     """Kernel directions on unit sphere for routing."""
     if n == 1:
         return torch.zeros(1, 3, dtype=torch.float32)
-    origin = torch.zeros(1, 3, dtype=torch.float32)
+    origin  = torch.zeros(1, 3, dtype=torch.float32)
     indices = torch.arange(n - 1, dtype=torch.float32)
     phi = (indices + 0.5) * (torch.pi * (3 - torch.sqrt(torch.tensor(5.0))))
-    y = 1 - (indices / float(n - 2)) * 2
-    r = torch.sqrt(1 - y**2)
-    x = r * torch.cos(phi)
-    z = r * torch.sin(phi)
+    y   = 1 - (indices / float(n - 2)) * 2
+    r   = torch.sqrt(1 - y ** 2)
+    x   = r * torch.cos(phi)
+    z   = r * torch.sin(phi)
     return torch.cat([origin, torch.stack([x, y, z], dim=1) * radius], dim=0)
 
 
@@ -57,12 +129,9 @@ class AnisotropicConv(MessagePassing):
                  learnable_kernels: bool = False,
                  use_softmax: bool = False,
                  softmax_temperature: float = 1.0,
-                 refl_gate_bias_init: float = 0.0,
-                 refl_gate_cap: float = 1.0,
+                 flashlight_out_dim: int = 0,
+                 memory_efficient: bool = False,
                  **kwargs):
-        # Pop any legacy parameters that model.py might pass
-        kwargs.pop('use_dualnorm_lite', None)
-        kwargs.pop('dualnorm_lite', None)
         kwargs.setdefault('aggr', 'add')
         super().__init__(**kwargs)
 
@@ -81,13 +150,7 @@ class AnisotropicConv(MessagePassing):
 
         self.use_softmax = use_softmax
         self.softmax_temperature = float(max(1e-3, softmax_temperature))
-        self.refl_gate_bias_init = refl_gate_bias_init
-        self.refl_gate_cap = float(min(1.0, max(0.0, refl_gate_cap)))
-
-        # Trust-aware per-edge reflectance gain: modulate edge contributions before aggregation
-        self.use_refl_edge_gain = True
-        self.refl_edge_gain_logit = nn.Parameter(torch.tensor(-2.2, dtype=torch.float32))
-        self.refl_edge_gain_cap = 0.35
+        self.memory_efficient = bool(memory_efficient)
 
         if not use_softmax:
             from sparsemax import Sparsemax
@@ -95,50 +158,44 @@ class AnisotropicConv(MessagePassing):
         else:
             self.attention_fn = None
 
-        # Per-point reflectance reliability gate.
-        # Input: geom kernel mass (K) + geom eigvals (3) + refl eigvals (3) + D eigvals (3) + contrast strength (1)
-        # Output: 3 eigval gates + 1 trust scalar + 1 signed modulation scalar
-        # Gate sees all three spectra to learn relationships:
-        # - Eigval gates (3): independently scale each eigenvalue (directional control)
-        # - Trust scalar (1): point-level reliability for edge-level reflectance magnitude
-        # - Signed modulation (1): whether reflectance should amplify or attenuate edges
-        gate_hidden = max(8, num_kernel_points)
-        self.refl_reliability_gate = nn.Sequential(
-            nn.Linear(num_kernel_points + 10, gate_hidden),
-            nn.ReLU(),
-        )
-        self.refl_gate_head = nn.Linear(gate_hidden, 4)
-        self.refl_mod_head = nn.Linear(gate_hidden, 1)
+        # Dedicated flashlight MLP: processes the 11 structure-tensor channels separately
+        # from local_nn so that the flashlight signal is not diluted by F*K geometry channels.
+        # Input LayerNorm intentionally omitted: eigenvalue magnitudes carry the signal
+        # (flat neighbourhood → ~0, structured → larger); normalising the input erases it.
+        self.flashlight_out_dim = int(flashlight_out_dim)
+        if self.flashlight_out_dim > 0:
+            h1 = max(64, self.flashlight_out_dim * 4)
+            h2 = max(32, self.flashlight_out_dim * 2)
+            self.flashlight_mlp = nn.Sequential(
+                nn.Linear(11, h1),
+                nn.LeakyReLU(inplace=True),
+                nn.LayerNorm(h1),
+                nn.Linear(h1, h2),
+                nn.LeakyReLU(inplace=True),
+                nn.LayerNorm(h2),
+                nn.Linear(h2, self.flashlight_out_dim),
+                nn.LeakyReLU(inplace=True),
+                nn.LayerNorm(self.flashlight_out_dim),
+            )
+        else:
+            self.flashlight_mlp = None
 
         self.reset_parameters()
 
     def reset_parameters(self):
         reset(self.local_nn)
         reset(self.global_nn)
-        reset(self.refl_reliability_gate)
-        reset(self.refl_gate_head)
-        reset(self.refl_mod_head)
-        # Gate bias controls initial reflectance reliance.
-        # 0.0 = neutral, negative = cautious, positive = rely-more.
-        nn.init.constant_(self.refl_gate_head.bias, self.refl_gate_bias_init)
-        # Start the signed edge modulator at exactly neutral so retraining begins
-        # from geometry-only edge strength and learns suppression/amplification.
-        nn.init.zeros_(self.refl_mod_head.weight)
-        nn.init.zeros_(self.refl_mod_head.bias)
 
     def forward(self, x: Union[OptTensor, PairOptTensor],
                 pos: Union[Tensor, PairTensor], edge_index: Adj) -> Tensor:
-        """Anisotropic convolution: geometry-first routing with reflectance gating.
-
+        """
         Args:
-            x: Node features, shape [N, F] or (N_src, F_src), (N_tgt, F_tgt) for bipartite.
-            pos: Node positions. Expects pos[:, :3] = xyz coordinates, pos[:, 3] = reflectance.
-                 Shape [N, >=4] or tuple of (pos_src, pos_tgt).
+            x:   Node features [N, F] or pair for bipartite.
+            pos: Node positions [N, >=4]; pos[:, :3] = xyz, pos[:, 3] = reflectance.
             edge_index: Graph connectivity.
 
         Returns:
-            Output features [N, K*F + 3] where K*F are aggregated features across kernel
-            directions and 3 are gated eigenvalues of the reflectance difference tensor.
+            [N, K*F + 11] or [N, local_nn_out + flash_dim] when flashlight_out_dim > 0.
         """
         if not isinstance(x, tuple):
             x = (x, None)
@@ -157,13 +214,14 @@ class AnisotropicConv(MessagePassing):
 
     def message(self, x_j: OptTensor, pos_i: Tensor, pos_j: Tensor, index: Tensor,
                 num_nodes: Optional[int] = None):
-        rel_pos = pos_j[:, :3] - pos_i[:, :3]
+        rel_pos = (pos_j[:, :3] - pos_i[:, :3]).nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
         rel_dir = F.normalize(rel_pos, dim=1, eps=1e-6)
-        dists = torch.norm(rel_pos, dim=1, keepdim=True)
-        max_d, _ = scatter_max(dists, index, dim=0, dim_size=num_nodes if num_nodes is not None else None)
+        dists   = torch.norm(rel_pos, dim=1, keepdim=True)
+        max_d, _ = scatter_max(dists, index, dim=0,
+                               dim_size=num_nodes if num_nodes is not None else None)
 
-        # Geometry-only kernel routing
-        kernel_dirs = (self.kernel_dirs if self.kernel_dirs is not None else F.normalize(self.kernel_points, dim=1, eps=1e-6)).unsqueeze(0)
+        kernel_dirs = (self.kernel_dirs if self.kernel_dirs is not None
+                       else F.normalize(self.kernel_points, dim=1, eps=1e-6)).unsqueeze(0)
         attn = torch.sum(rel_dir.unsqueeze(1) * kernel_dirs, dim=-1)
         if self.use_softmax:
             weights = F.softmax((attn.float() / self.softmax_temperature), dim=1).to(attn.dtype)
@@ -171,222 +229,155 @@ class AnisotropicConv(MessagePassing):
             weights = self.attention_fn(attn.float()).to(attn.dtype)
         weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
 
-        self_mask = dists.squeeze(-1) < 1e-8
+        is_self_loop = dists.squeeze(-1) < 1e-8
         weights = weights.clone()
-        if self_mask.any():
-            weights[self_mask] = 0.0
-            weights[self_mask, 0] = 1.0
+        if is_self_loop.any():
+            weights[is_self_loop] = 0.0
+            weights[is_self_loop, 0] = 1.0
 
-        # Kernel-0 is reserved for self only.
-        # For non-self edges, force kernel-0 mass to zero and renormalize.
-        non_self = ~self_mask
+        non_self = ~is_self_loop
         if non_self.any():
             w_non = weights[non_self]
             w_non[:, 0] = 0.0
             w_non = w_non / w_non.sum(dim=1, keepdim=True).clamp(min=1e-8)
             weights[non_self] = w_non
 
-        # Normalize radial feature by max distance in neighborhood (density-invariant)
         norm_radius = max_d[index].clamp(min=1e-8)
-        # Clamp to 4.0 to handle sparse neighborhoods and prevent extreme values
-        dist_norm = (dists / norm_radius).clamp(0.0, 4.0)
+        dist_norm   = (dists / norm_radius).clamp(0.0, 4.0)
 
         feat_list = [rel_dir, dist_norm]
         if x_j is not None:
             feat_list.insert(0, x_j)
         feat = torch.cat(feat_list, dim=-1)
-        weighted_feat = feat.unsqueeze(-1) * weights.unsqueeze(1)
 
-        # Raw neighbor reflectance for within-direction consistency in aggregate
-        if pos_j.size(1) >= 4:
-            refl_j = pos_j[:, 3].to(feat.dtype)
-        else:
-            refl_j = torch.zeros(feat.size(0), device=feat.device, dtype=feat.dtype)
+        refl_j = (pos_j[:, 3].to(feat.dtype) if pos_j.size(1) >= 4
+                  else torch.zeros(feat.size(0), device=feat.device, dtype=feat.dtype))
+        refl_i = (pos_i[:, 3].to(feat.dtype) if pos_i.size(1) >= 4
+                  else torch.zeros(feat.size(0), device=feat.device, dtype=feat.dtype))
 
         if self.training:
-            # Normalized to [0,1] — max entropy = log(K). Do not compare to old eigenvalue-based support.
-            ent = (-(weights * (weights + 1e-8).log()).sum(dim=1)).mean()
+            ent     = (-(weights * (weights + 1e-8).log()).sum(dim=1)).mean()
             max_ent = math.log(max(weights.size(1), 2))
             self.kernel_entropy = (ent / max_ent).clamp(0.0, 1.0)
 
-        return (weighted_feat, weights, refl_j, rel_dir)
+        return (feat, weights, refl_j, rel_dir, refl_i, is_self_loop)
 
-    def _compute_neighborhood_median(self, refl_j: Tensor, index: Tensor,
-                                      kernel_mass_geom: Tensor, dim_size: int) -> Tensor:
-        """Compute per-neighborhood median reflectance (robust to specular spikes).
+    def aggregate(self, inputs, index: Tensor,
+                  ptr: Optional[Tensor] = None, dim_size: Optional[int] = None) -> Tensor:
+        feat, weights, refl_j, rel_dir, refl_i, is_self_loop = inputs
 
-        Uses two-level stable sort to avoid float32 precision loss from encoding.
-
-        Args:
-            refl_j: Reflectance values at edges [E]
-            index: Node indices for each edge [E]
-            kernel_mass_geom: Aggregate kernel weights per node [N, K]
-            dim_size: Number of nodes
-
-        Returns:
-            Median reflectance per node [N]
-        """
-        # Sort edges by reflectance first, then by node index to group by node
-        idx_by_refl = torch.argsort(refl_j, stable=True)
-        idx_by_index = torch.argsort(index[idx_by_refl], stable=True)
-        sorted_idx = idx_by_refl[idx_by_index]
-        sorted_refl = refl_j[sorted_idx]
-
-        # Compute edge counts per node and find median position
-        counts_int = kernel_mass_geom.sum(dim=1).round().long().clamp(min=1)
-        cum_counts = torch.zeros(dim_size + 1, dtype=torch.long, device=refl_j.device)
-        cum_counts[1:] = counts_int.cumsum(0)
-        median_pos = cum_counts[:-1] + counts_int // 2
-        median_pos = median_pos.clamp(0, sorted_refl.size(0) - 1)
-
-        return sorted_refl[median_pos]
-
-    def aggregate(self, inputs, index: Tensor, ptr: Optional[Tensor] = None, dim_size: Optional[int] = None) -> Tensor:
-        weighted_feat, weights, refl_j, rel_dir = inputs
-
-        # Compute geometric kernel mass for the gate before scatter_add
-        kernel_mass_geom = scatter_add(weights, index, dim=0, dim_size=dim_size)  # [N, K]
-        neighbor_count = kernel_mass_geom.sum(dim=1, keepdim=True).clamp(min=1e-8)
-
-        # --- Tensor flashlight: reflectance illuminating geometry ---
-        # Local contrast: absolute deviation from per-neighbourhood median.
-        # Median is robust to specular spikes; a uniformly bright neighbourhood
-        # yields r_local ≈ 0 for all points so M_refl ≈ 0 and the gate suppresses.
-        # Both bright AND dark deviations count (abs) so a dark twig in a bright
-        # leaf canopy is just as detectable as a bright twig in a dark one.
-
+        kernel_mass    = scatter_add(weights, index, dim=0, dim_size=dim_size)  # [N, K]
+        neighbor_count = kernel_mass.sum(dim=1, keepdim=True).clamp(min=1e-8)  # [N, 1]
         n_pts = dim_size
-        refl_median = self._compute_neighborhood_median(refl_j, index, kernel_mass_geom, n_pts)
 
-        r_local = (refl_j - refl_median[index]).abs()  # [E] absolute contrast from median
+        # Center-relative contrast; NaN-guarded for bad sensor returns.
+        c = (refl_j - refl_i).abs().nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)  # [E]
 
-        # Structure tensors: outer products of unit direction vectors
-        # M_geom = (1/k) Σ d̂⊗d̂           — geometric neighbourhood shape
-        # M_refl = (1/k) Σ r_local·d̂⊗d̂   — brightness-weighted shape
-        # D = M_refl - M_geom: where does brightness deviate from pure geometry?
-        # Cache outer_flat to avoid recomputing (used for both M_geom and M_refl scatter_add)
+        # Cache outer products once for all three structure tensors.
+        # Self-loop has rel_dir = 0 (after normalize with eps), so outer_flat_self = 0.
+        # Self-loops therefore never contribute to any M_* numerator regardless of weight.
         outer_flat = (rel_dir.unsqueeze(-1) * rel_dir.unsqueeze(-2)).view(-1, 9)  # [E, 9]
-        nc = neighbor_count.unsqueeze(-1)  # [N, 1, 1] after second unsqueeze below
+        nc = neighbor_count.unsqueeze(-1)  # [N, 1, 1] for broadcasting over [N, 3, 3]
 
-        M_geom = scatter_add(outer_flat, index, dim=0, dim_size=dim_size).view(n_pts, 3, 3) / nc  # nc [N,1,1] broadcasts to [N,3,3]
-        M_refl = scatter_add(r_local.unsqueeze(1) * outer_flat, index, dim=0, dim_size=dim_size).view(n_pts, 3, 3) / nc
-        del outer_flat  # [E, 9] — no longer needed, free before eigvalsh workspace
+        # M_geom: uniform — pure geometric neighbourhood shape.
+        # Note: trace(M_geom) = (non-self edges) / (total count incl. self) = k/(k+1).
+        # This constant bias is absorbed by the flashlight_mlp.
+        M_geom = (scatter_add(outer_flat, index, dim=0, dim_size=dim_size)
+                  .view(n_pts, 3, 3) / nc)
 
-        # Eigenvalues of geometry structure tensor (tells gate if geometry is coherent or scattered)
-        M_geom_sym = (M_geom + M_geom.transpose(-1, -2)) * 0.5
-        eigvals_geom = torch.linalg.eigvalsh(M_geom_sym)  # [N, 3] ascending
-        eigvals_geom = torch.nan_to_num(eigvals_geom, nan=0.0, posinf=0.0, neginf=0.0)
+        # M_refl: contrast-weighted — captures directions toward DISSIMILAR neighbours.
+        # Self contributes c_self = 0 to contrast_sum; it cancels in mean_c.
+        contrast_sum = scatter_add(c, index, dim=0, dim_size=dim_size)  # [N]
+        M_refl = (scatter_add(c.unsqueeze(1) * outer_flat, index, dim=0, dim_size=dim_size)
+                  .view(n_pts, 3, 3) / contrast_sum.clamp(min=1e-6).view(n_pts, 1, 1))
 
-        # D = M_refl - M_geom: where does brightness deviate from pure geometry?
-        D_sym = M_refl - M_geom
-        del M_geom  # free before next eigvalsh
-        D_sym = (D_sym + D_sym.transpose(-1, -2)) * 0.5
-        eigvals = torch.linalg.eigvalsh(D_sym)  # [N, 3] ascending: e0 ≤ e1 ≤ e2
-        eigvals = torch.nan_to_num(eigvals, nan=0.0, posinf=0.0, neginf=0.0)
-        del D_sym
+        # M_cobright: complement-weighted — captures directions toward SIMILAR neighbours.
+        # c_max is the local contrast range, the natural scale for the decomposition.
+        # Weight = c_max - c_j: maximum for co-bright pairs (c_j ≈ 0), zero for the most
+        # contrasting neighbour. No calibration constants; scale is set by the neighbourhood.
+        #
+        # Self-loop exclusion: the self-loop has c_self = 0, so complement_self = c_max.
+        # Since outer_flat_self = 0, it would not enter the M_cobright numerator, but it
+        # WOULD inflate compl_sum by c_max, biasing eigenvalues down by ~1/(n_cobright+1).
+        # We explicitly zero the self-loop complement before the scatter to avoid this.
+        c_max      = scatter_max(c, index, dim=0, dim_size=dim_size)[0]  # [N]
+        complement = (c_max[index] - c).clamp(min=0.0)                   # [E]
+        complement = complement.masked_fill(is_self_loop, 0.0)           # exclude self-loop
+        compl_sum  = scatter_add(complement, index, dim=0, dim_size=dim_size)  # [N]
+        M_cobright = (scatter_add(complement.unsqueeze(1) * outer_flat, index, dim=0, dim_size=dim_size)
+                      .view(n_pts, 3, 3) / compl_sum.clamp(min=1e-6).view(n_pts, 1, 1))
 
-        # Eigenvalues of reflectance structure tensor (tells gate if reflectance shows structure)
-        M_refl_sym = (M_refl + M_refl.transpose(-1, -2)) * 0.5
-        del M_refl  # free before eigvalsh workspace
-        eigvals_refl = torch.linalg.eigvalsh(M_refl_sym)  # [N, 3] ascending
-        eigvals_refl = torch.nan_to_num(eigvals_refl, nan=0.0, posinf=0.0, neginf=0.0)
-        del M_refl_sym
+        del outer_flat
 
-        # Contrast strength: mean absolute deviation from median — tells gate how
-        # much local reflectance variation exists in this neighbourhood.
-        contrast_strength = scatter_add(r_local, index, dim=0, dim_size=dim_size).unsqueeze(1) / neighbor_count  # [N, 1]
+        def _sym_eigvals(M):
+            S = (M + M.transpose(-1, -2)) * 0.5
+            return _eigvalsh_3x3_analytical(S)
 
-        # Reflectance reliability gate: learns when to trust reflectance vs geometry.
-        # Input: kernel routing (K), geometry spectrum (3), reflectance spectrum (3),
-        #        difference spectrum (3), and local contrast strength (1).
-        kernel_mass_geom_norm = kernel_mass_geom / kernel_mass_geom.sum(dim=1, keepdim=True).clamp(min=1e-8)
-        gate_input = torch.cat([kernel_mass_geom_norm, eigvals_geom, eigvals_refl, eigvals, contrast_strength], dim=1)  # [N, K+10]
-        gate_features = self.refl_reliability_gate(gate_input)
-        gate_output = self.refl_gate_head(gate_features)  # [N, 4]
-        refl_gate = torch.sigmoid(gate_output[:, :3])  # [N, 3] per-eigenvalue gates
-        trust = torch.sigmoid(gate_output[:, 3])  # [N] scalar trust (point-level reliability)
-        signed_mod = torch.tanh(self.refl_mod_head(gate_features).squeeze(1))  # [N] signed edge modulation
+        eigvals_geom     = _sym_eigvals(M_geom);     del M_geom
+        eigvals_refl     = _sym_eigvals(M_refl);     del M_refl
+        eigvals_cobright = _sym_eigvals(M_cobright); del M_cobright
 
-        refl_gate = torch.nan_to_num(refl_gate, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-        trust = torch.nan_to_num(trust, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-        signed_mod = torch.nan_to_num(signed_mod, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
-        if self.refl_gate_cap < 1.0:
-            refl_gate = refl_gate * self.refl_gate_cap
-        eigvals_gated = eigvals * refl_gate  # [N, 3]
+        # Non-self neighbour count for unbiased mean_c (excluding self-loop's c=0).
+        # neighbor_count is [N, 1]; squeeze to [N] before dividing into contrast_sum [N].
+        non_self_count = (neighbor_count.squeeze(1) - 1.0).clamp(min=1.0)  # [N]
+        mean_c    = (contrast_sum / non_self_count).unsqueeze(1).clamp(max=2.0)  # [N, 1]
+        c_max_out = c_max.unsqueeze(1).clamp(max=2.0)                            # [N, 1]
 
-        # Trust-aware signed per-edge reflectance gain: modulate edge contributions
-        # around 1.0 so reflectance can either sharpen or suppress ambiguous edges.
-        # Geometry still determines routing (kernel bins); reflectance only changes edge strength.
-        # This allows reflectance to sharpen faint structures (twigs in noise) or
-        # damp misleading bright leaf returns without inventing structure from brightness.
-        refl_gain_mean = refl_gain_min = refl_gain_max = None
-        if self.use_refl_edge_gain:
-            edge_trust = trust[index]  # [E] broadcast per-point trust to edges
-            edge_signed_mod = signed_mod[index]  # [E] signed boost/suppress control
+        # 11-channel flashlight: three eigenvalue spectra + mean contrast + local dynamic range.
+        # mean_c and c_max together let the MLP distinguish a specular outlier
+        # (c_max >> mean_c) from a genuine wood/leaf interface (both similar and large).
+        flashlight_raw = torch.cat(
+            [eigvals_geom, eigvals_refl, eigvals_cobright, mean_c, c_max_out], dim=-1
+        )
+        flashlight_raw = torch.nan_to_num(flashlight_raw, nan=0.0, posinf=0.0, neginf=0.0)
 
-            contrast_mean_edge = contrast_strength[index].squeeze(1)  # [E]
-            # Normalize edge reflectance contrast by neighborhood scale
-            refl_score = r_local / (contrast_mean_edge + 1e-6)
-            # Clamp to 3.0 to prevent extreme amplification in high-contrast regions
-            refl_score = torch.clamp(refl_score, 0.0, 3.0)
+        # Geometry aggregation
+        if self.memory_efficient:
+            agg_chunks = []
+            for k_idx in range(weights.size(1)):
+                agg_k = scatter_add(
+                    feat * weights[:, k_idx:k_idx + 1].to(feat.dtype),
+                    index, dim=0, dim_size=dim_size)
+                agg_chunks.append(agg_k)
+            del feat, weights
+            agg_feat = torch.stack(agg_chunks, dim=1) / neighbor_count.unsqueeze(1)
+            del agg_chunks
+            agg_feat = agg_feat.contiguous().view(dim_size, -1)
+        else:
+            weighted_feat = feat.unsqueeze(-1) * weights.unsqueeze(1).to(feat.dtype)
+            agg_feat = scatter_add(weighted_feat, index, dim=0, dim_size=dim_size)
+            del weighted_feat, feat, weights
+            agg_feat = (agg_feat / neighbor_count.unsqueeze(1)
+                        ).transpose(1, 2).contiguous().view(dim_size, -1)
 
-            # Beta init=-2.2 gives sigmoid≈0.09. Combined with the cap, gain stays
-            # in a safe positive band around 1.0 instead of flipping feature signs.
-            beta = torch.sigmoid(self.refl_edge_gain_logit).to(weighted_feat.dtype) * self.refl_edge_gain_cap
-            refl_gain = 1.0 + beta * edge_trust * edge_signed_mod * torch.tanh(refl_score)  # [E]
-            refl_gain = refl_gain.clamp(1.0 - self.refl_edge_gain_cap, 1.0 + self.refl_edge_gain_cap)
+        if self.flashlight_mlp is not None:
+            agg_feat = torch.nan_to_num(agg_feat, nan=0.0, posinf=0.0, neginf=0.0)
+            if self.local_nn is not None:
+                agg_feat = self.local_nn(agg_feat)
+            combined = torch.cat([agg_feat, self.flashlight_mlp(flashlight_raw)], dim=-1)
+        else:
+            combined = torch.cat([agg_feat, flashlight_raw], dim=-1)
+            combined = torch.nan_to_num(combined, nan=0.0, posinf=0.0, neginf=0.0)
+            if self.local_nn is not None:
+                combined = self.local_nn(combined)
 
-            weighted_feat = weighted_feat * refl_gain.view(-1, 1, 1)
-            refl_gain_mean = float(refl_gain.mean().item())
-            refl_gain_min = float(refl_gain.min().item())
-            refl_gain_max = float(refl_gain.max().item())
-            del refl_gain, edge_trust, edge_signed_mod, refl_score, contrast_mean_edge
-
-        # Now aggregate features with optional reflectance modulation
-        agg_feat = scatter_add(weighted_feat, index, dim=0, dim_size=dim_size)  # [N, F, K]
-        del weighted_feat  # [E, F, K] — largest edge tensor, free immediately
-        agg_feat = agg_feat / neighbor_count.unsqueeze(1)
-
-        agg_feat = agg_feat.transpose(1, 2).contiguous().view(dim_size, -1)
-        combined = torch.cat([agg_feat, eigvals_gated], dim=-1)
         combined = torch.nan_to_num(combined, nan=0.0, posinf=0.0, neginf=0.0)
 
         if self.training:
             with torch.no_grad():
-                has_nan = torch.isnan(eigvals).any()
+                cobright_lift = F.relu(eigvals_cobright[:, 2] - eigvals_geom[:, 2])
+                refl_lift     = F.relu(eigvals_refl[:, 2]     - eigvals_geom[:, 2])
                 self.diagnostics = {
-                    'D_mean': eigvals.mean().item(),
-                    'D_max_eig_mean': eigvals[:, 2].mean().item(),
-                    'D_max_eig_std': eigvals[:, 2].std().item(),
-                    'contrast_strength_mean': contrast_strength.mean().item(),
-                    'refl_gate_mean': refl_gate.mean().item(),
-                    'refl_gate_min': refl_gate.min().item(),
-                    'refl_gate_max': refl_gate.max().item(),
-                    'eigvals_gated_mean': eigvals_gated.mean().item(),
-                    'trust_mean': trust.mean().item(),
-                    'signed_mod_mean': signed_mod.mean().item(),
-                    'signed_mod_min': signed_mod.min().item(),
-                    'signed_mod_max': signed_mod.max().item(),
-                    'has_nan': has_nan,
+                    'contrast_gate_mean':     mean_c.mean().detach(),
+                    'cobright_lift_mean':     cobright_lift.mean().detach(),
+                    'cobright_lift_max_mean': eigvals_cobright[:, 2].mean().detach(),
+                    'refl_lift_mean':         refl_lift.mean().detach(),
+                    'c_max_mean':             c_max.mean().detach(),
+                    'has_nan':                torch.isnan(flashlight_raw).any().detach(),
                 }
-                if refl_gain_mean is not None:
-                    self.diagnostics['refl_gain_mean'] = refl_gain_mean
-                    self.diagnostics['refl_gain_min'] = refl_gain_min
-                    self.diagnostics['refl_gain_max'] = refl_gain_max
-                if has_nan:
-                    self.diagnostics['warning'] = 'NaN detected in eigvals'
+            # Distillation proxy: local reflectance activity per point.
+            self.last_refl_gate_per_point = mean_c.squeeze(1).clamp(0.0, 1.0).detach()
 
-        # Trainer logging — scalars only (no per-point GPU tensors to avoid memory retention)
-        with torch.no_grad():
-            self.last_D_max_eig = float(eigvals[:, 2].mean().item())
-            self.last_refl_gate = float(refl_gate.mean().item())
-            self.last_trust = float(trust.mean().item())
-            self.last_signed_mod = float(signed_mod.mean().item())
-            if refl_gain_mean is not None:
-                self.last_refl_gain = refl_gain_mean
-
-        if self.local_nn is not None:
-            combined = self.local_nn(combined)
         return combined
 
     def update(self, aggr_out: Tensor) -> Tensor:

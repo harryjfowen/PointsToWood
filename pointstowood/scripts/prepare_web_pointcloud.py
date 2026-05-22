@@ -126,7 +126,7 @@ def hash01(index: int, seed: int) -> float:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", default="uk01_lw_pl_3_p2w.ply")
+    parser.add_argument("--input", default="uk01_lw_pl_3-p2w.ply")
     parser.add_argument("--output-dir", default="docs/data")
     parser.add_argument("--target-points", type=int, default=260000)
     parser.add_argument("--wood-threshold", type=float, default=0.5)

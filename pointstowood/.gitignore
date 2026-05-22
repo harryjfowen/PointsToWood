@@ -208,9 +208,12 @@ cython_debug/
 *.7z
 *.bz2
 
-# Model files (large files)
+# Model files — only the four deployed models are tracked (via LFS)
 *.pth
-!model/*.pth
+!model/h4mcc-eu.pth
+!model/h4mcc-finland.pth
+!model/h4mcc-poland.pth
+!model/h4mcc-spain.pth
 *.pkl
 *.pickle
 *.h5
@@ -277,3 +280,25 @@ saves/
 
 # Archive folder
 archive/
+wandb/
+
+# Point cloud files
+*.ply
+*.las
+*.laz
+*.e57
+
+# Training/eval data
+data/
+
+# Voxel scratch
+voxels/
+checkpoints_backup*/
+
+# Dev-only scripts
+eval_comparison.py
+.codex
+
+# Output artefacts
+reports/
+visualisations/

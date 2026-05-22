@@ -58,9 +58,27 @@ def sor_filter(pos, reflectance=None, y=None, edge_scores=None, k=16, std_thresh
     return pos_filtered, reflectance_filtered, y_filtered, edge_scores_filtered
 
 
-def _load_voxel_file(path, weights_only=True):
-    """Load a voxel .pt file; support both dict {'point_cloud', 'grid_size'} and legacy tensor. Returns (point_cloud_tensor, grid_size or None)."""
-    data = torch.load(path, map_location='cpu', weights_only=weights_only)
+SHARD_FILENAME = 'shard.pt'
+
+
+def _load_shard(voxel_dir: str):
+    """Load a shard file if it exists. Returns list of voxel dicts or None."""
+    path = os.path.join(voxel_dir, SHARD_FILENAME)
+    if os.path.isfile(path):
+        return torch.load(path, map_location='cpu', weights_only=False)
+    return None
+
+
+def _load_voxel_source(source, weights_only=True):
+    """Load a voxel payload from disk or memory.
+
+    Supports both dict {'point_cloud', 'grid_size'} and legacy tensor payloads.
+    Returns (point_cloud_tensor, grid_size or None).
+    """
+    if isinstance(source, (str, os.PathLike)):
+        data = torch.load(source, map_location='cpu', weights_only=weights_only)
+    else:
+        data = source
     if isinstance(data, dict) and 'point_cloud' in data:
         return data['point_cloud'], data.get('grid_size')
     return data, None
@@ -85,11 +103,10 @@ def _point_count_from_pc(pc):
 
 
 class TrainingDataset(Dataset, ABC):
-    def __init__(self, voxels, augmentation, mode, max_pts, device, denoise=False, denoise_k=16, denoise_std=1.0, pointcutmix=True, pointcutmix_prob=0.25, pointcutmix_refl_dropout=0.0, density_aug=False, density_aug_prob=0.5, density_aug_spacing_min=0.01, density_aug_spacing_max=0.04):
+    def __init__(self, voxels, augmentation, mode, max_pts, device, denoise=False, denoise_k=16, denoise_std=1.0, pointcutmix=True, pointcutmix_prob=0.25, pointcutmix_refl_dropout=0.0, density_aug=False, density_aug_prob=0.5, density_aug_spacing_min=0.01, density_aug_spacing_max=0.04, exclude_prefixes=None):
         if not voxels:
             raise ValueError("The 'voxels' parameter cannot be empty.")
         self.voxels = voxels
-        self.keys = sorted(glob.glob(os.path.join(voxels, '*.pt')))
         self.device = device
         self.max_pts = max_pts
         self.reflectance_index = 3
@@ -112,12 +129,32 @@ class TrainingDataset(Dataset, ABC):
 
         if self.denoise:
             print(f"Denoising enabled with k={denoise_k}, std_threshold={denoise_std}")
+
+        # Load voxels: prefer single shard file, fall back to individual .pt files
+        shard = _load_shard(voxels)
+        if shard is not None:
+            self._shard = shard  # list of dicts in memory
+            self.keys = [entry.get('name', f'voxel_{i}') for i, entry in enumerate(shard)]
+        else:
+            self._shard = None
+            self.keys = sorted(glob.glob(os.path.join(voxels, '*.pt')))
+
+        if exclude_prefixes:
+            _excl = set(exclude_prefixes)
+            self.keys = [k for k in self.keys
+                         if os.path.basename(str(k)).split('_voxel_')[0] not in _excl]
+
         self._eligible_leaf = []
         self._eligible_wood = []
         self.grid_sizes = []  # per real index; used for resolution-aware batching (None = legacy file)
-        for idx, key in enumerate(self.keys):
-            point_cloud, grid_size = _load_voxel_file(key)
+        self.edge_fractions = []  # per real index; per-voxel 25cm mixed-label fraction (difficulty)
+        for idx in range(len(self.keys)):
+            point_cloud, grid_size = self._load_by_index(idx)
             self.grid_sizes.append(grid_size)
+            if self._shard is not None:
+                self.edge_fractions.append(float(self._shard[idx].get('edge_fraction', 0.0)))
+            else:
+                self.edge_fractions.append(0.0)
             y = point_cloud[:, self.label_index]
             sample_label = 1 if (y > 0.50).sum() > len(y) / 2 else 0
             self.labels.append(sample_label)
@@ -129,6 +166,10 @@ class TrainingDataset(Dataset, ABC):
                     self._eligible_leaf.append(idx)
                 elif sample_label == 1 and n <= half:
                     self._eligible_wood.append(idx)
+
+        # Per-voxel difficulty scores: set externally by trainer each epoch from the
+        # VoxelDifficultyTracker EMA. Shape [n_real], values in [0, 1]; None = disabled.
+        self.difficulty_scores = None
 
         # Group indices for GroupDRO — parsed from filename prefix
         self.groups = [_parse_group(k) for k in self.keys]
@@ -143,18 +184,22 @@ class TrainingDataset(Dataset, ABC):
             }
             # Extra dataset slots for mixed samples (appended, not replacing). More batches/samples per epoch.
             self._num_mix_slots = int(round(pointcutmix_prob * len(self.keys)))
-            pct = int(round(pointcutmix_prob * 100))
-            refl_str = f", refl_dropout={pointcutmix_refl_dropout}" if pointcutmix_refl_dropout > 0 else ""
-            print(f"PointCutMix: ~{pct}% mixes (append){refl_str}; {len(self._eligible_leaf)} leaf / {len(self._eligible_wood)} wood eligible; +{self._num_mix_slots} mix slots/epoch")
         else:
             self._num_mix_slots = 0
+
+    def _load_by_index(self, index):
+        """Load a voxel by index from shard (memory) or individual file (disk)."""
+        if self._shard is not None:
+            entry = self._shard[index]
+            return entry['point_cloud'], entry.get('grid_size')
+        return _load_voxel_source(self.keys[index])
 
     def __len__(self):
         return len(self.keys) + getattr(self, '_num_mix_slots', 0)
 
     def _load_one_no_aug(self, index):
         """Load one voxel: denoise, subsample only. No augmentation. Returns (pos, reflectance, y)."""
-        point_cloud, _ = _load_voxel_file(self.keys[index])
+        point_cloud, _ = self._load_by_index(index)
         pos = torch.as_tensor(point_cloud[:, :3], dtype=torch.float).requires_grad_(False)
         reflectance = torch.as_tensor(point_cloud[:, self.reflectance_index], dtype=torch.float)
         y = torch.as_tensor(point_cloud[:, self.label_index], dtype=torch.float)
@@ -192,35 +237,39 @@ class TrainingDataset(Dataset, ABC):
             edge_scores = recompute_edge_scores(pos, y, batch=None, voxel_size=self.voxel_size)
             out_mix = Data(pos=pos, reflectance=reflectance, y=y, sf=scaling_factor, edge_scores=edge_scores)
             out_mix.group_idx = torch.tensor([0], dtype=torch.long)  # placeholder: mix samples not group-attributed
+            out_mix.voxel_idx = torch.tensor([-1], dtype=torch.long)  # sentinel: mix samples not tracked
+            out_mix.difficulty = torch.tensor([1.0], dtype=torch.float)  # preserve synthetic hard structure
             return out_mix
 
         # Standard path: load one voxel (real sample only; mixes come from extra indices above)
-        point_cloud, grid_size = _load_voxel_file(self.keys[index])
+        point_cloud, grid_size = self._load_by_index(index)
         pos = torch.as_tensor(point_cloud[:, :3], dtype=torch.float).requires_grad_(False)
         reflectance = torch.as_tensor(point_cloud[:, self.reflectance_index], dtype=torch.float)
         y = torch.as_tensor(point_cloud[:, self.label_index], dtype=torch.float)
         
-        if self.mode == 'train' and point_cloud.shape[-1] > 5:
-            edge_scores_precomputed = torch.as_tensor(point_cloud[:, 5], dtype=torch.float)
-        else:
-            edge_scores_precomputed = None
-        
         if self.denoise:
-            pos, reflectance, y, edge_scores_precomputed = sor_filter(pos, reflectance, y, edge_scores_precomputed, self.denoise_k, self.denoise_std)
-        
-            if edge_scores_precomputed is not None and edge_scores_precomputed.size(0) != pos.size(0):
-                edge_scores_precomputed = None
+            pos, reflectance, y, _ = sor_filter(pos, reflectance, y, None, self.denoise_k, self.denoise_std)
         
         if self.max_pts > 0 and len(pos) > self.max_pts:
             indices = torch.randperm(len(pos))[:self.max_pts]
             pos = pos[indices]
             reflectance = reflectance[indices]
             y = y[indices]
-            if edge_scores_precomputed is not None:
-                edge_scores_precomputed = edge_scores_precomputed[indices]
+
+        edge_scores_for_aug = recompute_edge_scores(pos, y, batch=None, voxel_size=self.voxel_size)
         
+        # Difficulty for augmentation suppression. EMA scores arrive after warmup;
+        # before that use edge_fraction as a proxy — high boundary fraction voxels
+        # are inherently hard and should preserve reflectance signal from epoch 1.
+        if self.difficulty_scores is not None and index < len(self.difficulty_scores):
+            difficulty = float(self.difficulty_scores[index])
+        elif index < len(self.edge_fractions):
+            difficulty = float(self.edge_fractions[index])
+        else:
+            difficulty = 0.0
+
         if self.augmentation:
-            pos, reflectance, y = augmentations(pos, reflectance, y, self.mode)
+            pos, reflectance, y = augmentations(pos, reflectance, y, self.mode, edge_scores=edge_scores_for_aug, difficulty=difficulty)
 
         local_shift = torch.mean(pos[:, :3], axis=0).requires_grad_(False)
         pos = pos - local_shift
@@ -229,14 +278,9 @@ class TrainingDataset(Dataset, ABC):
         if torch.any(torch.isnan(reflectance)):
             print('nans in reflectance')
 
-        if edge_scores_precomputed is not None:
-            edge_scores = edge_scores_precomputed
-        else:
-            cluster = voxel_grid(pos, size=self.voxel_size, batch=None)
-            pos_sum = torch_scatter.scatter_add((y == 1).float(), cluster, dim=0)
-            count = torch_scatter.scatter_add(torch.ones_like(y), cluster, dim=0)
-            pos_prop = pos_sum / (count + 1e-6)
-            edge_scores = ((pos_prop[cluster] > 0) & (pos_prop[cluster] < 1)).float()
+        # Final boundary weights are always recomputed from the current sample
+        # after augmentation / subsampling, never read from stored voxel fields.
+        edge_scores = recompute_edge_scores(pos, y, batch=None, voxel_size=self.voxel_size)
 
         out = Data(
             pos=pos,
@@ -248,6 +292,8 @@ class TrainingDataset(Dataset, ABC):
         if grid_size is not None:
             out.grid_size = grid_size
         out.group_idx = torch.tensor([self.group_indices[index]], dtype=torch.long)
+        out.voxel_idx = torch.tensor([index], dtype=torch.long)
+        out.difficulty = torch.tensor([difficulty], dtype=torch.float)
         return out
 
 class TestingDataset(Dataset, ABC):
@@ -255,26 +301,47 @@ class TestingDataset(Dataset, ABC):
         if not voxels:
             raise ValueError("The 'voxels' parameter cannot be empty.")
         self.voxels = voxels
-        # Use file_pattern if provided, otherwise load all .pt files
-        if file_pattern:
-            self.keys = sorted(glob.glob(os.path.join(voxels, file_pattern)))
+        self.in_memory = bool(in_memory)
+        if self.in_memory:
+            self._shard = list(voxels)
+            self.keys = [entry.get('name', f'voxel_{i}') if isinstance(entry, dict) else f'voxel_{i}'
+                         for i, entry in enumerate(self._shard)]
         else:
-            self.keys = sorted(glob.glob(os.path.join(voxels, '*.pt')))
+            # Prefer shard file, fall back to individual .pt files
+            shard = _load_shard(voxels)
+            if shard is not None:
+                self._shard = shard
+                self.keys = [entry.get('name', f'voxel_{i}') for i, entry in enumerate(shard)]
+            else:
+                self._shard = None
+                if file_pattern:
+                    self.keys = sorted(glob.glob(os.path.join(voxels, file_pattern)))
+                else:
+                    self.keys = sorted(glob.glob(os.path.join(voxels, '*.pt')))
         self.device = device
         self.max_pts = max_pts
         self.reflectance_index = 3
-        
+
         self.denoise = denoise
         self.denoise_k = denoise_k
         self.denoise_std = denoise_std
         if self.denoise:
             print(f"Denoising enabled with k={denoise_k}, std_threshold={denoise_std}")
 
+    def _load_by_index(self, index):
+        """Load a voxel by index from shard (memory) or individual file (disk)."""
+        if self._shard is not None:
+            entry = self._shard[index]
+            if isinstance(entry, dict) and 'point_cloud' in entry:
+                return entry['point_cloud'], entry.get('grid_size')
+            return entry, None
+        return _load_voxel_source(self.keys[index])
+
     def __len__(self):
-        return len(self.keys)  
+        return len(self.keys)
 
     def __getitem__(self, index):
-        point_cloud, grid_size = _load_voxel_file(self.keys[index])
+        point_cloud, grid_size = self._load_by_index(index)
         pos = torch.as_tensor(point_cloud[:, :3], dtype=torch.float).requires_grad_(False)
         reflectance = torch.as_tensor(point_cloud[:, self.reflectance_index], dtype=torch.float)
 
@@ -357,7 +424,7 @@ class BalancedPointBudgetSampler(Sampler):
                   "balanced" = class-balanced best-fit (round-robin wood/leaf/mix),
                   "balanced_bfd" = class-aware BFD + utilization smoothing.
     """
-    def __init__(self, dataset, labels, target_points_per_batch=50000, min_points_per_batch=16000, mode="downsampling", packing_mode="bfd", verbose=True):
+    def __init__(self, dataset, labels, target_points_per_batch=50000, min_points_per_batch=16000, mode="downsampling", packing_mode="bfd", verbose=True, sample_weights=None, edge_fracs=None):
         self.dataset = dataset
         self.labels = np.array(labels)
         self.target_points = target_points_per_batch
@@ -365,6 +432,9 @@ class BalancedPointBudgetSampler(Sampler):
         self.mode = mode
         self.packing_mode = packing_mode
         self.verbose = verbose
+        self.sample_weights = None if sample_weights is None else np.asarray(sample_weights, dtype=np.float64)
+        self.weighted_replacement = True
+        self.edge_fracs = edge_fracs
 
         # Point counts for all indices (real + mix slots when PointCutMix append is on)
         # max_pts <= 0 or >= 100M means "no subsampling" (use full voxels); otherwise cap for packing
@@ -377,13 +447,11 @@ class BalancedPointBudgetSampler(Sampler):
         self._raw_point_counts = []  # for diagnostic
         for idx in range(n_real):
             try:
-                pc, _ = _load_voxel_file(dataset.keys[idx], weights_only=True)
+                pc, _ = dataset._load_by_index(idx)
                 raw_count = _point_count_from_pc(pc)
                 self._raw_point_counts.append(raw_count)
                 count = min(raw_count, effective_max)
                 self.point_counts.append(count)
-                if self.verbose and idx == 0 and pc is not None and hasattr(pc, 'shape'):
-                    print(f"First voxel shape: {pc.shape} -> {raw_count} points (effective cap {effective_max:,})")
             except Exception:
                 self._raw_point_counts.append(0)
                 self.point_counts.append(effective_max // 2)  # Fallback
@@ -405,16 +473,46 @@ class BalancedPointBudgetSampler(Sampler):
 
         self.n_real = n_real
         self.n_total = n_total
-        if packing_mode == "bfd":
-            self.batches = self._create_bfd_batches()
-        elif packing_mode == "ffd":
-            self.batches = self._create_ffd_batches()
-        elif packing_mode == "balanced":
-            self.batches = self._create_balanced_batches()
-        elif packing_mode == "balanced_bfd":
-            self.batches = self._create_balanced_bfd_batches()
+        self.batches = self._build_batches()
+
+    def _build_batches(self):
+        if self.packing_mode == "bfd":
+            return self._create_bfd_batches()
+        elif self.packing_mode == "ffd":
+            return self._create_ffd_batches()
+        elif self.packing_mode == "balanced":
+            return self._create_balanced_batches()
+        elif self.packing_mode == "balanced_bfd":
+            return self._create_balanced_bfd_batches()
         else:
-            raise ValueError(f"Unknown packing_mode: {packing_mode}")
+            raise ValueError(f"Unknown packing_mode: {self.packing_mode}")
+
+    def set_weights(self, weights, allow_replacement=True):
+        """Update per-sample draw weights and rebuild batches for the next epoch."""
+        self.sample_weights = None if weights is None else np.asarray(weights, dtype=np.float64)
+        self.weighted_replacement = bool(allow_replacement)
+        self.batches = self._build_batches()
+
+    def _weighted_choice(self, idxs, n, replace=None):
+        """Choice helper that preserves class balancing while biasing within class/group."""
+        idxs = list(idxs)
+        if not idxs or n <= 0:
+            return []
+        if self.sample_weights is None:
+            if replace is None:
+                replace = len(idxs) < n
+            return np.random.choice(idxs, n, replace=replace).tolist()
+
+        weights = np.asarray([
+            self.sample_weights[i] if i < len(self.sample_weights) else 1.0
+            for i in idxs
+        ], dtype=np.float64)
+        weights = np.clip(weights, 1e-8, None)
+        if replace is None:
+            non_uniform = (float(weights.max()) / max(float(weights.min()), 1e-8)) > 1.05
+            replace = len(idxs) < n or (non_uniform and self.weighted_replacement)
+        probs = weights / weights.sum()
+        return np.random.choice(idxs, n, replace=replace, p=probs).tolist()
 
     def _create_bfd_batches(self):
         """Best-Fit Decreasing: sort by size descending, place in bin with smallest remainder that fits."""
@@ -457,8 +555,6 @@ class BalancedPointBudgetSampler(Sampler):
 
             self._merge_small_batches(res_batches, batch_pts)
             batches.extend(res_batches)
-
-        self._merge_small_batches(batches, None)  # final pass, recompute pts
 
         if self.verbose:
             self._print_batch_stats(batches)
@@ -556,36 +652,23 @@ class BalancedPointBudgetSampler(Sampler):
             self._merge_small_batches(res_batches, batch_pts)
             batches.extend(res_batches)
 
-        self._merge_small_batches(batches, None)
         if self.verbose:
             self._print_batch_stats(batches)
         return batches
 
     def _print_batch_stats(self, batches):
-        """Print point-count and batch utilization stats."""
+        """Print batch summary only."""
         if not self.verbose:
             return
-        raw_counts = getattr(self, '_raw_point_counts', [])
-        max_raw = max(raw_counts) if raw_counts else 0
-        max_effective = max(self.point_counts) if self.point_counts else 0
-        use_raw = getattr(self, '_use_raw_counts', False)
-        effective_max = 999999999 if use_raw else min(self.dataset.max_pts, max(self.target_points, 50000))
-        print(f"Point counts: max raw (on-disk)={max_raw:,}, max effective (for packing)={max_effective:,}, cap={effective_max:,} (dataset.max_pts={self.dataset.max_pts:,})")
         batch_sizes = [len(b) for b in batches]
         batch_points = [sum(self.point_counts[i] for i in b) for b in batches]
-        utilization = [bp / self.target_points for bp in batch_points]
-        over_target = [bp for bp in batch_points if bp > self.target_points * 2]
-        if over_target:
-            print(f"WARNING: Some batches exceed 2x target (max {max(batch_points):,}); collate downsamples to {self.target_points:,}")
         mode_str = {
             "ffd": "FFD",
             "bfd": "BFD",
             "balanced": "BALANCED",
             "balanced_bfd": "BALANCED-BFD",
         }.get(self.packing_mode, "custom")
-        print(f"Point-budget ({mode_str}): {len(batches)} batches (resolution-aware), {min(batch_sizes)}–{max(batch_sizes)} samples/batch (avg {np.mean(batch_sizes):.1f}), "
-              f"{min(batch_points):,.0f}–{max(batch_points):,.0f} pts pre-collate (collate caps to {self.target_points:,}), "
-              f"utilization {min(utilization):.0%}–{max(utilization):.0%} (avg {np.mean(utilization):.0%})")
+        print(f"Batches ({mode_str}): {len(batches)} ({min(batch_sizes)}–{max(batch_sizes)} samples, {min(batch_points):,.0f}–{max(batch_points):,.0f} pts)")
 
     def _label_of(self, idx):
         if idx < len(self.labels):
@@ -614,7 +697,7 @@ class BalancedPointBudgetSampler(Sampler):
 
         selected = []
         for lbl, idxs in lbl2idx.items():
-            chosen = np.random.choice(idxs, n_per, replace=len(idxs) < n_per).tolist()
+            chosen = self._weighted_choice(idxs, n_per)
             selected.extend(chosen)
         selected.extend(mix)
         return selected
@@ -772,7 +855,7 @@ class BalancedPointBudgetSampler(Sampler):
                 continue
             samples_per_class = min(len(idxs) for idxs in lbl2idx.values()) if self.mode == "downsampling" else max(len(idxs) for idxs in lbl2idx.values())
             class_pools = {
-                label: np.random.choice(idxs, samples_per_class, replace=len(idxs) < samples_per_class).tolist()
+                label: self._weighted_choice(idxs, samples_per_class)
                 for label, idxs in lbl2idx.items()
             }
             # Per-class queues: (idx, point_count) sorted descending (best-fit picks largest that fits)
@@ -892,17 +975,6 @@ class BalancedPointBudgetSampler(Sampler):
                 res_batches.pop(0)
             batches.extend(res_batches)
 
-        # Final pass: merge standalone tiny batches (< 30%) into previous (even across resolutions)
-        min_standalone = 0.3
-        i = 1
-        while i < len(batches):
-            bp = sum(self.point_counts[j] for j in batches[i])
-            if bp < self.target_points * min_standalone:
-                batches[i - 1].extend(batches[i])
-                batches.pop(i)
-            else:
-                i += 1
-
         if self.verbose:
             self._print_batch_stats(batches)
         return batches
@@ -921,11 +993,21 @@ class PointBudgetSampler(Sampler):
     """
     GPU memory-aware point budget sampler that automatically determines optimal batch sizes
     based on available GPU memory and runtime profiling.
+
+    When ``sample_weights`` is provided (per real voxel index), the sampler biases batch
+    composition toward high-weight samples. Weights should already be normalised by the
+    caller (e.g. ``1.0 + alpha * edge_fraction``). Hard samples still compete for the same
+    point budget; weights only change the probability each sample is *picked* for a batch,
+    not how it is packed. Uniform sampling is equivalent to weights == 1 everywhere.
     """
-    def __init__(self, dataset, target_points_per_batch=None, memory_fraction=0.7, verbose=True):
+    def __init__(self, dataset, target_points_per_batch=None, memory_fraction=0.7, verbose=True, sample_weights=None, edge_fracs=None):
         self.dataset = dataset
         self.memory_fraction = memory_fraction
         self.verbose = verbose
+        self.sample_weights = sample_weights
+        self.weighted_replacement = True
+        self.edge_fracs = edge_fracs  # raw per-voxel edge fractions for ramp updates
+        self._sample_info_cache = None  # populated on first _create_batches call
         self.target_points = target_points_per_batch or self._estimate_optimal_budget()
         self.batches = self._create_batches()
 
@@ -975,7 +1057,8 @@ class PointBudgetSampler(Sampler):
 
     def _get_sample_info(self, idx):
         """Load sample once; return (point_count, grid_size) for resolution-aware batching."""
-        basename = os.path.basename(self.dataset.keys[idx])
+        key = self.dataset.keys[idx]
+        basename = os.path.basename(key) if isinstance(key, (str, os.PathLike)) else f'in_memory_{idx}'
         if not basename.startswith('voxel_'):
             try:
                 name = basename.replace('.pt', '')
@@ -989,7 +1072,7 @@ class PointBudgetSampler(Sampler):
             except Exception:
                 pass
         try:
-            point_cloud, grid_size = _load_voxel_file(self.dataset.keys[idx], weights_only=True)
+            point_cloud, grid_size = self.dataset._load_by_index(idx)
             count = point_cloud.shape[0]
             if count <= 0:
                 return 1, grid_size
@@ -1004,19 +1087,43 @@ class PointBudgetSampler(Sampler):
         count, _ = self._get_sample_info(idx)
         return count
 
+    def set_weights(self, weights, allow_replacement=True):
+        """Update sampling weights and rebuild batch packing (no disk reads — uses cached sample info)."""
+        self.sample_weights = weights
+        self.weighted_replacement = bool(allow_replacement)
+        if self._sample_info_cache is None:
+            return  # not yet initialised; _create_batches will use the new weights
+        # Rebuild packing from cached info, suppressing verbose output
+        sample_info = self._sample_info_cache
+        res2samples = {}
+        for idx, pc, gs in sample_info:
+            res2samples.setdefault(gs, []).append((idx, pc))
+        use_weights = self.sample_weights is not None
+        batches = []
+        if use_weights:
+            w = np.asarray(self.sample_weights, dtype=np.float64)
+            w = np.clip(w, 1e-8, None)
+        for res, si in res2samples.items():
+            if use_weights:
+                batches.extend(self._weighted_bin_packing(si, w, replace=self.weighted_replacement))
+            else:
+                batches.extend(self._optimal_bin_packing(si))
+        self.batches = batches
+
     def _create_batches(self):
         """Create optimally packed batches; partition by grid_size so 4m and 2m never mix."""
-        if self.verbose:
-            print("Analyzing point cloud sizes for optimal adaptive batching (resolution-aware)...")
-
         sample_info = []
         for idx in range(len(self.dataset)):
             point_count, grid_size = self._get_sample_info(idx)
             sample_info.append((idx, point_count, grid_size))
+        self._sample_info_cache = sample_info
 
         if self.verbose:
             point_counts = [x[1] for x in sample_info]
-            print(f"Point count distribution: min={min(point_counts)}, max={max(point_counts)}, avg={np.mean(point_counts):.1f}")
+            print(
+                f"  Samples      {len(point_counts)} voxels | "
+                f"{min(point_counts):,}-{max(point_counts):,} pts | avg {np.mean(point_counts):,.1f}"
+            )
 
             # More detailed analysis
             zero_count = sum(1 for pc in point_counts if pc <= 0)
@@ -1024,49 +1131,114 @@ class PointBudgetSampler(Sampler):
             medium_count = sum(1 for pc in point_counts if 1000 < pc <= 5000)
             large_count = sum(1 for pc in point_counts if pc > 5000)
 
-            print(f"Sample size breakdown:")
+            dist_parts = []
             if zero_count > 0:
-                print(f"  Zero/invalid: {zero_count} samples")
-            print(f"  Small (1-1000): {small_count} samples")
-            print(f"  Medium (1001-5000): {medium_count} samples")
-            print(f"  Large (>5000): {large_count} samples")
-
-            # Check if adaptive batching makes sense for this data
-            total_points = sum(point_counts)
-            optimal_batch_count = total_points // self.target_points
-            if optimal_batch_count < 10:
-                print(f"WARNING: Total points ({total_points:,}) could fit in {optimal_batch_count} batches")
-                print(f"         Consider using fixed batching with smaller max-pts instead")
+                dist_parts.append(f"{zero_count} invalid")
+            dist_parts.append(f"{small_count} small")
+            dist_parts.append(f"{medium_count} medium")
+            dist_parts.append(f"{large_count} large")
+            print(f"  Distribution {' | '.join(dist_parts)}")
 
         # Partition by grid_size so each batch has a single resolution (2m and 4m never mixed)
         res2samples = {}
         for idx, pc, gs in sample_info:
             res2samples.setdefault(gs, []).append((idx, pc))
 
+        # Optional: biased draw order based on sample_weights. We keep bin-packing
+        # as the underlying mechanism (preserves the point-budget invariant), but
+        # seed the packer's priority order from a weighted shuffle instead of
+        # sorting strictly by size. This makes hard samples more likely to be
+        # picked early and appear in more batches across epochs without breaking
+        # GPU memory guarantees.
+        use_weights = self.sample_weights is not None
+        if use_weights:
+            w = np.asarray(self.sample_weights, dtype=np.float64)
+            w = np.clip(w, 1e-8, None)
+            if self.verbose:
+                print(f"  Difficulty   weighted sampling active | w∈[{w.min():.3f}, {w.max():.3f}] | mean {w.mean():.3f}")
+
         batches = []
         for res, si in res2samples.items():
-            batches.extend(self._optimal_bin_packing(si))
-
-        if self.verbose and len(res2samples) > 1:
-            print(f"Resolution-aware: {len(res2samples)} grid sizes (no mixing within a batch)")
+            if use_weights:
+                batches.extend(self._weighted_bin_packing(si, w, replace=self.weighted_replacement))
+            else:
+                batches.extend(self._optimal_bin_packing(si))
 
         if self.verbose:
-            print(f"Created {len(batches)} adaptive batches with target {self.target_points} points each")
+            print(f"  Batches      {len(batches)} targeting {self.target_points:,} pts/batch")
 
             # Analyze batch efficiency
             batch_points = [sum(self._get_point_count(idx) for idx in batch) for batch in batches]
             batch_sizes = [len(batch) for batch in batches]
-            utilization = [bp / self.target_points for bp in batch_points]
 
-            print(f"Batch sizes: min={min(batch_sizes)}, max={max(batch_sizes)}, avg={np.mean(batch_sizes):.1f}")
-            print(f"Points per batch: min={min(batch_points):,}, max={max(batch_points):,}, avg={np.mean(batch_points):,.0f}")
-            print(f"Memory utilization: min={min(utilization):.1%}, max={max(utilization):.1%}, avg={np.mean(utilization):.1%}")
+            print(
+                f"  Packing      {min(batch_sizes)}-{max(batch_sizes)} samples/batch | "
+                f"avg {np.mean(batch_sizes):.1f}"
+            )
+            print(
+                f"  Batch pts    {min(batch_points):,}-{max(batch_points):,} | "
+                f"avg {np.mean(batch_points):,.0f} | p95 {np.percentile(batch_points, 95):,.0f}"
+            )
 
             # Check for any batch exceeding the limit
             over_limit = [bp for bp in batch_points if bp > self.target_points]
-            if over_limit:
-                print(f"WARNING: {len(over_limit)} batches exceed target ({max(over_limit):,} > {self.target_points:,})")
+            single_over = [pc for pc in point_counts if pc > self.target_points]
+            if over_limit or single_over:
+                warn_parts = []
+                if over_limit:
+                    warn_parts.append(f"{len(over_limit)} batches exceed target ({max(over_limit):,} > {self.target_points:,})")
+                if single_over:
+                    warn_parts.append(f"{len(single_over)} single voxels exceed target ({max(single_over):,} > {self.target_points:,})")
+                print(f"  Warning      {' | '.join(warn_parts)}")
+            else:
+                print(f"  Over target  0 batches | 0 single voxels")
 
+        return batches
+
+    def _weighted_bin_packing(self, sample_info, weights, replace=True):
+        """Weighted sampling WITH replacement + best-fit bin packing.
+
+        Each epoch draws N samples (N = pool size) with probabilities
+        ∝ weights[idx]. Hard samples are genuinely oversampled — expected
+        appearances ≈ N · w_i / sum(w). Easy samples are undersampled but
+        still seen. Batches are formed by best-fit packing so the point
+        budget invariant holds. Same sample may appear in multiple batches
+        per epoch; within a single batch duplicates are rare for realistic
+        pool sizes and acceptable.
+        """
+        idx_to_pc = {idx: pc for idx, pc in sample_info}
+        pool_idx = [idx for idx, _ in sample_info]
+        w = np.asarray([weights[i] for i in pool_idx], dtype=np.float64)
+        w = w / w.sum()
+
+        rng = np.random.default_rng()
+        n_draws = len(pool_idx)
+        draw_order = rng.choice(len(pool_idx), size=n_draws, replace=bool(replace), p=w).tolist()
+        ordered = [(pool_idx[k], idx_to_pc[pool_idx[k]]) for k in draw_order]
+
+        batches = []
+        remaining = ordered.copy()
+        while remaining:
+            lead_idx, lead_pc = remaining.pop(0)
+            batch = [lead_idx]
+            current = lead_pc
+            # Fill with best-fit from remaining pool (unchanged packing invariant)
+            while remaining:
+                budget_left = self.target_points - current
+                if budget_left <= 0:
+                    break
+                best_i = -1
+                best_pc = 0
+                for i, (_idx, pc) in enumerate(remaining):
+                    if pc <= budget_left and pc > best_pc:
+                        best_pc = pc
+                        best_i = i
+                if best_i < 0:
+                    break
+                pick_idx, pick_pc = remaining.pop(best_i)
+                batch.append(pick_idx)
+                current += pick_pc
+            batches.append(batch)
         return batches
 
     def _optimal_bin_packing(self, sample_info):
@@ -1116,14 +1288,9 @@ class PointBudgetSampler(Sampler):
 
     def __iter__(self):
         import random
-        import torch
         random.shuffle(self.batches)
 
-        for i, batch in enumerate(self.batches):
-            if self.verbose and torch.cuda.is_available() and i < 3:  # Log first 3 batches
-                batch_points = sum(self._get_point_count(idx) for idx in batch)
-                current_memory = torch.cuda.memory_allocated() / 1e6
-                print(f"    Batch {i+1}: {len(batch)} samples, {batch_points:,} points, GPU: {current_memory:.1f} MB")
+        for batch in self.batches:
             yield batch
 
     def __len__(self):
@@ -1176,6 +1343,10 @@ def _downsample_batch_to_point_budget(batch, max_points):
             batch.sf = batch.sf[unique_old]
         elif batch.sf.numel() == n:
             batch.sf = batch.sf[indices]
+    for attr in ('voxel_idx', 'group_idx', 'difficulty'):
+        value = getattr(batch, attr, None)
+        if value is not None and hasattr(value, 'size') and value.size(0) == old_batch.max().item() + 1:
+            setattr(batch, attr, value[unique_old])
     if hasattr(batch, 'local_shift') and batch.local_shift is not None:
         # local_shift is stored per-sample as flattened [B*3]; preserve surviving samples.
         n_shift = batch.local_shift.numel() // 3
@@ -1243,8 +1414,6 @@ def create_train_loader(args, device):
         density_aug_spacing_min=smin,
         density_aug_spacing_max=smax,
     )
-    if density_aug:
-        print(f"Density aug: random grid downsampling {smin*100:.1f}-{smax*100:.1f} cm (prob={getattr(args, 'density_aug_prob', 0.5)}, per-batch)")
 
     # Use point-budget-aware batching if specified, otherwise fixed batch size
     max_points_per_batch = getattr(args, 'max_points_per_batch', 0)
@@ -1252,15 +1421,52 @@ def create_train_loader(args, device):
     if max_points_per_batch > 0:
         # Point-budget-aware balanced sampling (prevents OOM)
         min_points_per_batch = getattr(args, 'min_points_per_batch', 16000)
-        train_sampler = BalancedPointBudgetSampler(
-            dataset=train_dataset,
-            labels=train_dataset.labels,
-            target_points_per_batch=max_points_per_batch,
-            min_points_per_batch=min_points_per_batch,
-            mode=args.balance_mode,
-            packing_mode=getattr(args, 'packing_mode', 'bfd'),
-            verbose=getattr(args, 'verbose', False)
-        )
+        use_difficulty = bool(getattr(args, 'difficulty_sampling', False))
+        use_adaptive_groups = bool(getattr(args, 'adaptive_group_sampling', False))
+        if use_difficulty:
+            alpha = float(getattr(args, 'difficulty_alpha', 4.0))
+            edge_fracs = np.asarray(train_dataset.edge_fractions, dtype=np.float64)
+            real_weights = 1.0 + alpha * edge_fracs
+            # Mix slots (appended after real samples) are averaged at the mean real weight
+            mix_slots = getattr(train_dataset, '_num_mix_slots', 0)
+            if mix_slots > 0:
+                mix_w = np.full(mix_slots, float(real_weights.mean()), dtype=np.float64)
+                sample_weights = np.concatenate([real_weights, mix_w])
+            else:
+                sample_weights = real_weights
+            train_sampler = PointBudgetSampler(
+                dataset=train_dataset,
+                target_points_per_batch=max_points_per_batch,
+                memory_fraction=getattr(args, 'memory_fraction', 0.7),
+                verbose=getattr(args, 'verbose', False),
+                sample_weights=sample_weights,
+                edge_fracs=edge_fracs,
+            )
+            print(
+                f"Difficulty sampling ON | alpha={alpha:.2f} | "
+                f"edge_frac∈[{edge_fracs.min():.3f},{edge_fracs.max():.3f}] mean={edge_fracs.mean():.3f}"
+            )
+        else:
+            edge_fracs = np.asarray(train_dataset.edge_fractions, dtype=np.float64)
+            sample_weights = None
+            if use_adaptive_groups:
+                mix_slots = getattr(train_dataset, '_num_mix_slots', 0)
+                real_weights = np.ones(len(train_dataset.keys), dtype=np.float64)
+                mix_w = np.ones(mix_slots, dtype=np.float64)
+                sample_weights = np.concatenate([real_weights, mix_w]) if mix_slots > 0 else real_weights
+            train_sampler = BalancedPointBudgetSampler(
+                dataset=train_dataset,
+                labels=train_dataset.labels,
+                target_points_per_batch=max_points_per_batch,
+                min_points_per_batch=min_points_per_batch,
+                mode=args.balance_mode,
+                packing_mode=getattr(args, 'packing_mode', 'bfd'),
+                verbose=getattr(args, 'verbose', False),
+                sample_weights=sample_weights,
+                edge_fracs=edge_fracs,
+            )
+            if use_adaptive_groups:
+                print("Adaptive group sampling ready | validation-guided weights start after warmup")
 
         def _train_collate(batch):
             return point_budget_collate(batch, max_points_per_batch)
@@ -1320,6 +1526,8 @@ def create_train_loader(args, device):
 
     return train_loader, train_dataset
 
+FOCUS_ONLY_PREFIXES = {'fin04-hard'}
+
 def create_test_loader(args, device):
     test_dataset = TrainingDataset(
         voxels=args.tefile,
@@ -1329,7 +1537,8 @@ def create_test_loader(args, device):
         max_pts=args.max_pts,
         denoise=getattr(args, 'denoise', False),
         denoise_k=getattr(args, 'denoise_k', 16),
-        denoise_std=getattr(args, 'denoise_std', 1.0)
+        denoise_std=getattr(args, 'denoise_std', 1.0),
+        exclude_prefixes=FOCUS_ONLY_PREFIXES,
     )
 
     # Use point-budget-aware batching if specified
@@ -1372,44 +1581,47 @@ def create_test_loader(args, device):
     return test_loader, test_dataset
 
 def create_inference_loader(args, device):
+    use_in_memory = bool(getattr(args, 'in_memory', False))
+    voxel_source = getattr(args, 'inference_voxels', None) if use_in_memory else args.vxfile
+    if use_in_memory and voxel_source is None:
+        raise ValueError('In-memory inference requested but no voxel payloads were provided.')
+
     test_dataset = TestingDataset(
-        voxels=args.vxfile,
+        voxels=voxel_source,
         device=device,
         max_pts=args.max_pts,
+        in_memory=use_in_memory,
         denoise=getattr(args, 'denoise', False),
         denoise_k=getattr(args, 'denoise_k', 16),
         denoise_std=getattr(args, 'denoise_std', 1.0),
         file_pattern=getattr(args, 'eval_file_pattern', None)
     )
     
-    use_perspectives = hasattr(args, 'boost_perspective') and args.boost_perspective
-    
-    if use_perspectives:
-        if args.verbose:
-            print("Using multi-perspective inference with 7 different views of each point cloud")
-        from src.perspectives import MultiPerspectiveDataset
-        test_dataset = MultiPerspectiveDataset(test_dataset)
-    
     from torch.utils.data import DataLoader
     import os
 
-    # Conservative worker count to avoid "too many open files" errors
-    # Use at most 4 workers to prevent file handle exhaustion
-    cpu_count = os.cpu_count() if os.cpu_count() else 4
-    num_workers = min(4, max(1, cpu_count - 2))
+    # When voxels are already in RAM (in-memory mode or shard loaded at init),
+    # DataLoader workers just duplicate the dataset across processes for no benefit.
+    # Use num_workers=0 to avoid memory multiplication and pickling overhead.
+    has_shard = hasattr(test_dataset, '_shard') and test_dataset._shard is not None
+    if use_in_memory or has_shard:
+        num_workers = 0
+    else:
+        cpu_count = os.cpu_count() if os.cpu_count() else 4
+        num_workers = min(4, max(1, cpu_count - 2))
 
     # Choose batching strategy based on batch_size parameter
     use_adaptive = getattr(args, 'batch_size', 0) == 0
 
     if use_adaptive:
         # Match trainer behavior: explicit point budget by default.
-        max_points_per_batch = getattr(args, 'max_points_per_batch', 50000)
+        max_points_per_batch = getattr(args, 'max_points_per_batch', 32768)
         target_points = max_points_per_batch if max_points_per_batch > 0 else None
         point_sampler = PointBudgetSampler(
             test_dataset,
             target_points_per_batch=target_points,
             memory_fraction=getattr(args, 'memory_fraction', 0.7),
-            verbose=True
+            verbose=getattr(args, 'verbose', False),
         )
         target_pts = point_sampler.target_points
 
@@ -1424,16 +1636,18 @@ def create_inference_loader(args, device):
                 b.voxel_size = torch.tensor([float(grid_sizes[0])], dtype=torch.float32)
             return b
 
-        test_loader = DataLoader(
-            test_dataset,
-            batch_sampler=point_sampler,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
-            prefetch_factor=4,
-            persistent_workers=False,
-            collate_fn=inference_collate
-        )
+        loader_kwargs = {
+            'dataset': test_dataset,
+            'batch_sampler': point_sampler,
+            'shuffle': False,
+            'num_workers': num_workers,
+            'pin_memory': (device.type == 'cuda' and not use_in_memory),
+            'collate_fn': inference_collate,
+        }
+        if num_workers > 0:
+            loader_kwargs['prefetch_factor'] = 4
+            loader_kwargs['persistent_workers'] = False
+        test_loader = DataLoader(**loader_kwargs)
     else:
         # Traditional fixed batch size
         if args.verbose:
@@ -1447,15 +1661,17 @@ def create_inference_loader(args, device):
                 b.voxel_size = torch.tensor([float(grid_sizes[0])], dtype=torch.float32)
             return b
 
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
-            prefetch_factor=4,
-            persistent_workers=False,
-            collate_fn=geometric_collate
-        )
+        loader_kwargs = {
+            'dataset': test_dataset,
+            'batch_size': args.batch_size,
+            'shuffle': False,
+            'num_workers': num_workers,
+            'pin_memory': (device.type == 'cuda' and not use_in_memory),
+            'collate_fn': geometric_collate,
+        }
+        if num_workers > 0:
+            loader_kwargs['prefetch_factor'] = 4
+            loader_kwargs['persistent_workers'] = False
+        test_loader = DataLoader(**loader_kwargs)
 
     return test_loader, test_dataset 

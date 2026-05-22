@@ -30,6 +30,7 @@ from tqdm import tqdm
 
 from src.io import load_file
 from src.predicter import SemanticSegmentation
+from src.regions import is_generated_p2w_file
 from src.utils import preprocess_point_cloud_data
 
 warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
@@ -71,7 +72,7 @@ def _harmonic_mean(a, b):
 def _get_test_files(eval_root, biome):
     biome_dir = os.path.join(eval_root, f"{biome}_eval")
     files     = glob.glob(os.path.join(biome_dir, "*.ply"))
-    return sorted(f for f in files if not f.lower().endswith('_p2w.ply'))
+    return sorted(f for f in files if not is_generated_p2w_file(f))
 
 def _load_ground_truth(file_path):
     data = load_file(file_path)

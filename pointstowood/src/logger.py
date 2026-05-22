@@ -525,20 +525,51 @@ class ModelManager:
             print(f"  Ignored old params: {unexpected}")
         return self.model
 
+    def checkpoint_payload(self):
+        """Serialize weights plus effective model config for exact inference reconstruction."""
+        payload = {'model_state_dict': self.model.state_dict()}
+        cfg = {}
+        for key in (
+            'model_family',
+            'c_base',
+            'k_neighbors',
+            'stage_kernel_points',
+            'num_kernel_points',
+            'learnable_kernels',
+            'spatial_mix_lite',
+            'flash_dim',
+            'memory_efficient_conv',
+            'sparse_max',
+            'sa1_blocks',
+            'sa2_blocks',
+            'sa3_blocks',
+            'compressed_head',
+            'compressed_head_dim',
+        ):
+            if hasattr(self.model, key):
+                value = getattr(self.model, key)
+                if value is not None:
+                    if key == 'stage_kernel_points':
+                        value = list(value)
+                    cfg[key] = value
+        if cfg:
+            payload['model_config'] = cfg
+        return payload
+
     def save_checkpoints(self, args, epoch):
         """Save checkpoint at specified epoch."""
         checkpoint_folder = os.path.join(args.wdir, 'checkpoints')
         if not os.path.isdir(checkpoint_folder):
             os.mkdir(checkpoint_folder)
         file = checkpoint_folder + '/' + f'epoch_{epoch}.pth'
-        torch.save({'model_state_dict': self.model.state_dict()}, file)
+        torch.save(self.checkpoint_payload(), file)
         return True
 
     def save_best_model(self, stat, best_stat, save_path):
         """Save model if current stat is better than best (higher is better)."""
         if stat > best_stat:
             best_stat = stat
-            torch.save({'model_state_dict': self.model.state_dict()}, save_path)
+            torch.save(self.checkpoint_payload(), save_path)
             print(f'Saving {save_path}')
         return best_stat
 
@@ -546,7 +577,7 @@ class ModelManager:
         """Save model if current stat is better than best (lower is better, e.g. FPR)."""
         if stat < best_stat:
             best_stat = stat
-            torch.save({'model_state_dict': self.model.state_dict()}, save_path)
+            torch.save(self.checkpoint_payload(), save_path)
             print(f'Saving {save_path}')
         return best_stat
 
@@ -616,61 +647,132 @@ class WandbLogger:
         if args.wandb:
             import wandb
             self.wandb = wandb
+            kernel_cfg = getattr(args, "num_kernel_points", None)
             self.wandb.init(
                 project="PointsToWood", 
                 config={
                     "architecture": "pointnet++",
-                    "dataset": "high resolution 2 & 4 m voxels",
+                    "region": getattr(args, "region", "unknown"),
+                    "grid_size": getattr(args, "grid_size", None),
+                    "num_kernel_points": kernel_cfg,
+                    "stage_kernel_points": kernel_cfg if isinstance(kernel_cfg, (list, tuple)) else None,
                     "epochs": args.num_epochs,
                 }
             )
+            self._define_metrics()
+
+    def _define_metrics(self):
+        """Set explicit x-axes and summary reducers so W&B charts behave sensibly."""
+        if not self.wandb:
+            return
+        try:
+            self.wandb.define_metric("epoch")
+            self.wandb.define_metric("train_step")
+
+            # Per-batch / per-update training traces
+            self.wandb.define_metric("train/*", step_metric="train_step")
+
+            # Epoch-level summaries and diagnostics
+            self.wandb.define_metric("epoch/*", step_metric="epoch")
+            self.wandb.define_metric("model/*", step_metric="epoch")
+            self.wandb.define_metric("val/*", step_metric="epoch")
+            self.wandb.define_metric("eval_*/*", step_metric="epoch")
+            self.wandb.define_metric("group_dro/*", step_metric="epoch")
+            self.wandb.define_metric("adaptive_sampling/*", step_metric="epoch")
+
+            # Useful summaries for quick run comparison
+            self.wandb.define_metric("epoch/train_loss", summary="min")
+            self.wandb.define_metric("val/h4_mcc", summary="max")
+            self.wandb.define_metric("val/harmonic_mcc", summary="max")
+            self.wandb.define_metric("val/mcc_edge_mean", summary="max")
+            self.wandb.define_metric("val/brier", summary="min")
+        except Exception:
+            pass
+
+    def log_train_step(self, train_step, lr, running_metrics, batch_loss=None, ema_loss=None, extra_metrics=None):
+        """Log within-epoch training traces so W&B lines update smoothly."""
+        if not self.wandb:
+            return
+
+        log_dict = {
+            "train_step": int(train_step),
+            "train/lr": float(lr),
+            "train/running_loss": float(running_metrics.get("loss", 0.0)),
+            "train/balanced_acc": float(running_metrics.get("accuracy", 0.0)),
+            "train/fbeta": float(running_metrics.get("fbeta", 0.0)),
+            "train/precision": float(running_metrics.get("precision", 0.0)),
+            "train/recall": float(running_metrics.get("recall", 0.0)),
+        }
+        if batch_loss is not None:
+            log_dict["train/batch_loss"] = float(batch_loss)
+        if ema_loss is not None:
+            log_dict["train/ema_loss"] = float(ema_loss)
+        if extra_metrics:
+            for key, value in extra_metrics.items():
+                if value is None:
+                    continue
+                log_dict[key] = float(value)
+        self.wandb.log(log_dict)
     
     def log_epoch(self, epoch, lr, train_metrics, test_metrics=None, model_metrics=None):
         """Log epoch metrics to wandb.
 
         Groups:
-          train/   — loss and accuracy
-          model/   — flashlight gate, contrast, DualNorm, CBL balance, kernel entropy
-          val/     — performance (h4_mcc, mcc split, refl_gain), boundary quality, FPR
+          epoch/   — holistic per-epoch summaries
+          train/   — within-epoch training traces
+          model/   — flashlight gate, kernel routing
+          val/     — h4_mcc, mcc split (global + edge), FPR, calibration
         """
         if not self.wandb:
             return
 
         log_dict = {
             "epoch": epoch,
-            "lr": lr,
-            "train/loss": float(train_metrics["loss"]),
-            "train/balanced_acc": float(train_metrics["accuracy"]),
+            "epoch/lr": float(lr),
+            "epoch/train_loss": float(train_metrics["loss"]),
+            "epoch/train_balanced_acc": float(train_metrics["accuracy"]),
+            "epoch/train_fbeta": float(train_metrics.get("fbeta", 0.0)),
         }
 
-        # Model internals — flashlight, DualNorm, CBL balance, kernel routing
         if model_metrics:
-            log_dict["model/refl_gate"] = float(model_metrics.get("refl_gate", 0))
-            log_dict["model/contrast_strength"] = float(model_metrics.get("contrast_strength", 0))
-            log_dict["model/dualnorm_alpha"] = float(model_metrics.get("dualnorm_alpha", 0))
-            log_dict["model/kernel_entropy"] = float(model_metrics.get("kernel_entropy", 0))
-            log_dict["model/cbl_sample_std"] = float(model_metrics.get("cbl_sample_std", 0))
+            for key, value in model_metrics.items():
+                if value is None:
+                    continue
+                log_dict[f"model/{key}"] = float(value)
 
         if test_metrics:
             mcc_with = float(test_metrics.get("mcc_with_refl", 0))
             mcc_no = float(test_metrics.get("mcc_no_refl", 0))
+            mcc_edge_with = float(test_metrics.get("mcc_edge_with_refl", 0))
+            mcc_edge_no = float(test_metrics.get("mcc_edge_no_refl", 0))
+            mcc_pure_with = float(test_metrics.get("mcc_pure_with_refl", 0))
+            mcc_pure_no = float(test_metrics.get("mcc_pure_no_refl", 0))
+            fpr_with = float(test_metrics.get("fpr_with_refl", 0))
+            fpr_no = float(test_metrics.get("fpr_no_refl", 0))
+            fpr_edge_with = float(test_metrics.get("fpr_edge_with_refl", 0))
+            fpr_edge_no = float(test_metrics.get("fpr_edge_no_refl", 0))
+            refl_gain_edge = mcc_edge_with - mcc_edge_no
             log_dict.update({
-                # Primary save metric and overall performance
                 "val/h4_mcc":               float(test_metrics.get("h4_mcc", 0)),
-                "val/mcc_with_refl":         mcc_with,
-                "val/mcc_no_refl":           mcc_no,
-                "val/refl_gain":             mcc_with - mcc_no,  # how much refl contributes
-                # Hardest condition: boundaries (where hard forest types fail)
-                "val/mcc_edge_with_refl":    float(test_metrics.get("mcc_edge_with_refl", 0)),
-                "val/mcc_edge_no_refl":      float(test_metrics.get("mcc_edge_no_refl", 0)),
-                "val/refl_gain_edge":        float(test_metrics.get("mcc_edge_with_refl", 0)) - float(test_metrics.get("mcc_edge_no_refl", 0)),
-                # Boundary false positives
-                "val/fpr_edge_with_refl":    float(test_metrics.get("fpr_edge_with_refl", 0)),
-                "val/fpr_edge_no_refl":      float(test_metrics.get("fpr_edge_no_refl", 0)),
-                # Boundary spatial quality
-                "val/edge_coherency":        float(test_metrics.get("harmonic_edge_coherency", 0)),
-                # Reflectance contribution to decision
+                "val/harmonic_mcc":         float(test_metrics.get("harmonic_mcc", 0)),
+                "val/mcc_with_refl":        mcc_with,
+                "val/mcc_no_refl":          mcc_no,
+                "val/refl_gain":            mcc_with - mcc_no,
+                "val/mcc_pure_with_refl":   mcc_pure_with,
+                "val/mcc_pure_no_refl":     mcc_pure_no,
+                "val/mcc_pure_mean":        0.5 * (mcc_pure_with + mcc_pure_no),
+                "val/mcc_edge_with_refl":   mcc_edge_with,
+                "val/mcc_edge_no_refl":     mcc_edge_no,
+                "val/mcc_edge_mean":        0.5 * (mcc_edge_with + mcc_edge_no),
+                "val/refl_gain_edge":       refl_gain_edge,
+                "val/fpr_mean":             0.5 * (fpr_with + fpr_no),
+                "val/fpr_edge_mean":        0.5 * (fpr_edge_with + fpr_edge_no),
+                "val/brier":                float(test_metrics.get("mean_brier", test_metrics.get("brier_score", 0))),
                 "val/refl_dominance":        float(test_metrics.get("refl_dominance", 0)),
+                "val/refl_dominance_edge":   float(test_metrics.get("refl_dominance_edge", 0)),
+                "val/refl_dominance_pure":   float(test_metrics.get("refl_dominance_pure", 0)),
+                "val/refl_dominance_edge_wood": float(test_metrics.get("refl_dominance_edge_wood", 0)),
+                "val/refl_dominance_edge_ratio": float(test_metrics.get("refl_dominance_edge_ratio", 0)),
             })
 
         self.wandb.log(log_dict)

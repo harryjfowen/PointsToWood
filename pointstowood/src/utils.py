@@ -93,38 +93,6 @@ def clear_gpu_memory():
     gc.collect()
     torch.cuda.empty_cache()
 
-def _compute_quantiles_chunked(tensor: Tensor, quantiles: List[float], chunk_size: int = 1_000_000) -> Tensor:
-    """Compute quantiles for large tensors by processing in chunks"""
-    device = tensor.device
-    n_samples = min(10_000_000, tensor.numel())  # Sample up to 10M points for quantile estimation
-
-    if tensor.numel() <= n_samples:
-        # Use all data if small enough
-        sample_tensor = tensor
-    else:
-        # Random sampling for very large tensors
-        indices = torch.randint(0, tensor.numel(), (n_samples,), device=device)
-        sample_tensor = tensor[indices]
-
-    # Move to CPU if tensor is large to avoid GPU memory issues
-    if sample_tensor.numel() > 5_000_000 and device.type == 'cuda':
-        sample_tensor = sample_tensor.cpu()
-        quantile_device = torch.device('cpu')
-    else:
-        quantile_device = device
-
-    try:
-        quantile_values = torch.quantile(sample_tensor, torch.tensor(quantiles, device=quantile_device))
-        return quantile_values.to(device)
-    except RuntimeError as e:
-        if "too large" in str(e):
-            # Fall back to CPU computation
-            sample_tensor = sample_tensor.cpu()
-            quantile_values = torch.quantile(sample_tensor, torch.tensor(quantiles, device='cpu'))
-            return quantile_values.to(device)
-        else:
-            raise
-
 def minmax_normalize_reflectance(reflectance_tensor: Tensor) -> Tensor:
     """Min-max to [-1, 1]. No clipping — preserves relative differences (model uses relative contrast only)."""
     if torch.isnan(reflectance_tensor).any():
@@ -137,23 +105,49 @@ def minmax_normalize_reflectance(reflectance_tensor: Tensor) -> Tensor:
         return torch.zeros_like(reflectance_tensor)
     return 2 * (reflectance_tensor - min_val) / span - 1
 
+
 def quantile_normalize_reflectance(reflectance_tensor: Tensor) -> Tensor:
-    if torch.isnan(reflectance_tensor).any():
-        raise ValueError("Input reflectance tensor contains NaN values.")
-    
-    _, indices = torch.sort(reflectance_tensor)
-    ranks = torch.argsort(indices)
-    
-    empirical_quantiles = (ranks.float() + 1) / (len(ranks) + 1)
-    empirical_quantiles = torch.clamp(empirical_quantiles, 1e-7, 1 - 1e-7)
-    
-    normalized_reflectance = torch.erfinv(2 * empirical_quantiles - 1) * torch.sqrt(torch.tensor(2.0)).to(reflectance_tensor.device)
-    
-    min_val = normalized_reflectance.min()
-    max_val = normalized_reflectance.max()
-    scaled_reflectance = 2 * (normalized_reflectance - min_val) / (max_val - min_val) - 1
-    
-    return scaled_reflectance
+    """Rank-transform reflectance to uniform on [-1, 1] via the empirical CDF.
+
+    Sensor-agnostic by construction: only order is preserved, so signed dB
+    (RIEGL), 8-bit amplitude, and anything monotone collapse to the same
+    uniform marginal. AnisotropicConv consumes only |refl - neighbourhood_median|,
+    and under a uniform marginal those local-contrast magnitudes are directly
+    comparable across clouds regardless of the source sensor.
+
+    Ties get the average rank (standard quantile normalisation), so saturated
+    plateaus (e.g. many points pinned at amplitude 255) don't produce
+    spurious micro-contrast within the saturated group.
+    """
+    if reflectance_tensor.numel() == 0:
+        return reflectance_tensor
+
+    original_dtype = reflectance_tensor.dtype
+    x = reflectance_tensor.to(torch.float32)
+
+    finite_mask = torch.isfinite(x)
+    if not finite_mask.any():
+        return torch.zeros_like(x, dtype=original_dtype)
+    if not finite_mask.all():
+        x = x.clone()
+        x[~finite_mask] = torch.median(x[finite_mask])
+
+    if (x.max() - x.min()).abs() < 1e-8:
+        return torch.zeros_like(x, dtype=original_dtype)
+
+    # Rank with tie-averaging: for each value, avg of its first and last
+    # positions in the sorted array — the standard bisection-based mean rank.
+    sorted_vals, sort_idx = torch.sort(x)
+    first_eq = torch.searchsorted(sorted_vals, sorted_vals, right=False).to(torch.float32)
+    last_eq = (torch.searchsorted(sorted_vals, sorted_vals, right=True) - 1).to(torch.float32)
+    avg_ranks_sorted = (first_eq + last_eq) * 0.5
+
+    ranks = torch.empty_like(x)
+    ranks[sort_idx] = avg_ranks_sorted
+
+    denom = max(x.numel() - 1, 1)
+    normalized = (ranks / denom) * 2.0 - 1.0
+    return normalized.to(original_dtype)
 
 def downsample_points(pos: Tensor, spacing: float) -> Tensor:
     with torch.no_grad():
@@ -223,9 +217,14 @@ def _extract_valid_voxels(
     counts: Tensor,
     boundaries: Tensor,
     min_points: int,
-    max_points: int
+    max_points: Optional[int] = None
 ) -> List[Tensor]:
-    """Extract indices for valid voxels (optimized with batched GPU ops)."""
+    """Extract indices for valid voxels (optimized with batched GPU ops).
+
+    If ``max_points`` is positive, apply an early uniform cap while extracting
+    indices. Pass ``None`` or ``<=0`` to keep full voxel membership and defer
+    any later sampling policy to the caller.
+    """
     # Find valid voxel IDs upfront
     valid_mask = counts >= min_points
     valid_ids = valid_mask.nonzero(as_tuple=True)[0]
@@ -249,8 +248,8 @@ def _extract_valid_voxels(
         start_idx, end_idx, count = starts_cpu[i], ends_cpu[i], counts_cpu[i]
         voxel_indices = sorted_order_cpu[start_idx:end_idx]
 
-        # Subsample if needed
-        if count > max_points:
+        # Optional early uniform subsample.
+        if max_points is not None and max_points > 0 and count > max_points:
             subsample = torch.randperm(count)[:max_points]
             voxel_indices = voxel_indices[subsample]
 
@@ -263,7 +262,7 @@ def create_point_grid_with_overlap(
     pos: Tensor,
     grid_size: float,
     min_points: int = 512,
-    max_points: int = 9999999,
+    max_points: Optional[int] = None,
     num_offsets: int = 4
 ) -> List[Tensor]:
     """Create overlapping voxel grids by shifting grid origin in XY.
@@ -272,7 +271,8 @@ def create_point_grid_with_overlap(
         pos: Point cloud tensor [N, 3+]
         grid_size: Voxel size in meters
         min_points: Minimum points per voxel
-        max_points: Maximum points per voxel
+        max_points: Optional early cap applied during extraction. ``None`` keeps
+            the full voxel and lets the caller handle any later sampling policy.
         num_offsets: Number of XY offset directions (4 or 8)
             4 = 50% overlap (2x2 grid of origins)
             8 = 4 + cardinal edges for denser coverage
@@ -331,8 +331,12 @@ def create_point_grid_with_overlap(
     return indices_list
 
 
-def create_point_grid(pos: Tensor, grid_sizes: List[float], min_points: int = 512, max_points: int = 9999999) -> List[Tensor]:
-    """Efficiently partition points into voxels using sorted indices."""
+def create_point_grid(pos: Tensor, grid_sizes: List[float], min_points: int = 512, max_points: Optional[int] = None) -> List[Tensor]:
+    """Efficiently partition points into voxels using sorted indices.
+
+    ``max_points`` is an optional early cap. Pass ``None`` or ``<=0`` to keep
+    full voxel membership and defer sampling to a later stage.
+    """
     indices_list: List[Tensor] = []
     device = pos.device
 
@@ -367,5 +371,3 @@ def compute_knn_edge_scores(point_cloud: Tensor, k: int = 16) -> Tensor:
     edge_scores = 4.0 * wood_ratios * (1.0 - wood_ratios)
     
     return torch.clamp(edge_scores, 0.0, 1.0)
-
-

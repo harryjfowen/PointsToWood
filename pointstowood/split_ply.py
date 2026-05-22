@@ -3,6 +3,12 @@ import argparse
 import numpy as np
 from plyfile import PlyData, PlyElement
 
+try:
+    from src.regions import is_generated_p2w_file
+except ImportError:
+    def is_generated_p2w_file(path: str) -> bool:
+        return os.path.basename(path).lower().endswith(('_p2w.ply', '-p2w.ply'))
+
 SPLITS = ["train", "test", "eval"]
 
 
@@ -44,9 +50,14 @@ def collect_files(input_path: str) -> list:
     if os.path.isfile(input_path):
         if not input_path.lower().endswith('.ply'):
             raise ValueError(f"File must be a .ply: {input_path}")
+        if is_generated_p2w_file(input_path):
+            raise ValueError(f"Refusing to process generated P2W output file: {input_path}")
         return [input_path]
     elif os.path.isdir(input_path):
-        files = sorted(f for f in os.listdir(input_path) if f.lower().endswith('.ply'))
+        files = sorted(
+            f for f in os.listdir(input_path)
+            if f.lower().endswith('.ply') and not is_generated_p2w_file(f)
+        )
         if not files:
             raise FileNotFoundError(f"No .ply files found in: {input_path}")
         return [os.path.join(input_path, f) for f in files]
@@ -89,7 +100,12 @@ def main():
     if args.output is not None:
         out_root = args.output
     elif os.path.isdir(args.input):
-        out_root = args.input
+        # If input is 'pool' directory, use parent directory as output root
+        input_basename = os.path.basename(args.input.rstrip('/'))
+        if input_basename == 'pool':
+            out_root = os.path.dirname(os.path.abspath(args.input))
+        else:
+            out_root = args.input
     else:
         out_root = os.path.dirname(os.path.abspath(args.input))
 

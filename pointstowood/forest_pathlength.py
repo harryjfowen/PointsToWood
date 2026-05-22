@@ -10,6 +10,7 @@ from tqdm import tqdm
 
 import networkx as nx
 from sklearn.neighbors import NearestNeighbors
+from sklearn.cluster import DBSCAN
 
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra
@@ -18,7 +19,7 @@ from scipy.sparse.csgraph import connected_components
 try:
     import hdbscan  # fast_hdbscan is alias in recent wheels
 except ImportError:
-    raise ImportError("hdbscan package is required: pip install hdbscan")
+    hdbscan = None
 
 import skfmm
 
@@ -138,6 +139,14 @@ def main():
                         help="XY tile size for local slicing (m, default 1.0)")
     parser.add_argument("--erosion-iter", type=int, default=2,
                         help="Number of 3×3 minimum-filter iterations to propagate ground heights across empty or canopy-only tiles (default 2, set 0 to disable).")
+    parser.add_argument("--cluster-min-size", type=int, default=512,
+                        help="Minimum stem cluster size in the slicing step (default 512).")
+    parser.add_argument("--cluster-min-samples", type=int, default=64,
+                        help="Minimum local sample count for stem clustering (default 64).")
+    parser.add_argument("--dbscan-eps", type=float, default=0.35,
+                        help="Fallback DBSCAN epsilon in metres when hdbscan is unavailable (default 0.35).")
+    parser.add_argument("--simple-root", action="store_true",
+                        help="Bypass clustering and use the lowest wood point in the slice as a single root source.")
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -147,6 +156,10 @@ def main():
         base, ext = os.path.splitext(args.input_ply)
         args.output_ply = f"{base}_pl{ext or '.ply'}"
         print(f"No --output supplied; writing results to {args.output_ply}")
+    args.output_ply = os.path.abspath(args.output_ply)
+    output_parent = os.path.dirname(os.path.abspath(args.output_ply))
+    if output_parent:
+        os.makedirs(output_parent, exist_ok=True)
 
     # ------------------------------------------------------------------
     # Load file – expects DataFrame with at least x y z label
@@ -249,49 +262,81 @@ def main():
         print("ERROR: not enough wood points in 3 m slice to cluster; aborting.")
         sys.exit(1)
 
-    # Run HDBSCAN – we cluster in XY to avoid vertical spread
-    clusterer = hdbscan.HDBSCAN(min_cluster_size=512, min_samples=64, metric='euclidean')
-    cluster_labels = clusterer.fit_predict(slice_coords[:, :2])
-    unique_clusters = [c for c in np.unique(cluster_labels) if c >= 0]
-    if len(unique_clusters) == 0:
-        print("ERROR: HDBSCAN found no clusters; aborting.")
-        sys.exit(1)
-
-    if args.single_tree:
-        # Only use the largest cluster
-        cluster_sizes = [(cid, np.sum(cluster_labels == cid)) for cid in unique_clusters]
-        largest_cid = max(cluster_sizes, key=lambda x: x[1])[0]
-        cluster_indices = np.where(cluster_labels == largest_cid)[0]
-        cluster_slice_pts = slice_coords[cluster_indices]
-        slice_global_idx = np.where(wood_mask)[0][slice_mask][cluster_indices]
-        local_min_idx = cluster_slice_pts[:, 2].argmin()
-        base_idx = slice_global_idx[local_min_idx]
-        bases = [int(base_idx)]
-        print(f"--single-tree: Using only the largest cluster (size {len(cluster_indices)}) as the stem base.")
+    if args.simple_root:
+        slice_global_idx = np.where(wood_mask)[0][slice_mask]
+        local_min_idx = int(np.argmin(slice_coords[:, 2]))
+        base_idx = int(slice_global_idx[local_min_idx])
+        bases = [base_idx]
+        print("Using simple root mode: lowest wood point in the slice as the single source.")
     else:
-        bases = []
-        for cid in unique_clusters:
-            cluster_indices = np.where(cluster_labels == cid)[0]
+        # Cluster in XY to avoid vertical spread. Prefer HDBSCAN, but allow a
+        # DBSCAN fallback so pathlength generation still works without extra deps.
+        if hdbscan is not None:
+            clusterer = hdbscan.HDBSCAN(
+                min_cluster_size=args.cluster_min_size,
+                min_samples=args.cluster_min_samples,
+                metric='euclidean',
+            )
+            cluster_labels = clusterer.fit_predict(slice_coords[:, :2])
+        else:
+            print(
+                "hdbscan not installed; falling back to DBSCAN "
+                f"(eps={args.dbscan_eps}, min_samples={args.cluster_min_samples})."
+            )
+            clusterer = DBSCAN(
+                eps=args.dbscan_eps,
+                min_samples=args.cluster_min_samples,
+                metric='euclidean',
+                n_jobs=1,
+            )
+            cluster_labels = clusterer.fit_predict(slice_coords[:, :2])
+            if np.any(cluster_labels >= 0):
+                valid = cluster_labels >= 0
+                unique_labels, counts = np.unique(cluster_labels[valid], return_counts=True)
+                small = unique_labels[counts < args.cluster_min_size]
+                if small.size:
+                    cluster_labels[np.isin(cluster_labels, small)] = -1
+
+        unique_clusters = [c for c in np.unique(cluster_labels) if c >= 0]
+        if len(unique_clusters) == 0:
+            print("ERROR: HDBSCAN found no clusters; aborting.")
+            sys.exit(1)
+
+        if args.single_tree:
+            # Only use the largest cluster
+            cluster_sizes = [(cid, np.sum(cluster_labels == cid)) for cid in unique_clusters]
+            largest_cid = max(cluster_sizes, key=lambda x: x[1])[0]
+            cluster_indices = np.where(cluster_labels == largest_cid)[0]
             cluster_slice_pts = slice_coords[cluster_indices]
             slice_global_idx = np.where(wood_mask)[0][slice_mask][cluster_indices]
+            local_min_idx = cluster_slice_pts[:, 2].argmin()
+            base_idx = slice_global_idx[local_min_idx]
+            bases = [int(base_idx)]
+            print(f"--single-tree: Using only the largest cluster (size {len(cluster_indices)}) as the stem base.")
+        else:
+            bases = []
+            for cid in unique_clusters:
+                cluster_indices = np.where(cluster_labels == cid)[0]
+                cluster_slice_pts = slice_coords[cluster_indices]
+                slice_global_idx = np.where(wood_mask)[0][slice_mask][cluster_indices]
 
-            # 1. Find minimum z in cluster
-            min_z = cluster_slice_pts[:, 2].min()
-            # 2. Select all points within epsilon of min_z
-            epsilon = 0.05  # 5 cm
-            base_mask = np.abs(cluster_slice_pts[:, 2] - min_z) < epsilon
-            base_points = cluster_slice_pts[base_mask]
-            # 3. Compute mean or median x, y
-            base_x = np.median(base_points[:, 0])
-            base_y = np.median(base_points[:, 1])
-            # 4. Use min_z as z
-            base_z = min_z
-            # 5. Find the closest point in the original cloud to (base_x, base_y, base_z)
-            dists = np.linalg.norm(coords - np.array([base_x, base_y, base_z]), axis=1)
-            base_idx = np.argmin(dists)
-            bases.append(int(base_idx))
-        bases = np.unique(bases).tolist()
-        print(f"Detected {len(bases)} stem bases (tree roots) that will act as Dijkstra sources.")
+                # 1. Find minimum z in cluster
+                min_z = cluster_slice_pts[:, 2].min()
+                # 2. Select all points within epsilon of min_z
+                epsilon = 0.05  # 5 cm
+                base_mask = np.abs(cluster_slice_pts[:, 2] - min_z) < epsilon
+                base_points = cluster_slice_pts[base_mask]
+                # 3. Compute mean or median x, y
+                base_x = np.median(base_points[:, 0])
+                base_y = np.median(base_points[:, 1])
+                # 4. Use min_z as z
+                base_z = min_z
+                # 5. Find the closest point in the original cloud to (base_x, base_y, base_z)
+                dists = np.linalg.norm(coords - np.array([base_x, base_y, base_z]), axis=1)
+                base_idx = np.argmin(dists)
+                bases.append(int(base_idx))
+            bases = np.unique(bases).tolist()
+            print(f"Detected {len(bases)} stem bases (tree roots) that will act as Dijkstra sources.")
 
     # ------------------------------------------------------------------
     # Down-sample for grid build
@@ -348,10 +393,12 @@ def main():
     saved = False
     try:
         from src.io import save_file  # type: ignore
-        save_file(df, args.output_ply)
-        saved = True
-    except Exception:
-        pass
+        additional_fields = [c for c in df.columns if c not in ['x', 'y', 'z']]
+        save_file(args.output_ply, df, additional_fields=additional_fields)
+        saved = os.path.exists(args.output_ply)
+        print(f"save_file exists={saved} path={args.output_ply}")
+    except Exception as e:
+        print(f"save_file failed ({e}) – trying direct PLY writer.")
     if not saved:
         try:
             from plyfile import PlyData, PlyElement  # type: ignore
@@ -366,11 +413,16 @@ def main():
                 vertex[col] = df[col].values
             el = PlyElement.describe(vertex, 'vertex')
             PlyData([el], text=True).write(args.output_ply)
-            saved = True
+            saved = os.path.exists(args.output_ply)
+            print(f"plyfile exists={saved} path={args.output_ply}")
         except Exception as e:
             print("plyfile save failed (" + str(e) + ") – falling back to CSV.")
     if not saved:
         df.to_csv(args.output_ply, index=False)
+        saved = os.path.exists(args.output_ply)
+        print(f"csv exists={saved} path={args.output_ply}")
+    if not saved:
+        raise RuntimeError(f"Failed to write pathlength-enriched file: {args.output_ply}")
     print(f"Wrote pathlength-enriched file to {args.output_ply}")
 
 
