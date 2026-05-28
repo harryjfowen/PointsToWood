@@ -4,16 +4,15 @@ Semantic segmentation of forest 3D point clouds — classifies each point as woo
 
 ## Prerequisites
 
-- Python 3.10+
-- CUDA 12.8 (for GPU inference)
-- PyTorch 2.7.0 + PyTorch Geometric
+- Python 3.11+
+- CUDA 12.9 (for GPU inference)
+- PyTorch 2.8.0 + PyTorch Geometric
 
 ## Installation
 
 ```bash
-bash install_torch.sh
-source ~/venvs/coan/bin/activate
-pip install psutil laspy lazrs-python
+bash install.sh
+conda activate ptw
 ```
 
 ## Models
