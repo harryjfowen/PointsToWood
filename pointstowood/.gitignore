@@ -298,6 +298,7 @@ checkpoints_backup*/
 # Dev-only scripts
 eval_comparison.py
 .codex
+scripts/
 
 # Output artefacts
 reports/
