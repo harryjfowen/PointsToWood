@@ -62,10 +62,12 @@ Passing `--region` selects the corresponding distilled student model automatical
 ```
 --region finland|poland|spain  auto-select biome-specific student model
 --model h4mcc-eu.pth           override model checkpoint directly
+--thorough                     maximum accuracy: 8 overlap offsets, 4× z-TTA, dual-perspective
 --grid-size 2.0                voxel grid size in metres (auto-detected if omitted)
---fast                         quick preview mode (~2× faster, near-standard accuracy)
 --verbose                      print performance summary
 ```
+
+By default, inference runs at **standard quality**: two scales (multi-perspective), 2× z-rotation TTA, no overlap offsets. This is fast and accurate for most inputs. Add `--thorough` for the highest accuracy — it adds dense overlap offsets, more augmentation, and dual-perspective inference (reflectance + geometry), but is significantly slower.
 
 ### Training
 

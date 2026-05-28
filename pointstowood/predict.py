@@ -314,8 +314,9 @@ if __name__ == '__main__':
                         choices=['eu', 'finland', 'poland', 'spain'],
                         help='Biome region — auto-selects the distilled student model (finland/poland/spain) '
                              'or EU teacher (eu, default).')
-    parser.add_argument('--fast', action='store_true',
-                        help='Fast mode: two scales, 2× z-TTA, no overlap (~2× faster, near-standard accuracy).')
+    parser.add_argument('--thorough', action='store_true',
+                        help='Thorough mode: two scales, 8 overlap offsets per scale, 4× z-TTA, dual-perspective '
+                             '(reflectance + geometry). Significantly slower but maximum accuracy.')
     parser.add_argument('--auto-threshold', action='store_true',
                         help='Adaptive wood threshold: fits a 2-component GMM to the per-scene '
                              'pwood distribution and thresholds at the Bayesian crossover. '
@@ -327,7 +328,7 @@ if __name__ == '__main__':
 
     adv = parser.add_argument_group('advanced')
     adv.add_argument('--inference-level', type=int, default=2, choices=[1, 2, 3, 4],
-                     help='1=single scale no overlap, 2=two scales 4 overlaps (default), '
+                     help='1=single scale no overlap, 2=two scales no overlap (default), '
                           '3=two scales 8 overlaps, 4=level 3 + dual-perspective.')
     adv.add_argument('--tta', type=int, default=2, choices=[1, 2, 4, 8],
                      help='Test-time augmentation: N z-axis yaw rotations (default 2).')
@@ -379,9 +380,9 @@ if __name__ == '__main__':
         else:
             args.model = f'h4mcc-{region}.pth'
 
-    if args.fast:
-        args.inference_level = 2
-        args.tta = 2
+    if args.thorough:
+        args.inference_level = 4
+        args.tta = 4
     grid_size_user_provided = args.grid_size is not None
     collect_grid_user_provided = args.collect_grid_size is not None
     resolution_user_provided = args.resolution is not None and float(args.resolution) > 0.0
@@ -463,25 +464,20 @@ if __name__ == '__main__':
         if not grid_size_user_provided and inference_level >= 2:
             base = args.grid_size[0]
             args.grid_size = [base, base * 2.0]
-        overlap_offsets = {1: 0, 2: 4, 3: 8, 4: 8}[inference_level]
-        if args.fast:
-            overlap_offsets = 0
+        overlap_offsets = {1: 0, 2: 0, 3: 8, 4: 8}[inference_level]
         args.overlap = overlap_offsets
         inference_labels = {
             1: "single scale",
-            2: "standard",
-            3: "best quality",
-            4: "best quality + dual perspective",
+            2: "standard (2-scale, TTA2, no overlap)",
+            3: "thorough (2-scale, 8 overlaps, TTA4)",
+            4: "thorough + dual-perspective",
         }
         args.dual_perspective = bool(inference_level >= 4 and not args.no_refl)
 
         if not collect_grid_user_provided:
             auto_collect, _ = _auto_collect_grid_size_m(args.resolution, args.grid_size)
             args.collect_grid_size = auto_collect
-        if args.fast:
-            _print_item("Inference", "fast (2-scale, TTA2, no overlap)")
-        else:
-            _print_item("Inference", f"level {inference_level} ({inference_labels[inference_level]})")
+        _print_item("Inference", f"level {inference_level} ({inference_labels[inference_level]})")
         _print_item("Point res.", _format_point_resolution_choice(args.resolution, resolution_user_provided, auto_meta, args.grid_size))
         _print_item("Grid size", _format_grid_choice(args.grid_size, grid_size_user_provided, auto_meta))
         _print_item("Overlap", f"{overlap_offsets} offsets per scale")
