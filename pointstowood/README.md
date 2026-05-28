@@ -100,4 +100,6 @@ MCC is preferred over F1 because it accounts for both wood and leaf errors — F
 
 ## License
 
-[LICENSE]
+[Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)](LICENSE)
+
+Free for academic research, personal use, and non-commercial applications. Commercial use is prohibited without explicit permission from the authors.
