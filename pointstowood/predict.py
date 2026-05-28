@@ -308,8 +308,12 @@ if __name__ == '__main__':
                     'Run without flags for standard quality, add --fast for a quick preview.')
     parser.add_argument('--point-cloud', '-p', required=True, nargs='+', type=str,
                         help='One or more input point cloud files.')
-    parser.add_argument('--model', type=str, default='h4mcc-eu.pth',
-                        help='Model checkpoint name inside pointstowood/model (default: h4mcc-eu.pth)')
+    parser.add_argument('--model', type=str, default=None,
+                        help='Model checkpoint name inside pointstowood/model. If omitted, resolved from --region.')
+    parser.add_argument('--region', type=str, default=None,
+                        choices=['eu', 'finland', 'poland', 'spain'],
+                        help='Biome region — auto-selects the distilled student model (finland/poland/spain) '
+                             'or EU teacher (eu, default).')
     parser.add_argument('--fast', action='store_true',
                         help='Fast mode: two scales, 2× z-TTA, no overlap (~2× faster, near-standard accuracy).')
     parser.add_argument('--auto-threshold', action='store_true',
@@ -366,6 +370,14 @@ if __name__ == '__main__':
                      help='Write voxels to disk on demand (slower but lower RAM for very large clouds).')
 
     args = parser.parse_args()
+
+    # Resolve model from --region if --model not explicitly provided
+    if args.model is None:
+        region = args.region or 'eu'
+        if region == 'eu':
+            args.model = 'h4mcc-eu.pth'
+        else:
+            args.model = f'h4mcc-{region}.pth'
 
     if args.fast:
         args.inference_level = 2
