@@ -86,6 +86,19 @@ python distill.py --region spain --teacher-model h4mcc-eu.pth
 
 The student uses a lighter architecture (NetLight: C=16, K=8, 1-2-1 block pattern) vs the teacher (NetFull: C=128, K=16, 2-4-2 block pattern), making it ~20× smaller with minimal accuracy loss on in-distribution data.
 
+## Evaluation metric
+
+Models are selected and compared using **H4MCC** — the harmonic mean of Matthews Correlation Coefficient (MCC) across four conditions:
+
+| Condition | Description |
+|-----------|-------------|
+| Pure + reflectance | Unambiguous voxels, full sensor data |
+| Edge + reflectance | Wood/leaf boundary voxels, full sensor data |
+| Pure + geometry | Unambiguous voxels, XYZ only |
+| Edge + geometry | Wood/leaf boundary voxels, XYZ only |
+
+MCC is preferred over F1 because it accounts for both wood and leaf errors — F1 ignores true negatives and can appear high even when leaf classification is poor. The harmonic mean across all four conditions means a model must perform well in every setting: strong reflectance performance cannot mask failure on geometry-only inputs, and easy voxels cannot hide poor boundary classification.
+
 ## License
 
 [LICENSE]
