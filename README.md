@@ -8,6 +8,10 @@
 
 ---
 
+**[Project Page](https://harryjfowen.github.io/PointsToWood)** &nbsp;·&nbsp; **[GitHub](https://github.com/harryjfowen/PointsToWood)**
+
+---
+
 ### Paper
 
 > **PointsToWood: Reflectance-Modulated Anisotropic Convolutions for Leaf-Wood Segmentation Across Diverse Forest TLS Data**
