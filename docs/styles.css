@@ -77,7 +77,6 @@ h1 {
   width: 100%;
   overflow: hidden;
   border-radius: var(--radius);
-  border: 1px solid var(--border);
   cursor: col-resize;
   user-select: none;
   line-height: 0;
