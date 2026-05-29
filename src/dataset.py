@@ -1646,7 +1646,7 @@ def create_inference_loader(args, device):
         }
         if num_workers > 0:
             loader_kwargs['prefetch_factor'] = 4
-            loader_kwargs['persistent_workers'] = False
+            loader_kwargs['persistent_workers'] = True
         test_loader = DataLoader(**loader_kwargs)
     else:
         # Traditional fixed batch size
@@ -1671,7 +1671,7 @@ def create_inference_loader(args, device):
         }
         if num_workers > 0:
             loader_kwargs['prefetch_factor'] = 4
-            loader_kwargs['persistent_workers'] = False
+            loader_kwargs['persistent_workers'] = True
         test_loader = DataLoader(**loader_kwargs)
 
     return test_loader, test_dataset 

@@ -505,24 +505,19 @@ def load_inference_model(args, device=None):
     _REF_PARAMS = 20_000_000
     if getattr(args, 'batch_size', 0) == 0 and getattr(args, 'max_points_per_batch', _DEFAULT_MAX_PTS) == _DEFAULT_MAX_PTS:
         _scale = min(_REF_PARAMS / max(param_count, 100_000), 8.0)
-        if _scale > 1.05:
-            args.max_points_per_batch = int(_DEFAULT_MAX_PTS * _scale)
+        args.max_points_per_batch = int(_DEFAULT_MAX_PTS * _scale)
 
     model.eval()
-
-    if torch.cuda.is_available() and hasattr(torch, 'compile'):
-        try:
-            cap = torch.cuda.get_device_capability()
-            if cap[0] >= 7:
-                model = torch.compile(model, mode='reduce-overhead')
-        except Exception:
-            pass
-
     return model
 
 
 def SemanticSegmentation(args, model=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    if device.type == 'cuda':
+        torch.set_float32_matmul_precision('high')
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     if model is None:
         model = load_inference_model(args, device)
