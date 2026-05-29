@@ -185,4 +185,4 @@ Free for academic research, personal use, and non-commercial applications. Comme
 
 <sub>Van den Broeck, W.A.J., Terryn, L. and Calders, K. Leaf-wood annotated tropical tree point clouds from terrestrial laser scanning. [Dataset]. Associated publication: Van den Broeck et al. (2025). https://doi.org/10.1016/j.isprsjprs.2025.06.023</sub>
 
-<sub>Ali, M., Biswas, A., Iglseder, A., Kumar, V., Kumar, S., Gupta, S., Hollaus, M., Pfeifer, N. and Lohani, B. (2026). Terrestrial and Airborne Laser Scanning Dataset of Trees in the Shivalik Range, India with Field Measurements and Leaf–Wood Classifications. Scientific Data, 13, 420.</sub>
+<sub>Ali, M., Biswas, A., Iglseder, A., Kumar, V., Kumar, S., Gupta, S., Hollaus, M., Pfeifer, N. and Lohani, B. (2026). Terrestrial and Airborne Laser Scanning Dataset of Trees in the Shivalik Range, India with Field Measurements and Leaf–Wood Classifications. Scientific Data, 13, Article 420.</sub>
