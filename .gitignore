@@ -114,6 +114,7 @@ dmypy.json
 
 # Image files outside of images folder
 /*.png
+!docs/*.png
 /*.jpg
 /*.jpeg
 pointstowood/*.png
