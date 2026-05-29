@@ -54,21 +54,26 @@ git lfs pull
 
 | File | Description |
 |---|---|
-| `model/h4mcc-eu.pth` | EU teacher model (default) |
-| `model/h4mcc-finland.pth` | Distilled — Finnish forest |
-| `model/h4mcc-poland.pth` | Distilled — Polish forest |
-| `model/h4mcc-spain.pth` | Distilled — Spanish forest |
+| `model/h4mcc-eu.pth` | EU teacher model (default, ~20M params) |
+| `model/h4mcc-finland.pth` | Distilled — Finnish forest (~1M params) |
+| `model/h4mcc-poland.pth` | Distilled — Polish forest (~1M params) |
+| `model/h4mcc-spain.pth` | Distilled — Spanish forest (~1M params) |
 
 ---
 
 ## Inference
 
 ```bash
-# Default (EU teacher, adaptive settings)
+# Default (EU teacher, standard quality)
 python predict.py --point-cloud your_plot.ply
 
-# Biome-specific model
-python predict.py --point-cloud your_plot.ply --model h4mcc-finland.pth
+# Biome-specific model (auto-selected by region)
+python predict.py --point-cloud your_plot.ply --region finland
+python predict.py --point-cloud your_plot.ply --region poland
+python predict.py --point-cloud your_plot.ply --region spain
+
+# Maximum accuracy
+python predict.py --point-cloud your_plot.ply --thorough
 
 # Geometry only (no reflectance)
 python predict.py --point-cloud your_plot.ply --no-refl
@@ -77,11 +82,13 @@ python predict.py --point-cloud your_plot.ply --no-refl
 Key options:
 
 ```
---model h4mcc-eu.pth     model checkpoint in pointstowood/model/ (default: h4mcc-eu.pth)
---inference-level 2      1=fast/single-scale, 2=default, 3=thorough, 4=maximum
---tta 2                  test-time augmentation: N z-axis rotations (default 2)
---any-wood 0.5           wood if any point in voxel exceeds threshold (higher recall)
+--region finland|poland|spain   auto-select distilled biome model
+--thorough                      maximum accuracy: 8 overlap offsets, 4× TTA, dual-perspective
+--any-wood 0.5                  wood if any point in voxel exceeds threshold (higher recall)
+--no-refl                       geometry-only mode (zeros out reflectance channel)
 ```
+
+By default, inference runs at standard quality: two scales (multi-perspective), 2× z-rotation TTA, no overlap offsets. Add `--thorough` for the highest accuracy — dense overlap, more augmentation, and dual-perspective inference — at significantly higher compute cost.
 
 ---
 
@@ -114,7 +121,7 @@ python train.py --region fin --preprocess --device cuda
 Distil a lightweight biome-specific student from the EU teacher:
 
 ```bash
-python distill.py --region fin --preprocess --teacher-model eu.pth
+python distill.py --region fin --preprocess --teacher-model h4mcc-eu.pth
 ```
 
 ---
@@ -127,7 +134,20 @@ Supervision uses a multi-scale contrastive boundary loss at every encoder stage 
 
 Student models use the same architecture compressed by channel width and block depth, trained via knowledge distillation from the teacher.
 
-**Save criterion — H4-MCC:** harmonic mean of MCC across four conditions (pure/edge × with/without reflectance). Penalises any weak condition disproportionately.
+---
+
+## Evaluation Metric — H4-MCC
+
+Models are selected and compared using **H4-MCC**: the harmonic mean of Matthews Correlation Coefficient (MCC) across four conditions:
+
+| Condition | Description |
+|---|---|
+| Pure + reflectance | Unambiguous voxels, full sensor data |
+| Edge + reflectance | Wood/leaf boundary voxels, full sensor data |
+| Pure + geometry | Unambiguous voxels, XYZ only |
+| Edge + geometry | Wood/leaf boundary voxels, XYZ only |
+
+MCC is preferred over F1 because it accounts for both wood and leaf errors — F1 ignores true negatives and can appear high even when leaf classification is poor. The harmonic mean across all four conditions means a model must perform well in every setting: strong reflectance performance cannot mask failure on geometry-only inputs, and easy voxels cannot hide poor boundary classification.
 
 ---
 
@@ -138,6 +158,14 @@ Student models use the same architecture compressed by channel width and block d
 | `eu` | All European prefixes |
 | `global` | All files in pool |
 | `fin` / `spa` / `pol` / ... | That prefix only |
+
+---
+
+## License
+
+[Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)](LICENSE)
+
+Free for academic research, personal use, and non-commercial applications. Commercial use is prohibited without explicit permission from the authors.
 
 ---
 
