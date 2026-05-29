@@ -11,7 +11,7 @@
 ### Paper
 
 > **PointsToWood: Reflectance-Modulated Anisotropic Convolutions for Leaf-Wood Segmentation Across Diverse Forest TLS Data**
-> Owen, H. J. F., Allen, M. J. A., Grieve, S. W. D., Wilkes, P., Lines, E. R. *(under review)*
+> Owen, H. J. F., Allen, M. J. A., Grieve, S. W. D., Wilkes, P., Flynn, W. R. M., Lines, E. R. *(under review)*
 
 For the implementation described in the preprint, see the `version1.0-paper` branch.
 
