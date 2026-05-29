@@ -13,7 +13,6 @@ from src.preprocessing import preprocess
 from src.io import load_file
 from src.utils import preprocess_point_cloud_data
 import sys
-import re
 
 
 def dir_path(string):
@@ -22,16 +21,9 @@ def dir_path(string):
     else:
         raise NotADirectoryError(string)
 
-def get_path(location_in_pointstowood: str = "") -> str:
-    current_wdir = os.getcwd()
-    match = re.search(r'PointsToWood.*?pointstowood', current_wdir, re.IGNORECASE)
-    if not match:
-        raise ValueError('"PointsToWood/pointstowood" not found in the current working directory path')
-    last_index = match.end()
-    output_path = current_wdir[:last_index]
-    if location_in_pointstowood:
-        output_path = os.path.join(output_path, location_in_pointstowood)
-    return output_path.replace("\\", "/")
+def get_path(location: str = "") -> str:
+    base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, location).replace("\\", "/") if location else base
 
 if __name__ == '__main__':
 
