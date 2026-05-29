@@ -9,7 +9,7 @@
   --accent: #e05c2a;
   --code-bg: #f4f4f5;
   --radius: 10px;
-  --max: 860px;
+  --max: 1400px;
 }
 
 html { font-size: 16px; scroll-behavior: smooth; }
