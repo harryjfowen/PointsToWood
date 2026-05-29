@@ -181,6 +181,8 @@ Free for academic research, personal use, and non-commercial applications. Comme
 
 <sub>Owen, H. J. F., Lines, E., & Grieve, S. (2024). Plot-level semantically labelled terrestrial laser scanning point clouds (1.0). Zenodo. https://doi.org/10.5281/zenodo.13268500.</sub>
 
-<sub>Van den Broeck, W.A.J., Terryn, L., Chen, S., Cherlet, W., Cooper, Z. T., & Calders, K. (2025). Pointwise deep learning for leaf-wood segmentation of tropical tree point clouds from terrestrial laser scanning. ISPRS Journal of Photogrammetry and Remote Sensing, 227, 366-382. https://doi.org/10.1016/j.isprsjprs.2025.06.023</sub>
+<sub>Van den Broeck, W.A.J., Terryn, L., Chen, S., Cherlet, W., Cooper, Z.T. and Calders, K. (2025). Pointwise deep learning for leaf-wood segmentation of tropical tree point clouds from terrestrial laser scanning. ISPRS Journal of Photogrammetry and Remote Sensing, 227, pp.366–382. https://doi.org/10.1016/j.isprsjprs.2025.06.023</sub>
 
-<sub>Ali, M., Biswas, A., Iglseder, A., Kumar, V., Kumar, S., Gupta, S., Hollaus, M., Pfeifer, N., & Lohani, B. (2026). Terrestrial and Airborne Laser Scanning Dataset of Trees in the Shivalik Range, India with Field Measurements and Leaf–Wood Classifications. Scientific Data, 13, 420. https://doi.org/10.1038/s41597-026-00420-x</sub>
+<sub>Van den Broeck, W.A.J., Terryn, L. and Calders, K. Leaf-wood annotated tropical tree point clouds from terrestrial laser scanning. [Dataset].</sub>
+
+<sub>Ali, M., Biswas, A., Iglseder, A., Kumar, V., Kumar, S., Gupta, S., Hollaus, M., Pfeifer, N. and Lohani, B. (2026). Terrestrial and Airborne Laser Scanning Dataset of Trees in the Shivalik Range, India with Field Measurements and Leaf–Wood Classifications. Scientific Data, 13, 420.</sub>
