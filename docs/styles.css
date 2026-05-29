@@ -39,7 +39,7 @@ nav {
   align-items: center;
   justify-content: space-between;
 }
-.nav-title { font-weight: 700; font-size: 1rem; letter-spacing: -0.01em; }
+.nav-title { font-weight: 700; font-size: 1.4rem; letter-spacing: -0.02em; }
 .nav-links { display: flex; gap: 1.5rem; }
 .nav-links a { color: var(--muted); text-decoration: none; font-size: 0.9rem; transition: color 0.15s; }
 .nav-links a:hover { color: var(--text); }
