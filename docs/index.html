@@ -1,61 +1,103 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>PointsToWood Viewer</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Chivo:wght@400;600;700&family=IBM+Plex+Mono:wght@400;600&display=swap"
-      rel="stylesheet"
-    />
-    <link rel="stylesheet" href="./styles.css" />
-  </head>
-  <body>
-    <div class="bg-glow bg-glow-a"></div>
-    <div class="bg-glow bg-glow-b"></div>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PointsToWood</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
 
-    <main class="layout">
-      <section class="panel">
-        <p class="kicker">PointsToWood</p>
-        <h1>Leaf vs Wood Point Cloud</h1>
-        <p class="subtitle">
-          Rotate with mouse. Scroll to zoom. Slider maps <code>prediction</code>
-          to leaf/wood.
-        </p>
+  <header>
+    <nav>
+      <span class="nav-title">PointsToWood</span>
+      <div class="nav-links">
+        <a href="https://github.com/harryjfowen/PointsToWood" target="_blank">GitHub</a>
+        <a href="https://github.com/harryjfowen/PointsToWood/tree/version1.0-paper" target="_blank">Paper Branch</a>
+      </div>
+    </nav>
+  </header>
 
-        <label class="field" for="threshold">
-          <span>Leaf / Wood Threshold</span>
-          <span id="threshold-value">0.50</span>
-        </label>
-        <input id="threshold" type="range" min="0" max="1" step="0.01" value="0.5" />
+  <main>
 
-        <label class="field" for="softness">
-          <span>Blend Softness</span>
-          <span id="softness-value">0.05</span>
-        </label>
-        <input id="softness" type="range" min="0" max="0.2" step="0.005" value="0.05" />
+    <section class="hero">
+      <p class="kicker">Wood-leaf semantic segmentation of TLS forest point clouds</p>
+      <h1>Reflectance-Modulated Anisotropic Convolutions for Leaf-Wood Segmentation Across Diverse Forest TLS Data</h1>
+      <p class="authors">Owen, H. J. F. &nbsp;·&nbsp; Allen, M. J. A. &nbsp;·&nbsp; Grieve, S. W. D. &nbsp;·&nbsp; Wilkes, P. &nbsp;·&nbsp; Lines, E. R.</p>
+      <p class="status"><em>Under review</em></p>
+    </section>
 
-        <label class="field" for="point-size">
-          <span>Point Size</span>
-          <span id="point-size-value">2.2</span>
-        </label>
-        <input id="point-size" type="range" min="0.6" max="6" step="0.1" value="2.2" />
-
-        <div class="meta">
-          <div><strong id="sample-count">-</strong> points rendered</div>
-          <div><strong id="split-count">-</strong></div>
-          <div id="source-file">loading source...</div>
+    <section class="slider-section">
+      <p class="slider-label">Drag to reveal wood classification</p>
+      <div class="slider-container" id="slider">
+        <img class="img-before" src="../images/webpage-ptw.png" alt="Raw point cloud" draggable="false" />
+        <div class="img-after-wrap">
+          <img class="img-after" src="../images/webpage-ptw-wood.png" alt="Wood classification" draggable="false" />
         </div>
-      </section>
+        <div class="slider-handle" id="handle">
+          <div class="handle-line"></div>
+          <div class="handle-circle">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <polyline points="15 18 9 12 15 6"></polyline>
+            </svg>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <polyline points="9 18 15 12 9 6"></polyline>
+            </svg>
+          </div>
+          <div class="handle-line"></div>
+        </div>
+        <span class="img-tag tag-left">Raw cloud</span>
+        <span class="img-tag tag-right">Wood only</span>
+      </div>
+    </section>
 
-      <section class="viewer">
-        <div id="status" class="status">Loading point cloud…</div>
-        <canvas id="scene"></canvas>
-      </section>
-    </main>
+    <section class="cards">
+      <div class="card">
+        <h3>Reflectance-modulated convolution</h3>
+        <p>LiDAR return intensity acts as a spatial modulator — weighting geometric neighbourhood contributions by material properties rather than as a flat input feature. Falls back gracefully to geometry when reflectance is absent.</p>
+      </div>
+      <div class="card">
+        <h3>Biome-specific distillation</h3>
+        <p>Lightweight student models (~1M params) distilled from the EU teacher (~20M params) for Finnish, Polish, and Spanish forests. Auto-selected with <code>--region</code>. Same architecture, 20× smaller.</p>
+      </div>
+      <div class="card">
+        <h3>H4-MCC evaluation</h3>
+        <p>Models are ranked by the harmonic mean of MCC across four conditions — pure/edge voxels × with/without reflectance. A model must perform well in every setting to score well.</p>
+      </div>
+    </section>
 
-    <script type="module" src="./app.js"></script>
-  </body>
+    <section class="install">
+      <h2>Quick start</h2>
+      <pre><code>git clone https://github.com/harryjfowen/PointsToWood
+cd PointsToWood
+bash install.sh &amp;&amp; conda activate ptw
+python predict.py --point-cloud your_plot.ply</code></pre>
+      <p>Output: <code>your_plot_p2w.ply</code> with per-point <code>prediction</code> (0 = leaf, 1 = wood) and <code>pwood</code> probability columns.</p>
+    </section>
+
+    <section class="models">
+      <h2>Pre-trained models</h2>
+      <table>
+        <thead>
+          <tr><th>Model</th><th>Region</th><th>Params</th><th>Flag</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>h4mcc-eu.pth</code></td><td>Pan-European (default)</td><td>~20M</td><td>—</td></tr>
+          <tr><td><code>h4mcc-finland.pth</code></td><td>Finnish forest</td><td>~1M</td><td><code>--region finland</code></td></tr>
+          <tr><td><code>h4mcc-poland.pth</code></td><td>Polish forest</td><td>~1M</td><td><code>--region poland</code></td></tr>
+          <tr><td><code>h4mcc-spain.pth</code></td><td>Spanish forest</td><td>~1M</td><td><code>--region spain</code></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+  </main>
+
+  <footer>
+    <p>CC BY-NC 4.0 &nbsp;·&nbsp; <a href="https://github.com/harryjfowen/PointsToWood" target="_blank">GitHub</a></p>
+  </footer>
+
+  <script src="slider.js"></script>
+</body>
 </html>
