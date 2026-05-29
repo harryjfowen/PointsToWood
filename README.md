@@ -1,7 +1,7 @@
 
-# PointsToWood
+# Reflectance-Modulated Anisotropic Convolutions for Leaf-Wood Segmentation Across Diverse Forest TLS Data
 
-Wood-leaf semantic segmentation of TLS forest point clouds.
+**PointsToWood** — wood-leaf semantic segmentation of TLS forest point clouds.
 
 ![Probability of wood predicted by our model from blue to red](images/our_tropical.png)
 <sub>Probability of wood (blue = low, red = high). Data: Wang et al., 2021.</sub>
