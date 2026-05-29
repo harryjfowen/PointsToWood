@@ -19,7 +19,15 @@ Thumbs.db
 
 # Ignore the data folder
 /data/
-pointstowood/instance_all.py
+pointstowood/
+
+# Model files — only the four deployed models tracked via LFS
+*.pth
+!model/h4mcc-eu.pth
+!model/h4mcc-finland.pth
+!model/h4mcc-poland.pth
+!model/h4mcc-spain.pth
+*.csv
 
 # Ignore any archived or data folder in subdirectories
 **/archive/
