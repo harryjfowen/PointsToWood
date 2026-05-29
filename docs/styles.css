@@ -34,7 +34,7 @@ header {
 nav {
   max-width: var(--max);
   margin: 0 auto;
-  padding: 0.9rem 1.5rem;
+  padding: 0.9rem 3rem;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -45,7 +45,7 @@ nav {
 .nav-links a:hover { color: var(--text); }
 
 /* HERO */
-main { max-width: var(--max); margin: 0 auto; padding: 0 1.5rem 4rem; }
+main { max-width: var(--max); margin: 0 auto; padding: 0 3rem 4rem; }
 
 .hero { padding: 4rem 0 2.5rem; text-align: center; }
 .kicker {
