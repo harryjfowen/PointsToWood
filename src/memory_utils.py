@@ -78,7 +78,7 @@ def clear_gpu_memory():
         torch.cuda.empty_cache()
 
 
-def should_use_cpu_preprocessing(point_count, has_reflectance=True, grid_sizes=[1.0, 2.0, 4.0], threshold=0.8):
+def should_use_cpu_preprocessing(point_count, has_reflectance=True, grid_sizes=[1.0, 2.0, 4.0], threshold=0.6):
     """
     Determine whether to use CPU or GPU for preprocessing based on memory requirements.
 
@@ -86,7 +86,7 @@ def should_use_cpu_preprocessing(point_count, has_reflectance=True, grid_sizes=[
         point_count (int): Number of points in the point cloud
         has_reflectance (bool): Whether reflectance data is present
         grid_sizes (list): List of grid sizes for voxelization
-        threshold (float): GPU memory usage threshold (0.8 = 80%)
+        threshold (float): GPU memory usage threshold (0.6 = 60%)
 
     Returns:
         tuple: (use_cpu: bool, estimated_gb: float, available_gb: float)

@@ -17,7 +17,6 @@ from src.io import load_file
 from src.utils import configure_threads
 from src.memory_utils import format_memory_info
 import psutil
-import gc
 
 
 def _z_quantile_edges(z: np.ndarray, bins: int) -> np.ndarray:
@@ -481,10 +480,6 @@ if __name__ == '__main__':
 
         _print_heading("Preprocessing")
 
-        # Avoid per-cloud empty_cache: it purges the allocator pool and forces
-        # the next batch to re-alloc from scratch. Trust the caching allocator.
-        gc.collect()
-
         if args.verbose:
             point_count = len(args.pc)
             memory_info = format_memory_info(point_count, args.reflectance, args.grid_size, args.resolution)
@@ -502,8 +497,6 @@ if __name__ == '__main__':
         total_pre_time += preprocessing_stats['duration']
         
         _print_heading("Inference")
-
-        gc.collect()
 
         inference_tracker = PerformanceTracker("Inference")
         SemanticSegmentation(args, model=_inference_model)

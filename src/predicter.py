@@ -509,6 +509,15 @@ def load_inference_model(args, device=None):
             args.max_points_per_batch = int(_DEFAULT_MAX_PTS * _scale)
 
     model.eval()
+
+    if torch.cuda.is_available() and hasattr(torch, 'compile'):
+        try:
+            cap = torch.cuda.get_device_capability()
+            if cap[0] >= 7:
+                model = torch.compile(model, mode='reduce-overhead')
+        except Exception:
+            pass
+
     return model
 
 
@@ -571,8 +580,14 @@ def SemanticSegmentation(args, model=None):
 
     for pass_desc, zero_refl, theta in passes:
         print()
-        # Precompute rotation matrix on the correct device/dtype lazily per pass.
+        # Precompute rotation matrix once per TTA pass (not per batch).
         rotate = abs(theta) > 1e-9
+        if rotate:
+            c, s = math.cos(theta), math.sin(theta)
+            R = torch.tensor(
+                [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]],
+                dtype=torch.float32,
+            ).to(device)
         with tqdm(total=len(test_loader), colour='white', ascii="▒█", bar_format='{l_bar}{bar:20}{r_bar}{bar:-20b}', desc=_tqdm_label(pass_desc)) as pbar:
             for batch_idx, data in enumerate(test_loader):
                 data = data.to(device, non_blocking=True)
@@ -589,13 +604,9 @@ def SemanticSegmentation(args, model=None):
                 # coords so global position (local_shift + xyz) stays correct.
                 if rotate:
                     orig_xyz = data.pos[:, :3].clone()
-                    c, s = math.cos(theta), math.sin(theta)
-                    R = torch.tensor(
-                        [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]],
-                        dtype=data.pos.dtype, device=data.pos.device,
-                    )
+                    R_typed = R.to(dtype=data.pos.dtype)
                     # Rotate x,y in place; z is preserved by R (gravity-aware).
-                    data.pos = torch.cat([orig_xyz @ R.T, data.pos[:, 3:]], dim=1) if data.pos.size(1) > 3 else orig_xyz @ R.T
+                    data.pos = torch.cat([orig_xyz @ R_typed.T, data.pos[:, 3:]], dim=1) if data.pos.size(1) > 3 else orig_xyz @ R_typed.T
                 else:
                     orig_xyz = None
 

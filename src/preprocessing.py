@@ -153,7 +153,13 @@ class Voxelise:
                 device = 'cuda'
                 print(f"  Device       GPU (~{estimated_gpu_mem:.1f} GB estimated)")
 
-            self.pos = torch.tensor(self.pos.values, dtype=torch.float).to(device=device)
+            self.pos = torch.tensor(self.pos.values, dtype=torch.float)
+            # Normalize reflectance on CPU before device transfer to avoid an
+            # unnecessary GPU allocation for the normalization pass.
+            reflectance_not_zero = self.pos.shape[1] > 3 and not torch.all(self.pos[:, 3] == 0)
+            if reflectance_not_zero:
+                self.pos[:, 3] = quantile_normalize_reflectance(self.pos[:, 3])
+            self.pos = self.pos.to(device=device)
 
         if self.file_prefix:
             file_counter = len(glob.glob(os.path.join(self.vxpath, f'{self.file_prefix}_voxel_*.pt')))
@@ -203,11 +209,6 @@ class Voxelise:
         num_offsets = int(self.overlap)
         original_pos = self.pos.clone()
 
-        # Normalize reflectance once upfront
-        reflectance_not_zero = original_pos.shape[1] > 3 and not torch.all(original_pos[:, 3] == 0)
-        if reflectance_not_zero:
-            original_pos[:, 3] = quantile_normalize_reflectance(original_pos[:, 3])
-
         kept_points_first = None
         written_points_total = 0
         all_prepared = list(prior_entries) if prior_entries else []
@@ -233,7 +234,7 @@ class Voxelise:
             if self.pos.device.type == 'cpu':
                 pos_cpu = self.pos.detach()
             else:
-                pos_cpu = self.pos.detach().clone().to('cpu')
+                pos_cpu = self.pos.detach().cpu()
 
             kept_points = int(self.pos.size(0))
             if kept_points_first is None:
@@ -259,11 +260,6 @@ class Voxelise:
         """Write voxels using multiple grid resolutions (original behavior)."""
         original_pos = self.pos.clone()
 
-        # Normalize reflectance once upfront on full cloud (before downsampling for any grid size)
-        reflectance_not_zero = original_pos.shape[1] > 3 and not torch.all(original_pos[:, 3] == 0)
-        if reflectance_not_zero:
-            original_pos[:, 3] = quantile_normalize_reflectance(original_pos[:, 3])
-
         kept_points_first = None
         written_points_total = 0
         all_prepared = list(prior_entries) if prior_entries else []
@@ -284,7 +280,7 @@ class Voxelise:
             if self.pos.device.type == 'cpu':
                 pos_cpu = self.pos.detach()
             else:
-                pos_cpu = self.pos.detach().clone().to('cpu')
+                pos_cpu = self.pos.detach().cpu()
 
             if kept_points_first is None:
                 kept_points_first = int(self.pos.size(0))
