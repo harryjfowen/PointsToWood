@@ -1,4 +1,0 @@
-model/h4mcc-eu.pth filter=lfs diff=lfs merge=lfs -text
-model/h4mcc-finland.pth filter=lfs diff=lfs merge=lfs -text
-model/h4mcc-poland.pth filter=lfs diff=lfs merge=lfs -text
-model/h4mcc-spain.pth filter=lfs diff=lfs merge=lfs -text
