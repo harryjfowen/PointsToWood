@@ -64,8 +64,18 @@ if __name__ == '__main__':
                             help='Disable per-voxel EMA difficulty mining and adaptive group sampling')
         parser.add_argument('--overlap', type=int, default=0,
                             help='Additional shifted grid origins when writing training voxels (0=none, max 8). Requires re-preprocessing.')
+        parser.add_argument('--num-kernel-points', type=int, nargs='+', default=[16, 16, 16],
+                            help='Kernel points per SA stage: one value or three for SA1 SA2 SA3 (default: 16 16 16)')
+        parser.add_argument('--epoch-steps', type=int, default=0,
+                            help='Max training steps per epoch (0 = full pass)')
+        parser.add_argument('--max-points', dest='max_pts', type=int, default=None,
+                            help='Max points per voxel before training. Defaults to --max-points-per-batch.')
 
         # ── Loss / training quality ───────────────────────────────────────────
+        parser.add_argument('--ema', action='store_true', default=False,
+                            help='Enable exponential moving average of model weights')
+        parser.add_argument('--ema-decay', type=float, default=0.999,
+                            help='EMA decay factor (default: 0.999)')
         parser.add_argument('--refl-fp-penalty', type=float, default=0.40,
                             help='False-positive penalty weight (leaf predicted as wood) (default: 0.40)')
         parser.add_argument('--contrastive-weight', type=float, default=0.1,
