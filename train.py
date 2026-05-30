@@ -27,95 +27,51 @@ def get_path(location: str = "") -> str:
 
 if __name__ == '__main__':
 
-        parser = argparse.ArgumentParser()
+        parser = argparse.ArgumentParser(description='PointsToWood training')
 
-        parser.add_argument('--device', type=str, default='cuda', help='"cuda" or "cpu"')
-        parser.add_argument('--region', type=str, default='eu', help='Data region (e.g. eu, spain, germany, global)')
-        parser.add_argument('--num-epochs', default=180, type=int, metavar='N', help='Number of total epochs to run')
-        parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate (max_lr in OneCycleLR)')
-        parser.add_argument('--model', type=str, default=None, help='Model filename (e.g. model.pth)')
+        # ── Core ──────────────────────────────────────────────────────────────
+        parser.add_argument('--region', type=str, default='eu',
+                            help='Training region: eu, global, or a country prefix (default: eu)')
+        parser.add_argument('--num-epochs', type=int, default=300,
+                            help='Training epochs (default: 300)')
+        parser.add_argument('--lr', type=float, default=1e-3,
+                            help='Peak learning rate for OneCycleLR (default: 1e-3)')
+        parser.add_argument('--model', type=str, default=None,
+                            help='Output model filename (default: <region>.pth)')
+
+        # ── Data / memory ─────────────────────────────────────────────────────
+        parser.add_argument('--grid-size', type=float, nargs='+', default=[1.0, 2.0],
+                            help='Voxel grid sizes in metres (default: 1.0 2.0)')
         parser.add_argument('--max-points-per-batch', type=int, default=32000,
-                            help='Target max points per batch (default 32000). Adjust for GPU memory.')
-        parser.add_argument('--min-points', dest='min_pts', type=int, default=2048,
-                            help='Minimum points required per preprocessed voxel (default 2048).')
-        parser.add_argument('--max-points', dest='max_pts', type=int, default=None,
-                            help='Maximum points kept per voxel before training. Default: --max-points-per-batch. Use 0 for no per-voxel subsampling.')
-        parser.add_argument('--grid-size', type=float, nargs='+', default=[2.0],
-                            help='Final model voxel block sizes for voxelization (default: 2.0)')
-        parser.add_argument('--num-kernel-points', type=int, nargs='+', default=[16, 16, 16],
-                            help='Kernel points per SA stage: one value for all stages, or three values for SA1 SA2 SA3 (default: 16 16 16)')
-        parser.add_argument('--preprocess', action='store_true', help='Preprocess point clouds into voxels')
-        parser.add_argument('--tune', action='store_true', help='Tune with lower learning rate schedule')
-        parser.add_argument('--eval', nargs='?', default=True, const=True, metavar='PLY',
-                            help='Eval visualization (optional PLY filename). Use --no-eval to disable.')
-        parser.add_argument('--no-eval', dest='eval', action='store_const', const=None,
-                            help='Disable eval visualization.')
-        parser.add_argument('--wandb', dest='wandb', action='store_true', default=False,
-                            help='Enable wandb logging (default: disabled)')
-        parser.add_argument('--epoch-steps', type=int, default=0,
-                            help='Max training steps per epoch (0 = full pass). Val steps = epoch_steps // 3, or full val if 0.')
-        parser.add_argument('--overlap', type=int, default=0,
-                            help='Number of additional shifted grid origins when writing training voxels (0=none, 2=3x voxels, max 8). Requires re-preprocessing.')
-        parser.add_argument('--no-augmentation', dest='augmentation', action='store_false', default=True,
-                            help='Disable per-sample geometry/reflectance augmentation.')
-        parser.add_argument('--no-density-aug', dest='density_aug', action='store_false', default=True,
-                            help='Disable batch-level density downsampling augmentation.')
-        parser.add_argument('--density-aug-prob', type=float, default=0.20,
-                            help='Probability of applying density augmentation to a batch (default 0.20).')
-        parser.add_argument('--density-aug-spacing', type=float, nargs=2, default=[0.01, 0.04],
-                            metavar=('MIN', 'MAX'),
-                            help='Density augmentation spacing range in metres; only coarsens native spacing.')
-        parser.add_argument('--density-aug-hard-threshold', type=float, default=0.75,
-                            help='Skip batch-level density augmentation when hardest sample difficulty is at or above this value.')
-        parser.add_argument('--density-aug-difficulty-power', type=float, default=2.0,
-                            help='Exponent for reducing density augmentation probability as batch difficulty rises.')
-        parser.add_argument('--refl-diagnostics', action='store_true', default=False,
-                            help='Run extra reflectance sensitivity diagnostics. Uses an additional validation backward pass.')
+                            help='Point budget per batch — reduce if OOM (default: 32000)')
         parser.add_argument('--accumulation-steps', type=int, default=8,
-                            help='Gradient accumulation steps (default 8).')
-        parser.add_argument('--memory-efficient-conv', action='store_true', default=False,
-                            help='Use lower-memory, slower AnisotropicConv aggregation.')
-        parser.add_argument('--no-sparse-max', dest='sparse_max', action='store_false',
-                            help='Use softmax kernel routing instead of sparsemax in AnisotropicConv.')
-        parser.set_defaults(sparse_max=True)
-        parser.add_argument('--compressed-head', dest='compressed_head', action='store_true',
-                            help='Use compact compressed seg head instead of the default full-width FP head.')
-        parser.add_argument('--no-compressed-head', dest='compressed_head', action='store_false',
-                            help='Use the default full-width FP seg head.')
-        parser.set_defaults(compressed_head=False)
-        parser.add_argument('--compressed-head-dim', type=int, default=64,
-                            help='Channel width of the compressed seg head (default 64). Use 32 for a tighter bottleneck.')
-        parser.add_argument('--k-neighbors', dest='k_neighbors', type=int, default=16,
-                            help='kNN neighbourhood size for each SA module (default 16). Higher values (e.g. 32) extend the reach along reflectance chains at the cost of more graph edges.')
-        parser.add_argument('--refl-fp-penalty', type=float, default=0.05,
-                            help='Ramped penalty weight for leaf points predicted as wood, weighted by reflectance when --refl-fp-flat is not set (default 0.05).')
-        parser.add_argument('--refl-fp-flat', action='store_true', default=False,
-                            help='Apply reflectance false-positive penalty equally to all leaf points instead of weighting bright leaves more.')
-        parser.add_argument('--no-refl-fp-ramp', dest='refl_fp_ramp', action='store_false', default=True,
-                            help='Disable ramp-up for reflectance false-positive penalty.')
-        parser.add_argument('--adaptive-sampling-metric', type=str, default='balanced_acc',
-                            choices=['balanced_acc', 'wood_f1', 'mcc', 'wood_recall'],
-                            help='Validation group metric used by --difficulty-mining (default balanced_acc).')
-        parser.add_argument('--adaptive-sampling-alpha', type=float, default=5.0,
-                            help='Steepness of group sampling curve: higher = stronger contrast between easy/hard sites (default 5.0).')
-        parser.add_argument('--adaptive-sampling-min', type=float, default=0.3,
-                            help='Minimum sampling multiplier for easy sites (default 0.3 — easy sites get ~30%% of baseline).')
-        parser.add_argument('--adaptive-sampling-max', type=float, default=3.0,
-                            help='Maximum sampling multiplier for hard sites (default 3.0).')
-        parser.add_argument('--ema-decay', type=float, default=0.995,
-                            help='EMA decay per optimizer step (default 0.995). Try 0.98 or 0.90 for faster EMA.')
-        parser.add_argument('--no-ema', dest='ema', action='store_false', default=True,
-                            help='Disable EMA validation/checkpoint weights.')
-        parser.add_argument('--difficulty-mining', action='store_true', default=True,
-                            help='Track per-voxel boundary-weighted loss EMA and progressively up-weight hard training voxels.')
-        parser.add_argument('--no-difficulty-mining', dest='difficulty_mining', action='store_false',
-                            help='Disable difficulty mining.')
-        parser.add_argument('--unseen-voxel-boost', type=float, default=8.0,
-                            help='During per-voxel warmup, multiply sampler weight for voxels not yet seen by the EMA tracker.')
-        parser.add_argument('--coverage-warmup-replacement', action='store_true', default=False,
-                            help='Allow weighted replacement during per-voxel coverage warmup. Default prevents replacement where possible.')
+                            help='Gradient accumulation steps (default: 8)')
+        parser.add_argument('--min-points', dest='min_pts', type=int, default=2048,
+                            help='Minimum points per voxel (default: 2048)')
+
+        # ── Workflow ──────────────────────────────────────────────────────────
+        parser.add_argument('--preprocess', action='store_true',
+                            help='Preprocess raw PLY files into voxels before training')
+        parser.add_argument('--tune', action='store_true',
+                            help='Fine-tune an existing model with a lower LR schedule')
+        parser.add_argument('--no-eval', dest='eval', action='store_const', const=None,
+                            help='Skip eval visualisation after each epoch')
+        parser.add_argument('--wandb', action='store_true', default=False,
+                            help='Enable Weights & Biases logging')
+        parser.add_argument('--no-augmentation', dest='augmentation', action='store_false', default=True,
+                            help='Disable all data augmentation (for debugging)')
+        parser.add_argument('--no-difficulty-mining', dest='difficulty_mining', action='store_false', default=True,
+                            help='Disable per-voxel EMA difficulty mining and adaptive group sampling')
+        parser.add_argument('--overlap', type=int, default=0,
+                            help='Additional shifted grid origins when writing training voxels (0=none, max 8). Requires re-preprocessing.')
+
+        # ── Loss / training quality ───────────────────────────────────────────
+        parser.add_argument('--refl-fp-penalty', type=float, default=0.40,
+                            help='False-positive penalty weight (leaf predicted as wood) (default: 0.40)')
         parser.add_argument('--contrastive-weight', type=float, default=0.1,
-                            help='Weight for supervised contrastive loss on FP1 features (default 0.1, set 0 to disable).')
+                            help='Supervised contrastive loss weight on FP1 features (default: 0.1, 0=off)')
+        parser.add_argument('--fine-grid-threshold', type=float, default=2.0,
+                            help='Voxels > this size (m) get flat BCE only — no focal gamma or difficulty mining (default: 2.0)')
 
         args = parser.parse_args()
 
@@ -142,7 +98,8 @@ if __name__ == '__main__':
         args.test = True
         args.verbose = True
         args.balance_mode = 'downsampling'
-        args.pointcutmix = False
+        args.pointcutmix = True
+        args.pointcutmix_prob = 0.15
         args.spatial_mix_lite = True
         args.learnable_kernels = False
         args.k_neighbors = 32
@@ -165,7 +122,7 @@ if __name__ == '__main__':
         args.sor_k = 10
         args.sor_std = 1.0
         # args.accumulation_steps is parsed above
-        args.drop_path_rate = 0.0
+        args.drop_path_rate = 0.1
         # args.ema / args.ema_decay are parsed above.
         args.amp_dtype = 'auto'
         # Density augmentation controls are parsed above
